@@ -296,11 +296,148 @@ def test_swa_mtp_decode_triton_uses_global_swa_slots(monkeypatch) -> None:
     torch.testing.assert_close(captured["lens"], swa_lens)
 
 
-def test_compressed_mtp_decode_triton_uses_global_swa_slots(monkeypatch) -> None:
+def _compressed_mtp_decode_inputs() -> tuple[
+    SimpleNamespace,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    SimpleNamespace,
+    SimpleNamespace,
+    torch.Tensor,
+]:
+    attention = SimpleNamespace(
+        num_heads=2,
+        scale=0.1,
+        attn_sink=torch.zeros(2, dtype=torch.float32),
+        compress_ratio=4,
+    )
+    q = torch.empty((6, 1, 2, 512), dtype=torch.bfloat16)
+    compressed_k_cache = torch.empty((1, 64, 584), dtype=torch.uint8)
+    swa_k_cache = torch.empty((1, 256, 584), dtype=torch.uint8)
+    swa_indices = torch.arange(48, dtype=torch.int32).reshape(6, 1, 8)
+    topk_slot_ids = torch.arange(24, dtype=torch.int32).reshape(6, 1, 4)
+    swa_metadata = SimpleNamespace(
+        num_decodes=2,
+        num_decode_tokens=6,
+        decode_swa_lens=torch.full((6,), 3, dtype=torch.int32),
+        decode_swa_indices=swa_indices,
+        seq_lens=torch.tensor([11, 22], dtype=torch.int32),
+        block_table=torch.empty((2, 4), dtype=torch.int32),
+        block_size=256,
+        token_to_req_indices=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32),
+    )
+    attn_metadata = SimpleNamespace(block_size=256)
+    output = torch.empty((6, 2, 512), dtype=torch.bfloat16)
+    return (
+        attention,
+        q,
+        compressed_k_cache,
+        swa_k_cache,
+        topk_slot_ids,
+        torch.full((6,), 4, dtype=torch.int32),
+        swa_metadata,
+        attn_metadata,
+        output,
+    )
+
+
+def test_compressed_mtp_decode_triton_uses_matmul_with_global_slots(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {"dequant_slot_ids": []}
+
+    def fake_dequantize_global_slots(output, k_cache, slot_ids, block_size) -> None:
+        captured["dequant_slot_ids"].append(slot_ids)
+        output.zero_()
+
+    def fake_build_valid_mask(output, compressed_slot_ids, topk_lens, swa_lens) -> None:
+        captured["valid_mask_shape"] = output.shape
+        captured["valid_mask_compressed_slot_ids"] = compressed_slot_ids
+        captured["valid_mask_topk_lens"] = topk_lens
+        captured["valid_mask_swa_lens"] = swa_lens
+        output.zero_()
+
+    def fake_matmul_decode(**kwargs) -> None:
+        captured["matmul_kv_shape"] = kwargs["kv"].shape
+        captured["matmul_valid_tokens_shape"] = kwargs["valid_tokens"].shape
+        kwargs["output"].zero_()
+
+    def fail_accumulate_global_slots(**kwargs) -> None:
+        raise AssertionError("single-chunk MTP decode should use matmul path")
+
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "current_workspace_manager",
+        lambda: _FakeWorkspaceManager(),
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "triton_sparse_mla_matmul_decode_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "dequantize_global_slots_k_cache",
+        fake_dequantize_global_slots,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "build_combined_sparse_mla_decode_valid_mask",
+        fake_build_valid_mask,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "matmul_sparse_mla_attention_with_sink",
+        fake_matmul_decode,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead",
+        fail_accumulate_global_slots,
+    )
+
+    (
+        attention,
+        q,
+        compressed_k_cache,
+        swa_k_cache,
+        topk_slot_ids,
+        topk_lens,
+        swa_metadata,
+        attn_metadata,
+        output,
+    ) = _compressed_mtp_decode_inputs()
+
+    deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_sparse_mla_compressed_decode_triton(
+        attention,
+        q=q,
+        compressed_k_cache=compressed_k_cache,
+        swa_k_cache=swa_k_cache,
+        topk_indices=topk_slot_ids,
+        topk_lens=topk_lens,
+        swa_metadata=swa_metadata,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+
+    dequant_slot_ids = captured["dequant_slot_ids"]
+    assert len(dequant_slot_ids) == 2
+    torch.testing.assert_close(dequant_slot_ids[0], topk_slot_ids[:, 0])
+    torch.testing.assert_close(dequant_slot_ids[1], swa_metadata.decode_swa_indices)
+    assert captured["valid_mask_shape"] == (6, 12)
+    assert captured["matmul_kv_shape"] == (6, 12, 512)
+    assert captured["matmul_valid_tokens_shape"] == (6, 12)
+
+
+def test_compressed_mtp_decode_triton_falls_back_to_global_swa_slots(
+    monkeypatch,
+) -> None:
     captured: list[torch.Tensor] = []
 
     def fail_matmul_decode(**kwargs) -> None:
-        raise AssertionError("MTP compressed decode must not stage paged SWA")
+        raise AssertionError("matmul path is disabled for this test")
 
     def fail_direct_global_paged(**kwargs) -> None:
         raise AssertionError("MTP compressed decode must not use paged SWA window")
@@ -315,6 +452,11 @@ def test_compressed_mtp_decode_triton_uses_global_swa_slots(monkeypatch) -> None
         deepseek_v4_attention_module,
         "current_workspace_manager",
         lambda: _FakeWorkspaceManager(),
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "triton_sparse_mla_matmul_decode_enabled",
+        lambda: False,
     )
     monkeypatch.setattr(
         deepseek_v4_attention_module,
@@ -337,40 +479,33 @@ def test_compressed_mtp_decode_triton_uses_global_swa_slots(monkeypatch) -> None
         fake_finish_two_states,
     )
 
-    attention = SimpleNamespace(
-        num_heads=2,
-        scale=0.1,
-        attn_sink=torch.zeros(2, dtype=torch.float32),
-        compress_ratio=4,
-    )
-    swa_indices = torch.arange(48, dtype=torch.int32).reshape(6, 1, 8)
-    topk_slot_ids = torch.arange(24, dtype=torch.int32).reshape(6, 1, 4)
-    swa_metadata = SimpleNamespace(
-        num_decodes=2,
-        num_decode_tokens=6,
-        decode_swa_lens=torch.full((6,), 3, dtype=torch.int32),
-        decode_swa_indices=swa_indices,
-        seq_lens=torch.tensor([11, 22], dtype=torch.int32),
-        block_table=torch.empty((2, 4), dtype=torch.int32),
-        block_size=256,
-        token_to_req_indices=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32),
-    )
+    (
+        attention,
+        q,
+        compressed_k_cache,
+        swa_k_cache,
+        topk_slot_ids,
+        topk_lens,
+        swa_metadata,
+        attn_metadata,
+        output,
+    ) = _compressed_mtp_decode_inputs()
 
     deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_sparse_mla_compressed_decode_triton(
         attention,
-        q=torch.empty((6, 1, 2, 512), dtype=torch.bfloat16),
-        compressed_k_cache=torch.empty((1, 64, 584), dtype=torch.uint8),
-        swa_k_cache=torch.empty((1, 256, 584), dtype=torch.uint8),
+        q=q,
+        compressed_k_cache=compressed_k_cache,
+        swa_k_cache=swa_k_cache,
         topk_indices=topk_slot_ids,
-        topk_lens=torch.full((6,), 4, dtype=torch.int32),
+        topk_lens=topk_lens,
         swa_metadata=swa_metadata,
-        attn_metadata=SimpleNamespace(block_size=256),
-        output=torch.empty((6, 2, 512), dtype=torch.bfloat16),
+        attn_metadata=attn_metadata,
+        output=output,
     )
 
     assert len(captured) == 2
     torch.testing.assert_close(captured[0], topk_slot_ids[:, 0])
-    torch.testing.assert_close(captured[1], swa_indices)
+    torch.testing.assert_close(captured[1], swa_metadata.decode_swa_indices)
 
 
 @pytest.mark.parametrize(
@@ -2208,6 +2343,134 @@ def test_finish_materialized_scores_value_block_matches_reference(
         actual,
         num_heads=7,
         value_block_size=value_block_size,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_mtp_matmul_global_slots_decode_matches_state_path() -> None:
+    torch.manual_seed(43)
+    compressed_block_size = 4
+    swa_block_size = 4
+    compressed_cache = torch.zeros(
+        4,
+        compressed_block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    swa_cache = torch.zeros(
+        4,
+        swa_block_size,
+        _TOKEN_DATA_SIZE + _SCALE_DIM,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    compressed_slot_ids = torch.tensor(
+        [[0, 3, -1, 8, 1], [7, -1, 4, 0, 8]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    topk_lens = torch.tensor([4, 5], dtype=torch.int32, device="cuda")
+    swa_slot_ids = torch.tensor(
+        [[3, 4, 1, -1], [8, 7, 0, -1]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    swa_lens = torch.tensor([3, 3], dtype=torch.int32, device="cuda")
+    q = torch.randn(2, 1, 8, 512, device="cuda", dtype=torch.bfloat16)
+    sink = torch.linspace(-0.5, 0.5, 8, device="cuda")
+    scale = 0.0625
+
+    for slot in (0, 1, 3, 4, 7, 8):
+        _write_fp8_ds_mla_token(compressed_cache, slot, compressed_block_size)
+        _write_fp8_ds_mla_token(swa_cache, slot, swa_block_size)
+
+    comp_max = torch.full((2, 8), float("-inf"), device="cuda")
+    comp_denom = torch.zeros((2, 8), device="cuda")
+    comp_acc = torch.zeros((2, 8, 512), device="cuda")
+    swa_max = torch.full((2, 8), float("-inf"), device="cuda")
+    swa_denom = torch.zeros((2, 8), device="cuda")
+    swa_acc = torch.zeros((2, 8, 512), device="cuda")
+    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+        q=q,
+        k_cache=compressed_cache,
+        slot_ids=compressed_slot_ids,
+        lens=topk_lens,
+        block_size=compressed_block_size,
+        candidate_offset=0,
+        scale=scale,
+        max_score=comp_max,
+        denom=comp_denom,
+        acc=comp_acc,
+        head_block_size=1,
+    )
+    accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+        q=q,
+        k_cache=swa_cache,
+        slot_ids=swa_slot_ids,
+        lens=swa_lens,
+        block_size=swa_block_size,
+        candidate_offset=0,
+        scale=scale,
+        max_score=swa_max,
+        denom=swa_denom,
+        acc=swa_acc,
+        head_block_size=1,
+    )
+    expected = torch.empty(2, 8, 512, device="cuda", dtype=torch.bfloat16)
+    finish_two_sparse_mla_attention_states_with_sink(
+        comp_max,
+        comp_denom,
+        comp_acc,
+        swa_max,
+        swa_denom,
+        swa_acc,
+        sink,
+        expected,
+    )
+
+    total_candidates = compressed_slot_ids.shape[1] + swa_slot_ids.shape[1]
+    combined_kv = torch.empty(
+        2,
+        total_candidates,
+        512,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    valid_tokens = torch.empty(
+        2,
+        total_candidates,
+        device="cuda",
+        dtype=torch.bool,
+    )
+    dequantize_global_slots_k_cache(
+        combined_kv[:, : compressed_slot_ids.shape[1]],
+        compressed_cache,
+        compressed_slot_ids,
+        compressed_block_size,
+    )
+    dequantize_global_slots_k_cache(
+        combined_kv[:, compressed_slot_ids.shape[1] :],
+        swa_cache,
+        swa_slot_ids,
+        swa_block_size,
+    )
+    build_combined_sparse_mla_decode_valid_mask(
+        valid_tokens,
+        compressed_slot_ids,
+        topk_lens,
+        swa_lens,
+    )
+    actual = torch.empty_like(expected)
+    matmul_sparse_mla_attention_with_sink(
+        q,
+        combined_kv,
+        valid_tokens,
+        scale,
+        sink,
+        actual,
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)

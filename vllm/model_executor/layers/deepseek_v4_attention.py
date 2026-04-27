@@ -26,6 +26,7 @@ from vllm.v1.attention.ops.deepseek_v4_ops import (
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
     dequantize_combined_sparse_mla_decode_kv,
+    dequantize_global_slots_k_cache,
     fused_indexer_q_rope_quant,
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
@@ -969,8 +970,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         if (
-            not mtp_decode
-            and compressed_topk <= topk_chunk_size
+            compressed_topk <= topk_chunk_size
             and triton_sparse_mla_matmul_decode_enabled()
         ):
             total_candidates = compressed_topk + max_swa_len
@@ -986,17 +986,31 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 ((num_decode_tokens, total_candidates), torch.bool),
                 ((num_decode_tokens, self.num_heads, total_candidates), torch.bfloat16),
             )
-            dequantize_combined_sparse_mla_decode_kv(
-                combined_kv,
-                compressed_k_cache,
-                compressed_slot_ids,
-                compressed_block_size,
-                swa_k_cache,
-                swa_metadata.seq_lens[:num_decodes],
-                swa_lens,
-                swa_metadata.block_table[:num_decodes],
-                swa_metadata.block_size,
-            )
+            if mtp_decode:
+                dequantize_global_slots_k_cache(
+                    combined_kv[:, :compressed_topk],
+                    compressed_k_cache,
+                    compressed_slot_ids,
+                    compressed_block_size,
+                )
+                dequantize_global_slots_k_cache(
+                    combined_kv[:, compressed_topk:],
+                    swa_k_cache,
+                    swa_indices,
+                    swa_metadata.block_size,
+                )
+            else:
+                dequantize_combined_sparse_mla_decode_kv(
+                    combined_kv,
+                    compressed_k_cache,
+                    compressed_slot_ids,
+                    compressed_block_size,
+                    swa_k_cache,
+                    swa_metadata.seq_lens[:num_decodes],
+                    swa_lens,
+                    swa_metadata.block_table[:num_decodes],
+                    swa_metadata.block_size,
+                )
 
             build_combined_sparse_mla_decode_valid_mask(
                 valid_tokens,
