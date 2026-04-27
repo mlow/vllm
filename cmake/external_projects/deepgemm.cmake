@@ -19,8 +19,8 @@ else()
   # This ref should be kept in sync with tools/install_deepgemm.sh
   FetchContent_Declare(
     deepgemm
-    GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM.git
-    GIT_TAG 891d57b4db1071624b5c8fa0d1e51cb317fa709f
+    GIT_REPOSITORY https://github.com/jasl/DeepGEMM.git
+    GIT_TAG 7a7a41a1bac7dacabe74057e7600e59f98f85bce
     GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
     GIT_PROGRESS TRUE
     CONFIGURE_COMMAND ""
@@ -45,6 +45,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
   list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.0f")
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
   list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.0a")
+endif()
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+  list(APPEND DEEPGEMM_SUPPORT_ARCHS "12.0f")
 endif()
 
 cuda_archs_loose_intersection(DEEPGEMM_ARCHS

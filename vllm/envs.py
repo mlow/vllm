@@ -166,6 +166,15 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_DEEP_GEMM_SM120_PAGED_MQA_TILED: bool = True
+    VLLM_TRITON_MLA_SPARSE: bool | None = None
+    VLLM_TRITON_MLA_SPARSE_DUMP: bool = False
+    VLLM_TRITON_MLA_SPARSE_DUMP_PATH: str = ""
+    VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
+    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
+    VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH: bool = True
+    VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
+    VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool | None = None
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -248,6 +257,7 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
+    VLLM_DEEPSEEK_V4_USE_MEGA_MOE: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1274,6 +1284,45 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES": lambda: bool(
         int(os.getenv("VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES", "1"))
     ),
+    # Enable DeepGEMM's SM120 paged MQA tiled kernel when available.
+    "VLLM_DEEP_GEMM_SM120_PAGED_MQA_TILED": lambda: bool(
+        int(os.getenv("VLLM_DEEP_GEMM_SM120_PAGED_MQA_TILED", "1"))
+    ),
+    # Experimental sparse MLA fallback controls.
+    # ``VLLM_TRITON_MLA_SPARSE`` unset means auto-select where FlashMLA sparse
+    # is unavailable; set 0/1 to force-disable/force-enable the fallback.
+    "VLLM_TRITON_MLA_SPARSE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE") is None
+        else os.getenv("VLLM_TRITON_MLA_SPARSE", "").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_DUMP": lambda: (
+        os.getenv("VLLM_TRITON_MLA_SPARSE_DUMP", "").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_DUMP_PATH": lambda: os.getenv(
+        "VLLM_TRITON_MLA_SPARSE_DUMP_PATH", ""
+    ),
+    "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", "512")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE", "256")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH": lambda: (
+        os.getenv("VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH", "1").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE": lambda: maybe_convert_int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE": lambda: (
+        None
+        if os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE") is None
+        else os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE", "").lower()
+        in ("1", "true", "yes", "on")
+    ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -1703,6 +1752,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to enable v2 model runner.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
+    ),
+    # Use the DeepGEMM MegaMoE fused expert kernel for DeepSeek V4 routed
+    # experts. Set to 0 to fall back to the standard SharedFusedMoE path.
+    "VLLM_DEEPSEEK_V4_USE_MEGA_MOE": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_USE_MEGA_MOE", "0"))
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
