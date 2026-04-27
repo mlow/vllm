@@ -1,4 +1,5 @@
-
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 def test_mxfp4_e8m0_scale_loading_preserves_raw_bytes():
     from types import SimpleNamespace
