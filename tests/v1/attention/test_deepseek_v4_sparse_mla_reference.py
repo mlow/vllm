@@ -3194,7 +3194,7 @@ def test_triton_sparse_mla_path_can_disable_cudagraphs(monkeypatch) -> None:
     assert vllm_config.compilation_config.max_cudagraph_capture_size == 0
 
 
-def test_triton_sparse_mla_path_disables_cudagraphs_for_mtp(
+def test_triton_sparse_mla_path_allows_cudagraph_support_for_mtp(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE", "1")
@@ -3240,21 +3240,24 @@ def test_triton_sparse_mla_path_disables_cudagraphs_for_mtp(
             vllm_config,
             mla_spec,
         )
-        is AttentionCGSupport.NEVER
+        is AttentionCGSupport.UNIFORM_BATCH
     )
     assert (
         DeepseekSparseSWAMetadataBuilder.get_cudagraph_support(
             vllm_config,
             swa_spec,
         )
-        is AttentionCGSupport.NEVER
+        is AttentionCGSupport.UNIFORM_BATCH
     )
 
     disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config)
 
-    assert vllm_config.compilation_config.mode == CompilationMode.NONE
-    assert vllm_config.compilation_config.compile_sizes == []
-    assert vllm_config.compilation_config.compile_ranges_endpoints == []
-    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-    assert vllm_config.compilation_config.cudagraph_capture_sizes == []
-    assert vllm_config.compilation_config.max_cudagraph_capture_size == 0
+    assert vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert vllm_config.compilation_config.compile_sizes == [1, 2]
+    assert vllm_config.compilation_config.compile_ranges_endpoints == [8192]
+    assert (
+        vllm_config.compilation_config.cudagraph_mode
+        == CUDAGraphMode.FULL_AND_PIECEWISE
+    )
+    assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4]
+    assert vllm_config.compilation_config.max_cudagraph_capture_size == 4
