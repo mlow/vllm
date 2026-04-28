@@ -1753,8 +1753,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(
         int(os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0"))
     ),
-    # Use the DeepGEMM MegaMoE fused expert kernel for DeepSeek V4 routed
-    # experts. Set to 0 to fall back to the standard SharedFusedMoE path.
+    # Optional override for the DeepGEMM MegaMoE fused expert kernel in
+    # DeepSeek V4. If unset, kernel_config.moe_backend decides; set to 1/0 to
+    # force-enable or force-disable this path during bring-up.
     "VLLM_DEEPSEEK_V4_USE_MEGA_MOE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_USE_MEGA_MOE", "0"))
     ),
