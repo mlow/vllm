@@ -16,7 +16,6 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
-    is_sparse_mla_attention_dump_enabled,
     is_triton_sparse_mla_enabled,
     is_triton_sparse_mla_enabled_for_platform,
     triton_sparse_mla_cudagraphs_allowed,
@@ -387,10 +386,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         }
         if num_decode_tokens == 0:
             return out
-        if (
-            is_sparse_mla_attention_dump_enabled()
-            or is_triton_sparse_mla_enabled(self.device)
-        ):
+        if is_triton_sparse_mla_enabled(self.device):
             return out
         for layer_type in self._layer_types:
             # get_mla_metadata() is the official FlashMLA entry point that
