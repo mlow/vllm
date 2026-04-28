@@ -70,6 +70,21 @@ def _use_sm120_short_row_topk_decode(
     )
 
 
+def _decode_logits_width(max_model_len: int, max_seq_len: int) -> int:
+    if max_model_len <= 0:
+        return 0
+    if max_seq_len <= 0:
+        return max_model_len
+    return min(max_model_len, max_seq_len)
+
+
+def _decode_topk_logits_width(
+    max_model_len: int, max_seq_len: int, topk_tokens: int
+) -> int:
+    logits_width = _decode_logits_width(max_model_len, max_seq_len)
+    return min(max_model_len, max(logits_width, topk_tokens))
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -347,7 +362,10 @@ def sparse_attn_indexer(
             else padded_q_quant_decode_tokens
         )
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
-        logits_bytes = num_padded_tokens * max_model_len * torch.float32.itemsize
+        logits_width = _decode_topk_logits_width(
+            max_model_len, attn_metadata_narrowed.max_seq_len, topk_tokens
+        )
+        logits_bytes = num_padded_tokens * logits_width * torch.float32.itemsize
         used_direct_topk = False
         if logits_bytes > sparse_indexer_max_logits_bytes():
             used_direct_topk = fp8_fp4_paged_mqa_topk_indices(
@@ -356,7 +374,7 @@ def sparse_attn_indexer(
                 weights[:num_padded_tokens],
                 seq_lens,
                 decode_metadata.block_table,
-                max_model_len,
+                logits_width,
                 topk_indices,
             )
 
@@ -368,7 +386,7 @@ def sparse_attn_indexer(
                 seq_lens,
                 decode_metadata.block_table,
                 decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
+                max_model_len=logits_width,
                 clean_logits=False,
             )
             num_rows = logits.shape[0]
@@ -395,7 +413,7 @@ def sparse_attn_indexer(
                     topk_indices,
                     topk_workspace,
                     topk_tokens,
-                    attn_metadata_narrowed.max_seq_len,
+                    logits_width,
                 )
             else:
                 if current_platform.is_xpu():
