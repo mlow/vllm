@@ -523,6 +523,26 @@ def fp8_fp4_mqa_topk_indices(
     return True
 
 
+def _fp8_mqa_logits_sm12x(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    if clean_logits and q_scale is None and q_values.dim() == 3 and kv[0].dim() == 2:
+        from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+            fp8_mqa_logits_triton,
+        )
+
+        return fp8_mqa_logits_triton(q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    return _fp8_mqa_logits_torch(
+        q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
+    )
+
+
 def fp8_fp4_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv: tuple[torch.Tensor, torch.Tensor],
@@ -557,7 +577,7 @@ def fp8_fp4_mqa_logits(
     """
     _lazy_init()
     if current_platform.is_device_capability_family(120) and q[1] is None:
-        return _fp8_mqa_logits_torch(
+        return _fp8_mqa_logits_sm12x(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
     if _fp8_fp4_mqa_logits_impl is None:
@@ -658,6 +678,33 @@ def _fp8_paged_mqa_logits_torch(
     return logits
 
 
+def _fp8_paged_mqa_logits_sm12x(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    if (
+        q_scale is None
+        and q_values.dim() == 4
+        and kv_cache.dtype == torch.uint8
+        and kv_cache.shape[-1] == q_values.shape[-1] + 4
+    ):
+        from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+            fp8_paged_mqa_logits_triton,
+        )
+
+        return fp8_paged_mqa_logits_triton(
+            q_values, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
+    return _fp8_paged_mqa_logits_torch(
+        q, kv_cache, weights, context_lens, block_tables, max_model_len
+    )
+
+
 def fp8_fp4_paged_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv_cache: torch.Tensor,
@@ -699,7 +746,7 @@ def fp8_fp4_paged_mqa_logits(
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         if current_platform.is_device_capability_family(120) and q[1] is None:
-            return _fp8_paged_mqa_logits_torch(
+            return _fp8_paged_mqa_logits_sm12x(
                 q, kv_cache, weights, context_lens, block_tables, max_model_len
             )
         return _missing()

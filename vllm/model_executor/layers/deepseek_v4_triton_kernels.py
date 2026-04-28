@@ -766,6 +766,7 @@ def _fp8_paged_mqa_logits_kernel(
     stride_wm: tl.constexpr,
     stride_wh: tl.constexpr,
     stride_clb: tl.constexpr,
+    stride_cln: tl.constexpr,
     stride_btb: tl.constexpr,
     stride_btk: tl.constexpr,
     stride_lm: tl.constexpr,
@@ -785,16 +786,11 @@ def _fp8_paged_mqa_logits_kernel(
     batch = offs_m // next_n
     q_pos = offs_m - batch * next_n
     context_len = tl.load(
-        context_lens_ptr + batch * stride_clb,
+        context_lens_ptr + batch * stride_clb + q_pos * stride_cln,
         mask=valid_m,
         other=0,
     )
-    q_offset = context_len - next_n + q_pos
-    causal_mask = (
-        valid_n[None, :]
-        & (offs_n[None, :] < context_len[:, None])
-        & (offs_n[None, :] <= q_offset[:, None])
-    )
+    context_mask = valid_n[None, :] & (offs_n[None, :] < context_len[:, None])
 
     block_rank = offs_n // block_size
     block_offset = offs_n - block_rank * block_size
@@ -809,7 +805,7 @@ def _fp8_paged_mqa_logits_kernel(
     logits = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     scale = tl.load(
         scale_ptr + block_idx * stride_sb + block_offset[None, :] * stride_ss,
-        mask=causal_mask,
+        mask=context_mask,
         other=0.0,
     )
     for h in tl.range(0, num_heads):
@@ -830,7 +826,7 @@ def _fp8_paged_mqa_logits_kernel(
                 + block_idx[:, :, None] * stride_kvb
                 + block_offset[None, :, None] * stride_kvs
                 + d[None, None, :] * stride_kvd,
-                mask=causal_mask[:, :, None] & (d[None, None, :] < head_dim),
+                mask=context_mask[:, :, None] & (d[None, None, :] < head_dim),
                 other=0.0,
             ).to(tl.float32)
             scores += tl.sum(q[:, None, :] * k, axis=2)
@@ -843,7 +839,7 @@ def _fp8_paged_mqa_logits_kernel(
         logits += weighted * weight[:, None]
 
     store_mask = valid_m[:, None] & valid_n[None, :]
-    logits = tl.where(causal_mask & store_mask, logits, float("-inf"))
+    logits = tl.where(context_mask & store_mask, logits, float("-inf"))
     tl.store(
         logits_ptr + offs_m[:, None] * stride_lm + offs_n[None, :] * stride_ln,
         logits,
@@ -860,7 +856,7 @@ def fp8_paged_mqa_logits_triton(
     max_model_len: int,
 ) -> torch.Tensor:
     batch_size, next_n, num_heads, head_dim = q.size()
-    kv_values = kv_cache[..., :head_dim]
+    kv_values = kv_cache[..., :head_dim].view(torch.float8_e4m3fn)
     kv_scale = kv_cache[..., head_dim:].contiguous().view(torch.float32)
     _, block_size, _, _ = kv_values.size()
     num_rows = batch_size * next_n
@@ -873,6 +869,8 @@ def fp8_paged_mqa_logits_triton(
         return logits
 
     context_lens_2d = context_lens.reshape(batch_size, -1)
+    if context_lens_2d.shape[1] == 1 and next_n != 1:
+        context_lens_2d = context_lens_2d.expand(batch_size, next_n).contiguous()
     grid = (triton.cdiv(num_rows, 4), triton.cdiv(max_model_len, 64))
     _fp8_paged_mqa_logits_kernel[grid](
         q,
@@ -900,6 +898,7 @@ def fp8_paged_mqa_logits_triton(
         weights.stride(0),
         weights.stride(1),
         context_lens_2d.stride(0),
+        context_lens_2d.stride(1),
         block_tables.stride(0),
         block_tables.stride(1),
         logits.stride(0),

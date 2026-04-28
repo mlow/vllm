@@ -128,7 +128,7 @@ def test_sm120_tf32_hc_prenorm_gemm_fallback_matches_split_abi(
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
 )
-def test_sm120_fp8_paged_mqa_logits_torch_fallback_matches_reference(
+def test_sm120_fp8_paged_mqa_logits_fallback_matches_reference(
     monkeypatch: pytest.MonkeyPatch,
 ):
     torch.manual_seed(1)
@@ -187,6 +187,11 @@ def test_sm120_fp8_paged_mqa_logits_torch_fallback_matches_reference(
 
     monkeypatch.setattr(deep_gemm_utils, "_lazy_init", lambda: None)
     monkeypatch.setattr(deep_gemm_utils, "_fp8_fp4_paged_mqa_logits_impl", None)
+
+    def fail_torch_path(*args, **kwargs):
+        raise AssertionError("torch paged fallback should not be used")
+
+    monkeypatch.setattr(deep_gemm_utils, "_fp8_paged_mqa_logits_torch", fail_torch_path)
     actual = deep_gemm_utils.fp8_fp4_paged_mqa_logits(
         (q_fp8.contiguous(), None),
         fused_kv,
@@ -198,6 +203,17 @@ def test_sm120_fp8_paged_mqa_logits_torch_fallback_matches_reference(
         clean_logits=False,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
+
+    from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+        fp8_paged_mqa_logits_triton,
+    )
+
+    triton_actual = fp8_paged_mqa_logits_triton(
+        q_fp8.contiguous(), fused_kv, weights, context_lens, block_tables, max_model_len
+    )
+    assert torch.equal(torch.isneginf(triton_actual), torch.isneginf(expected))
+    finite = torch.isfinite(expected)
+    assert (triton_actual[finite] - expected[finite]).abs().max() < 2e-2
 
 
 @pytest.mark.skipif(
@@ -249,6 +265,59 @@ def test_sm120_fp8_mqa_logits_torch_path_streams_head_chunks(
     assert torch.equal(torch.isneginf(logits), torch.isneginf(ref_logits))
     finite = torch.isfinite(ref_logits)
     assert (logits[finite] - ref_logits[finite]).abs().max() < 1e-4
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+def test_sm120_fp8_mqa_logits_wrapper_uses_triton_when_deepgemm_missing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    torch.manual_seed(2)
+    seq_len, seq_len_kv, num_heads, head_dim = 5, 13, 8, 32
+
+    q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
+    cu_seqlen_ks = torch.arange(seq_len, device="cuda", dtype=torch.int32) % 3
+    cu_seqlen_ke = torch.minimum(
+        cu_seqlen_ks + 6,
+        torch.full((seq_len,), seq_len_kv, device="cuda", dtype=torch.int32),
+    )
+
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    kv_amax = kv.abs().float().amax(dim=1, keepdim=True).clamp(1e-4)
+    kv_scale = (kv_amax / 448.0).squeeze(1).contiguous()
+    kv_fp8 = (kv * (1.0 / kv_scale[:, None])).to(torch.float8_e4m3fn)
+
+    kv_dequant = kv_fp8.float() * kv_scale[:, None]
+    score = torch.einsum("mhd,nd->hmn", q_fp8.float(), kv_dequant)
+    expected = (score.relu() * weights.transpose(0, 1).unsqueeze(-1)).sum(dim=0)
+    offsets = torch.arange(seq_len_kv, device="cuda")
+    valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+        offsets[None, :] < cu_seqlen_ke[:, None]
+    )
+    expected = expected.masked_fill(~valid, float("-inf"))
+
+    monkeypatch.setattr(deep_gemm_utils, "_lazy_init", lambda: None)
+    monkeypatch.setattr(deep_gemm_utils, "_fp8_fp4_mqa_logits_impl", None)
+
+    def fail_torch_path(*args, **kwargs):
+        raise AssertionError("torch fallback should not be used")
+
+    monkeypatch.setattr(deep_gemm_utils, "_fp8_mqa_logits_torch", fail_torch_path)
+    actual = deep_gemm_utils.fp8_fp4_mqa_logits(
+        (q_fp8, None),
+        (kv_fp8, kv_scale),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        clean_logits=True,
+    )
+
+    assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
+    finite = torch.isfinite(expected)
+    assert (actual[finite] - expected[finite]).abs().max() < 2e-2
 
 
 @pytest.mark.skipif(
