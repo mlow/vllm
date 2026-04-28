@@ -873,7 +873,7 @@ def fp8_paged_mqa_logits_triton(
         )
 
     kv_values = kv_cache[..., :head_dim].view(torch.float8_e4m3fn)
-    kv_scale = kv_cache[..., head_dim:].contiguous().view(torch.float32)
+    kv_scale = kv_cache[..., head_dim:].view(torch.float32)
     _, block_size, _, _ = kv_values.size()
     num_rows = batch_size * next_n
     if token_count is None:
@@ -1055,7 +1055,7 @@ def fp8_paged_mqa_logits_rowwise_triton(
 ) -> torch.Tensor:
     batch_size, next_n, num_heads, head_dim = q.size()
     kv_values = kv_cache[..., :head_dim].view(torch.float8_e4m3fn)
-    kv_scale = kv_cache[..., head_dim:].contiguous().view(torch.float32)
+    kv_scale = kv_cache[..., head_dim:].view(torch.float32)
     _, block_size, _, _ = kv_values.size()
     num_rows = batch_size * next_n
     if token_count is None:
@@ -1074,7 +1074,8 @@ def fp8_paged_mqa_logits_rowwise_triton(
     context_lens_2d = context_lens.reshape(batch_size, -1)
     if context_lens_2d.shape[1] == 1 and next_n != 1:
         context_lens_2d = context_lens_2d.expand(batch_size, next_n).contiguous()
-    grid = (num_rows, triton.cdiv(token_count, 64))
+    block_n = 128
+    grid = (num_rows, triton.cdiv(token_count, block_n))
     _fp8_paged_mqa_logits_rowwise_kernel[grid](
         q,
         kv_values,
@@ -1107,9 +1108,9 @@ def fp8_paged_mqa_logits_rowwise_triton(
         block_tables.stride(1),
         logits.stride(0),
         logits.stride(1),
-        BLOCK_N=64,
+        BLOCK_N=block_n,
         BLOCK_D=64,
-        BLOCK_H=4,
+        BLOCK_H=8,
         num_warps=4,
     )
     return logits

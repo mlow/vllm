@@ -680,7 +680,7 @@ def _fp8_paged_mqa_logits_torch(
     assert context_lens.shape == (batch_size, next_n)
 
     kv_values = kv_cache[..., :head_dim].view(torch.float8_e4m3fn)
-    kv_scales = kv_cache[..., head_dim : head_dim + 4].contiguous().view(torch.float32)
+    kv_scales = kv_cache[..., head_dim : head_dim + 4].view(torch.float32)
     logits = torch.full(
         (batch_size * next_n, max_model_len),
         float("-inf"),
