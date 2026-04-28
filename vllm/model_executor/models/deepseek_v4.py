@@ -710,6 +710,17 @@ direct_register_custom_op(
 )
 
 
+def _use_deepseek_v4_mega_moe(vllm_config: VllmConfig) -> bool:
+    if not vllm_config.parallel_config.enable_expert_parallel:
+        return False
+
+    env_name = "VLLM_DEEPSEEK_V4_USE_MEGA_MOE"
+    if envs.is_set(env_name):
+        return envs.VLLM_DEEPSEEK_V4_USE_MEGA_MOE
+
+    return vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
@@ -722,10 +733,7 @@ class DeepseekV4MoE(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.prefix = prefix
-        if vllm_config.parallel_config.enable_expert_parallel:
-            self.use_mega_moe = envs.VLLM_DEEPSEEK_V4_USE_MEGA_MOE
-        else:
-            self.use_mega_moe = False
+        self.use_mega_moe = _use_deepseek_v4_mega_moe(vllm_config)
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.hidden_size = config.hidden_size

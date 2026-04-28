@@ -9,6 +9,7 @@ import torch
 from vllm.model_executor.models.deepseek_v4 import (
     DeepseekV4MegaMoEExperts,
     _stage_deepseek_v4_mega_moe_inputs,
+    _use_deepseek_v4_mega_moe,
     make_deepseek_v4_expert_params_mapping,
 )
 from vllm.platforms import current_platform
@@ -17,6 +18,51 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="DeepSeek V4 MegaMoE requires CUDA",
 )
+
+
+def _make_mega_moe_config(
+    *,
+    enable_expert_parallel: bool = True,
+    moe_backend: str = "auto",
+):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=enable_expert_parallel
+        ),
+        kernel_config=SimpleNamespace(moe_backend=moe_backend),
+    )
+
+
+def test_deepseek_v4_mega_moe_selection_preserves_kernel_config(monkeypatch):
+    from vllm import envs
+
+    monkeypatch.delenv("VLLM_DEEPSEEK_V4_USE_MEGA_MOE", raising=False)
+    envs.disable_envs_cache()
+
+    assert _use_deepseek_v4_mega_moe(
+        _make_mega_moe_config(moe_backend="deep_gemm_mega_moe")
+    )
+    assert not _use_deepseek_v4_mega_moe(_make_mega_moe_config())
+    assert not _use_deepseek_v4_mega_moe(
+        _make_mega_moe_config(
+            enable_expert_parallel=False,
+            moe_backend="deep_gemm_mega_moe",
+        )
+    )
+
+
+def test_deepseek_v4_mega_moe_selection_env_override(monkeypatch):
+    from vllm import envs
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_USE_MEGA_MOE", "1")
+    envs.disable_envs_cache()
+    assert _use_deepseek_v4_mega_moe(_make_mega_moe_config())
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_USE_MEGA_MOE", "0")
+    envs.disable_envs_cache()
+    assert not _use_deepseek_v4_mega_moe(
+        _make_mega_moe_config(moe_backend="deep_gemm_mega_moe")
+    )
 
 
 def test_deepseek_v4_mega_moe_expert_mapping():
