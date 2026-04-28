@@ -743,6 +743,24 @@ def _tf32_hc_prenorm_gemm_torch(
     return out
 
 
+def _tf32_hc_prenorm_gemm_sm12x(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_split: int,
+) -> torch.Tensor:
+    if out.dim() == 3 and sqrsum.dim() == 2:
+        from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+            tf32_hc_prenorm_gemm_triton,
+        )
+
+        tf32_hc_prenorm_gemm_triton(x, fn, out, sqrsum, num_split)
+        return out
+
+    return _tf32_hc_prenorm_gemm_torch(x, fn, out, sqrsum, num_split)
+
+
 def tf32_hc_prenorm_gemm(
     x: torch.Tensor,
     fn: torch.Tensor,
@@ -760,7 +778,7 @@ def tf32_hc_prenorm_gemm(
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
         if current_platform.is_device_capability_family(120):
-            return _tf32_hc_prenorm_gemm_torch(x, fn, out, sqrsum, num_split)
+            return _tf32_hc_prenorm_gemm_sm12x(x, fn, out, sqrsum, num_split)
         return _missing()
     return _tf32_hc_prenorm_gemm_impl(
         x,

@@ -85,7 +85,7 @@ def test_sm120_fp8_mqa_logits_chunk_sizes_cap_large_scores():
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
 )
-def test_sm120_tf32_hc_prenorm_gemm_torch_fallback_matches_split_abi(
+def test_sm120_tf32_hc_prenorm_gemm_fallback_matches_split_abi(
     monkeypatch: pytest.MonkeyPatch,
 ):
     torch.manual_seed(0)
@@ -117,9 +117,11 @@ def test_sm120_tf32_hc_prenorm_gemm_torch_fallback_matches_split_abi(
     deep_gemm_utils.tf32_hc_prenorm_gemm(
         x, fn, wrapper_out, wrapper_sqrsum, num_split=3
     )
-    torch.testing.assert_close(wrapper_out.sum(dim=0), expected_out, rtol=0, atol=0)
     torch.testing.assert_close(
-        wrapper_sqrsum.sum(dim=0), expected_sqrsum, rtol=0, atol=0
+        wrapper_out.sum(dim=0), expected_out, rtol=2e-2, atol=2e-2
+    )
+    torch.testing.assert_close(
+        wrapper_sqrsum.sum(dim=0), expected_sqrsum, rtol=1e-4, atol=1e-4
     )
 
 
