@@ -4,8 +4,8 @@
 DeepseekV4 MLA Attention Layer
 """
 
-from collections.abc import Callable
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
