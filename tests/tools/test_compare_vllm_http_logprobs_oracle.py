@@ -17,6 +17,11 @@ spec.loader.exec_module(oracle_compare)
 
 
 def _response(tokens, top_logprobs):
+    token_ids = [
+        int(token.split(":", 1)[1])
+        for token in tokens
+        if isinstance(token, str) and token.startswith("token_id:")
+    ]
     return {
         "choices": [
             {
@@ -26,7 +31,7 @@ def _response(tokens, top_logprobs):
                     "token_logprobs": [-0.1 * (i + 1) for i in range(len(tokens))],
                     "top_logprobs": top_logprobs,
                 },
-                "token_ids": [int(token.split(":", 1)[1]) for token in tokens],
+                "token_ids": token_ids,
                 "prompt_token_ids": [1, 2, 3],
             }
         ],
@@ -79,3 +84,32 @@ def test_compare_response_reports_first_generated_token_divergence():
     }
     assert report["matching_prefix_tokens"] == 1
     assert report["top1_matches"] == 1
+
+
+def test_compare_response_can_decode_oracle_token_id_keys():
+    normalizer = oracle_compare.TokenNormalizer(
+        lambda token_id: {10: '","', 11: "title", 20: " What"}[token_id]
+    )
+    oracle = _response(
+        ["token_id:10", "token_id:11"],
+        [
+            {"token_id:10": -0.1, "token_id:20": -1.0},
+            {"token_id:11": -0.2, "token_id:20": -1.2},
+        ],
+    )
+    actual = _response(
+        ['","', "title"],
+        [
+            {'","': -0.11, " What": -1.1},
+            {"title": -0.19, " What": -1.3},
+        ],
+    )
+
+    report = oracle_compare.compare_response(
+        "case0", oracle, actual, top_n=2, normalizer=normalizer
+    )
+
+    assert report["tokens_match"] is True
+    assert report["top1_matches"] == 2
+    assert report["topk_overlap_mean"] == 1.0
+    assert report["max_common_logprob_abs_error"] == 0.10000000000000009

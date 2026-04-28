@@ -812,11 +812,11 @@ def fp8_fp4_paged_mqa_logits(
         `torch.float32`.
     """
     _lazy_init()
+    if current_platform.is_device_capability_family(120) and q[1] is None:
+        return _fp8_paged_mqa_logits_sm12x(
+            q, kv_cache, weights, context_lens, block_tables, max_model_len
+        )
     if _fp8_fp4_paged_mqa_logits_impl is None:
-        if current_platform.is_device_capability_family(120) and q[1] is None:
-            return _fp8_paged_mqa_logits_sm12x(
-                q, kv_cache, weights, context_lens, block_tables, max_model_len
-            )
         return _missing()
     return _fp8_fp4_paged_mqa_logits_impl(
         q,
@@ -891,9 +891,9 @@ def tf32_hc_prenorm_gemm(
     See the caller function for shape requirement
     """
     _lazy_init()
+    if current_platform.is_device_capability_family(120):
+        return _tf32_hc_prenorm_gemm_sm12x(x, fn, out, sqrsum, num_split)
     if _tf32_hc_prenorm_gemm_impl is None:
-        if current_platform.is_device_capability_family(120):
-            return _tf32_hc_prenorm_gemm_sm12x(x, fn, out, sqrsum, num_split)
         return _missing()
     return _tf32_hc_prenorm_gemm_impl(
         x,

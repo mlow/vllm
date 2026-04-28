@@ -20,6 +20,23 @@ from typing import Any
 Json = dict[str, Any]
 
 
+class TokenNormalizer:
+    """Normalize token-id placeholders to decoded token strings."""
+
+    def __init__(self, decode_token_id):
+        self._decode_token_id = decode_token_id
+
+    def token_key(self, token: Any) -> str:
+        key = _token_key(token)
+        if not key.startswith("token_id:"):
+            return key
+        try:
+            token_id = int(key.removeprefix("token_id:"))
+        except ValueError:
+            return key
+        return self._decode_token_id(token_id)
+
+
 def _token_key(token: Any) -> str:
     if isinstance(token, str):
         return token
@@ -38,15 +55,23 @@ def _choice(response: Json) -> Json:
     return choice
 
 
-def _generated_tokens(response: Json) -> list[str]:
+def _normalize_token(token: Any, normalizer: TokenNormalizer | None) -> str:
+    if normalizer is None:
+        return _token_key(token)
+    return normalizer.token_key(token)
+
+
+def _generated_tokens(
+    response: Json, normalizer: TokenNormalizer | None = None
+) -> list[str]:
     choice = _choice(response)
     logprobs = choice.get("logprobs") or {}
     tokens = logprobs.get("tokens")
     if isinstance(tokens, list) and tokens:
-        return [_token_key(token) for token in tokens]
+        return [_normalize_token(token, normalizer) for token in tokens]
     token_ids = choice.get("token_ids")
     if isinstance(token_ids, list):
-        return [_token_key(token) for token in token_ids]
+        return [_normalize_token(token, normalizer) for token in token_ids]
     return []
 
 
@@ -68,7 +93,9 @@ def _token_logprobs(response: Json) -> list[float | None]:
     return out
 
 
-def _top_logprobs(response: Json) -> list[dict[str, float]]:
+def _top_logprobs(
+    response: Json, normalizer: TokenNormalizer | None = None
+) -> list[dict[str, float]]:
     logprobs = _choice(response).get("logprobs") or {}
     values = logprobs.get("top_logprobs")
     if not isinstance(values, list):
@@ -79,7 +106,10 @@ def _top_logprobs(response: Json) -> list[dict[str, float]]:
             out.append({})
             continue
         out.append(
-            {_token_key(token): float(logprob) for token, logprob in step.items()}
+            {
+                _normalize_token(token, normalizer): float(logprob)
+                for token, logprob in step.items()
+            }
         )
     return out
 
@@ -127,11 +157,12 @@ def compare_response(
     actual_response: Json,
     *,
     top_n: int = 50,
+    normalizer: TokenNormalizer | None = None,
 ) -> Json:
-    oracle_tokens = _generated_tokens(oracle_response)
-    actual_tokens = _generated_tokens(actual_response)
-    oracle_top = _top_logprobs(oracle_response)
-    actual_top = _top_logprobs(actual_response)
+    oracle_tokens = _generated_tokens(oracle_response, normalizer)
+    actual_tokens = _generated_tokens(actual_response, normalizer)
+    oracle_top = _top_logprobs(oracle_response, normalizer)
+    actual_top = _top_logprobs(actual_response, normalizer)
     oracle_token_logprobs = _token_logprobs(oracle_response)
     actual_token_logprobs = _token_logprobs(actual_response)
 
@@ -241,6 +272,26 @@ def post_completion(base_url: str, payload: Json, timeout: float) -> Json:
     return data
 
 
+def load_token_normalizer(
+    tokenizer: str,
+    *,
+    tokenizer_mode: str,
+    trust_remote_code: bool,
+) -> TokenNormalizer:
+    from vllm.tokenizers import get_tokenizer
+
+    hf_tokenizer = get_tokenizer(
+        tokenizer,
+        tokenizer_mode=tokenizer_mode,
+        trust_remote_code=trust_remote_code,
+    )
+
+    def decode_token_id(token_id: int) -> str:
+        return hf_tokenizer.decode([token_id])
+
+    return TokenNormalizer(decode_token_id)
+
+
 def summarize_reports(reports: list[Json]) -> Json:
     return {
         "case_count": len(reports),
@@ -318,6 +369,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-n", type=int, default=50)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--model", help="Override the model field from request_*.json")
+    parser.add_argument(
+        "--tokenizer",
+        help=(
+            "Tokenizer used to decode token_id:<id> logprob keys before "
+            "comparing them with text token keys."
+        ),
+    )
+    parser.add_argument("--tokenizer-mode", default="auto")
+    parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--strict-tokens", action="store_true")
     parser.add_argument("--strict-prompt-token-ids", action="store_true")
     parser.add_argument("--fail-on-first-mismatch", action="store_true")
@@ -331,6 +391,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     cases = load_oracle_cases(args.oracle_dir)
+    normalizer = None
+    if args.tokenizer:
+        normalizer = load_token_normalizer(
+            args.tokenizer,
+            tokenizer_mode=args.tokenizer_mode,
+            trust_remote_code=args.trust_remote_code,
+        )
     reports: list[Json] = []
     for suffix, request_payload, oracle_response in cases:
         payload = dict(request_payload)
@@ -339,7 +406,11 @@ def main() -> int:
         actual_response = post_completion(args.base_url, payload, args.timeout)
         reports.append(
             compare_response(
-                f"request_{suffix}", oracle_response, actual_response, top_n=args.top_n
+                f"request_{suffix}",
+                oracle_response,
+                actual_response,
+                top_n=args.top_n,
+                normalizer=normalizer,
             )
         )
 
