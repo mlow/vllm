@@ -392,9 +392,7 @@ def _fp8_mqa_logits_torch(
     logits = torch.zeros(
         (seq_len, seq_len_kv), device=q_values.device, dtype=torch.float32
     )
-    head_chunk_size = _fp8_mqa_logits_head_chunk_size(
-        seq_len, seq_len_kv, num_heads
-    )
+    head_chunk_size = _fp8_mqa_logits_head_chunk_size(seq_len, seq_len_kv, num_heads)
 
     for head_start in range(0, num_heads, head_chunk_size):
         head_end = min(head_start + head_chunk_size, num_heads)
@@ -458,12 +456,8 @@ def _fp8_mqa_logits_topk_torch(
         device=q_values.device,
         dtype=torch.float32,
     )
-    head_chunk_size = _fp8_mqa_logits_head_chunk_size(
-        seq_len, seq_len_kv, num_heads
-    )
-    k_chunk_size = _fp8_mqa_logits_k_chunk_size(
-        seq_len, seq_len_kv, head_chunk_size
-    )
+    head_chunk_size = _fp8_mqa_logits_head_chunk_size(seq_len, seq_len_kv, num_heads)
+    k_chunk_size = _fp8_mqa_logits_k_chunk_size(seq_len, seq_len_kv, head_chunk_size)
 
     for k_start in range(0, seq_len_kv, k_chunk_size):
         k_end = min(k_start + k_chunk_size, seq_len_kv)
@@ -480,9 +474,7 @@ def _fp8_mqa_logits_topk_torch(
             scores = torch.matmul(q_chunk, k_t[:, k_start:k_end])
             scores.relu_()
             scores.mul_(head_weights)
-            chunk_logits.add_(
-                scores[0] if scores.shape[0] == 1 else scores.sum(dim=0)
-            )
+            chunk_logits.add_(scores[0] if scores.shape[0] == 1 else scores.sum(dim=0))
 
         offsets = torch.arange(k_start, k_end, device=q_values.device)
         valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
@@ -601,6 +593,71 @@ def get_paged_mqa_logits_metadata(
     return _get_paged_mqa_logits_metadata_impl(context_lens, block_size, num_sms)
 
 
+def _fp8_paged_mqa_logits_torch(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    if q_scale is not None:
+        raise NotImplementedError("SM120 paged MQA torch path only supports FP8 Q")
+
+    batch_size, next_n, num_heads, head_dim = q_values.shape
+    _, block_kv, _, head_dim_with_scale = kv_cache.shape
+    assert head_dim_with_scale == head_dim + 4
+    assert weights.shape == (batch_size * next_n, num_heads)
+    assert context_lens.shape == (batch_size, next_n)
+
+    kv_values = kv_cache[..., :head_dim].view(torch.float8_e4m3fn)
+    kv_scales = kv_cache[..., head_dim : head_dim + 4].contiguous().view(torch.float32)
+    logits = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+
+    q_f32 = q_values.float()
+    score_bytes = _SM120_MQA_LOGITS_MAX_SCORE_BYTES
+    max_tokens_per_chunk = max(1, score_bytes // max(1, num_heads * 4))
+    token_offsets_cache: dict[int, torch.Tensor] = {}
+
+    for batch_idx in range(batch_size):
+        for next_idx in range(next_n):
+            row = batch_idx * next_n + next_idx
+            context_len = int(context_lens[batch_idx, next_idx].item())
+            if context_len <= 0:
+                continue
+
+            q_row = q_f32[batch_idx, next_idx]
+            row_weights = weights[row]
+            for token_start in range(0, context_len, max_tokens_per_chunk):
+                token_end = min(context_len, token_start + max_tokens_per_chunk)
+                chunk_len = token_end - token_start
+                token_offsets = token_offsets_cache.get(chunk_len)
+                if token_offsets is None or token_offsets.device != q_values.device:
+                    token_offsets = torch.arange(
+                        chunk_len, device=q_values.device, dtype=torch.long
+                    )
+                    token_offsets_cache[chunk_len] = token_offsets
+                token_ids = token_start + token_offsets
+                logical_blocks = token_ids // block_kv
+                token_in_block = token_ids - logical_blocks * block_kv
+                physical_blocks = block_tables[batch_idx, logical_blocks]
+                kv_chunk = kv_values[physical_blocks, token_in_block, 0].float()
+                scale_chunk = kv_scales[physical_blocks, token_in_block, 0].squeeze(-1)
+                kv_chunk.mul_(scale_chunk[:, None])
+                scores = torch.matmul(q_row, kv_chunk.T)
+                scores.relu_()
+                scores.mul_(row_weights[:, None])
+                logits[row, token_start:token_end] = scores.sum(dim=0)
+
+    return logits
+
+
 def fp8_fp4_paged_mqa_logits(
     q: tuple[torch.Tensor, torch.Tensor | None],
     kv_cache: torch.Tensor,
@@ -641,6 +698,10 @@ def fp8_fp4_paged_mqa_logits(
     """
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
+        if current_platform.is_device_capability_family(120) and q[1] is None:
+            return _fp8_paged_mqa_logits_torch(
+                q, kv_cache, weights, context_lens, block_tables, max_model_len
+            )
         return _missing()
     return _fp8_fp4_paged_mqa_logits_impl(
         q,
@@ -652,6 +713,34 @@ def fp8_fp4_paged_mqa_logits(
         max_model_len,
         clean_logits=clean_logits,
     )
+
+
+def _tf32_hc_prenorm_gemm_torch(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_split: int,
+) -> torch.Tensor:
+    """Portable SM12x HyperConnection prenorm GEMM fallback.
+
+    DeepGEMM's split ABI only requires that downstream consumers recover the
+    full result by summing over the split dimension. Keep the implementation
+    simple by writing the full product to split zero and clearing the rest.
+    """
+    del num_split
+    product = x.float() @ fn.float().T
+    norm = x.float().square().sum(dim=-1)
+
+    if out.dim() == 3:
+        out.zero_()
+        sqrsum.zero_()
+        out[0].copy_(product)
+        sqrsum[0].copy_(norm)
+    else:
+        out.copy_(product)
+        sqrsum.copy_(norm)
+    return out
 
 
 def tf32_hc_prenorm_gemm(
@@ -670,6 +759,8 @@ def tf32_hc_prenorm_gemm(
     """
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
+        if current_platform.is_device_capability_family(120):
+            return _tf32_hc_prenorm_gemm_torch(x, fn, out, sqrsum, num_split)
         return _missing()
     return _tf32_hc_prenorm_gemm_impl(
         x,

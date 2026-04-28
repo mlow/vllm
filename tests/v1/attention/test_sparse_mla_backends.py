@@ -85,6 +85,122 @@ def test_sm120_fp8_mqa_logits_chunk_sizes_cap_large_scores():
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
 )
+def test_sm120_tf32_hc_prenorm_gemm_torch_fallback_matches_split_abi(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    torch.manual_seed(0)
+    num_tokens, out_features, hidden_size = 7, 12, 64
+    x = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    fn = torch.randn(out_features, hidden_size, device="cuda", dtype=torch.float32)
+
+    out = torch.empty(num_tokens, out_features, device="cuda", dtype=torch.float32)
+    sqrsum = torch.empty(num_tokens, device="cuda", dtype=torch.float32)
+    deep_gemm_utils._tf32_hc_prenorm_gemm_torch(x, fn, out, sqrsum, num_split=1)
+
+    expected_out = x.float() @ fn.T
+    expected_sqrsum = x.float().square().sum(dim=-1)
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(sqrsum, expected_sqrsum, rtol=0, atol=0)
+
+    split_out = torch.empty(3, num_tokens, out_features, device="cuda")
+    split_sqrsum = torch.empty(3, num_tokens, device="cuda")
+    deep_gemm_utils._tf32_hc_prenorm_gemm_torch(
+        x, fn, split_out, split_sqrsum, num_split=3
+    )
+    torch.testing.assert_close(split_out.sum(dim=0), expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(split_sqrsum.sum(dim=0), expected_sqrsum, rtol=0, atol=0)
+
+    monkeypatch.setattr(deep_gemm_utils, "_lazy_init", lambda: None)
+    monkeypatch.setattr(deep_gemm_utils, "_tf32_hc_prenorm_gemm_impl", None)
+    wrapper_out = torch.empty_like(split_out)
+    wrapper_sqrsum = torch.empty_like(split_sqrsum)
+    deep_gemm_utils.tf32_hc_prenorm_gemm(
+        x, fn, wrapper_out, wrapper_sqrsum, num_split=3
+    )
+    torch.testing.assert_close(wrapper_out.sum(dim=0), expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(
+        wrapper_sqrsum.sum(dim=0), expected_sqrsum, rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+def test_sm120_fp8_paged_mqa_logits_torch_fallback_matches_reference(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    torch.manual_seed(1)
+    batch_size, next_n, num_heads, head_dim = 2, 2, 4, 32
+    block_size, max_model_len, num_blocks = 4, 12, 4
+
+    q = torch.randn(
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_fp8 = q.to(torch.float8_e4m3fn)
+    kv = torch.randn(
+        num_blocks, block_size, 1, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_scale = kv.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4) / 448.0
+    kv_fp8 = (kv * kv_scale.reciprocal()).to(torch.float8_e4m3fn)
+    fused_kv = torch.empty(
+        num_blocks,
+        block_size,
+        1,
+        head_dim + 4,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    fused_kv[..., :head_dim] = kv_fp8.view(torch.uint8)
+    fused_kv[..., head_dim:] = kv_scale.contiguous().view(torch.uint8)
+
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device="cuda", dtype=torch.float32
+    )
+    context_lens = torch.tensor([[3, 6], [7, 11]], device="cuda", dtype=torch.int32)
+    block_tables = torch.tensor(
+        [[0, 1, 2], [1, 2, 3]], device="cuda", dtype=torch.int32
+    )
+    expected = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        device="cuda",
+        dtype=torch.float32,
+    )
+    kv_dequant = kv_fp8.float() * kv_scale
+    for batch_idx in range(batch_size):
+        for next_idx in range(next_n):
+            row = batch_idx * next_n + next_idx
+            for token_idx in range(int(context_lens[batch_idx, next_idx].item())):
+                block = int(block_tables[batch_idx, token_idx // block_size].item())
+                offset = token_idx % block_size
+                score = (
+                    q_fp8[batch_idx, next_idx].float() * kv_dequant[block, offset, 0]
+                ).sum(dim=1)
+                expected[row, token_idx] = (score.relu() * weights[row]).sum()
+
+    monkeypatch.setattr(deep_gemm_utils, "_lazy_init", lambda: None)
+    monkeypatch.setattr(deep_gemm_utils, "_fp8_fp4_paged_mqa_logits_impl", None)
+    actual = deep_gemm_utils.fp8_fp4_paged_mqa_logits(
+        (q_fp8.contiguous(), None),
+        fused_kv,
+        weights,
+        context_lens,
+        block_tables,
+        schedule_metadata=torch.empty(0, device="cuda", dtype=torch.int32),
+        max_model_len=max_model_len,
+        clean_logits=False,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
 def test_sm120_fp8_mqa_logits_torch_path_streams_head_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -96,9 +212,7 @@ def test_sm120_fp8_mqa_logits_torch_path_streams_head_chunks(
         seq_len * 5 * 4,
     )
 
-    q = torch.randn(
-        seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
+    q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
     cu_seqlen_ks = torch.arange(seq_len, device="cuda", dtype=torch.int32) % 3
@@ -150,9 +264,7 @@ def test_sm120_fp8_mqa_logits_topk_streams_k_chunks(
         seq_len * 5 * 4,
     )
 
-    q = torch.randn(
-        seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
+    q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     kv = torch.randn(seq_len_kv, head_dim, device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
     cu_seqlen_ks = torch.arange(seq_len, device="cuda", dtype=torch.int32) % 4
@@ -189,8 +301,8 @@ def test_sm120_fp8_mqa_logits_topk_streams_k_chunks(
         valid_count = int((cu_seqlen_ke[row] - cu_seqlen_ks[row]).item())
         row_topk = min(topk_tokens, valid_count)
         if row_topk > 0:
-            expected[row, :row_topk] = logits[row].topk(row_topk).indices.to(
-                torch.int32
+            expected[row, :row_topk] = (
+                logits[row].topk(row_topk).indices.to(torch.int32)
             )
 
     for row in range(seq_len):
