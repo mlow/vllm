@@ -459,6 +459,38 @@ def _fp8_mqa_logits_topk_torch(
     )
     head_chunk_size = _fp8_mqa_logits_head_chunk_size(seq_len, seq_len_kv, num_heads)
     k_chunk_size = _fp8_mqa_logits_k_chunk_size(seq_len, seq_len_kv, head_chunk_size)
+    max_chunk_topk = min(topk_tokens, k_chunk_size)
+    chunk_values_buf = torch.empty(
+        (seq_len, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    chunk_indices_buf = torch.empty(
+        (seq_len, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int64,
+    )
+    chunk_indices_i32 = torch.empty(
+        (seq_len, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int32,
+    )
+    candidate_values = torch.empty(
+        (seq_len, topk_tokens + max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    candidate_indices = torch.empty(
+        (seq_len, topk_tokens + max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int32,
+    )
+    next_best_values = torch.empty_like(best_values)
+    selected = torch.empty(
+        (seq_len, topk_tokens),
+        device=q_values.device,
+        dtype=torch.int64,
+    )
 
     for k_start in range(0, seq_len_kv, k_chunk_size):
         k_end = min(k_start + k_chunk_size, seq_len_kv)
@@ -484,13 +516,28 @@ def _fp8_mqa_logits_topk_torch(
         chunk_logits.masked_fill_(~valid, float("-inf"))
 
         chunk_topk = min(topk_tokens, k_end - k_start)
-        chunk_values, chunk_indices = torch.topk(chunk_logits, chunk_topk, dim=1)
-        chunk_indices = (chunk_indices + k_start).to(torch.int32)
+        chunk_values = chunk_values_buf[:, :chunk_topk]
+        chunk_indices = chunk_indices_buf[:, :chunk_topk]
+        torch.topk(chunk_logits, chunk_topk, dim=1, out=(chunk_values, chunk_indices))
+        chunk_indices_out = chunk_indices_i32[:, :chunk_topk]
+        chunk_indices_out.copy_(chunk_indices)
+        chunk_indices_out.add_(k_start)
 
-        candidate_values = torch.cat((best_values, chunk_values), dim=1)
-        candidate_indices = torch.cat((out, chunk_indices), dim=1)
-        best_values, selected = torch.topk(candidate_values, topk_tokens, dim=1)
-        out.copy_(candidate_indices.gather(1, selected))
+        candidate_cols = topk_tokens + chunk_topk
+        candidate_values_view = candidate_values[:, :candidate_cols]
+        candidate_indices_view = candidate_indices[:, :candidate_cols]
+        candidate_values_view[:, :topk_tokens].copy_(best_values)
+        candidate_values_view[:, topk_tokens:candidate_cols].copy_(chunk_values)
+        candidate_indices_view[:, :topk_tokens].copy_(out)
+        candidate_indices_view[:, topk_tokens:candidate_cols].copy_(chunk_indices_out)
+        torch.topk(
+            candidate_values_view,
+            topk_tokens,
+            dim=1,
+            out=(next_best_values, selected),
+        )
+        torch.gather(candidate_indices_view, 1, selected, out=out)
+        best_values, next_best_values = next_best_values, best_values
         out.masked_fill_(~torch.isfinite(best_values), -1)
 
     return out
@@ -743,6 +790,38 @@ def fp8_fp4_paged_mqa_topk_indices(
         dtype=torch.float32,
     )
     chunk_size = max(1, _SM120_PAGED_MQA_TOPK_CHUNK_SIZE)
+    max_chunk_topk = min(topk_tokens, chunk_size)
+    chunk_values_buf = torch.empty(
+        (num_rows, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    chunk_indices_buf = torch.empty(
+        (num_rows, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int64,
+    )
+    chunk_indices_i32 = torch.empty(
+        (num_rows, max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int32,
+    )
+    candidate_values = torch.empty(
+        (num_rows, topk_tokens + max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    candidate_indices = torch.empty(
+        (num_rows, topk_tokens + max_chunk_topk),
+        device=q_values.device,
+        dtype=torch.int32,
+    )
+    next_best_values = torch.empty_like(best_values)
+    selected = torch.empty(
+        (num_rows, topk_tokens),
+        device=q_values.device,
+        dtype=torch.int64,
+    )
 
     from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
         fp8_paged_mqa_logits_triton,
@@ -761,13 +840,28 @@ def fp8_fp4_paged_mqa_topk_indices(
             token_count=token_count,
         )
         chunk_topk = min(topk_tokens, token_count)
-        chunk_values, chunk_indices = torch.topk(chunk_logits, chunk_topk, dim=1)
-        chunk_indices = (chunk_indices + token_start).to(torch.int32)
+        chunk_values = chunk_values_buf[:, :chunk_topk]
+        chunk_indices = chunk_indices_buf[:, :chunk_topk]
+        torch.topk(chunk_logits, chunk_topk, dim=1, out=(chunk_values, chunk_indices))
+        chunk_indices_out = chunk_indices_i32[:, :chunk_topk]
+        chunk_indices_out.copy_(chunk_indices)
+        chunk_indices_out.add_(token_start)
 
-        candidate_values = torch.cat((best_values, chunk_values), dim=1)
-        candidate_indices = torch.cat((topk_indices, chunk_indices), dim=1)
-        best_values, selected = torch.topk(candidate_values, topk_tokens, dim=1)
-        topk_indices.copy_(candidate_indices.gather(1, selected))
+        candidate_cols = topk_tokens + chunk_topk
+        candidate_values_view = candidate_values[:, :candidate_cols]
+        candidate_indices_view = candidate_indices[:, :candidate_cols]
+        candidate_values_view[:, :topk_tokens].copy_(best_values)
+        candidate_values_view[:, topk_tokens:candidate_cols].copy_(chunk_values)
+        candidate_indices_view[:, :topk_tokens].copy_(topk_indices)
+        candidate_indices_view[:, topk_tokens:candidate_cols].copy_(chunk_indices_out)
+        torch.topk(
+            candidate_values_view,
+            topk_tokens,
+            dim=1,
+            out=(next_best_values, selected),
+        )
+        torch.gather(candidate_indices_view, 1, selected, out=topk_indices)
+        best_values, next_best_values = next_best_values, best_values
         topk_indices.masked_fill_(~torch.isfinite(best_values), -1)
 
     return True

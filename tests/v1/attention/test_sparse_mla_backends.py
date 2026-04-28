@@ -293,6 +293,13 @@ def test_sm120_fp8_paged_mqa_topk_indices_streams_chunks(
         "_SM120_PAGED_MQA_TOPK_CHUNK_SIZE",
         7,
     )
+    monkeypatch.setattr(
+        torch,
+        "cat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("paged MQA top-k should reuse candidate buffers")
+        ),
+    )
 
     q = torch.randn(
         batch_size,
@@ -488,6 +495,13 @@ def test_sm120_fp8_mqa_logits_topk_streams_k_chunks(
         deep_gemm_utils,
         "_SM120_MQA_LOGITS_MAX_SCORE_BYTES",
         seq_len * 5 * 4,
+    )
+    monkeypatch.setattr(
+        torch,
+        "cat",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("MQA top-k should reuse candidate buffers")
+        ),
     )
 
     q = torch.randn(seq_len, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
