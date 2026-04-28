@@ -55,6 +55,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.deepseek_compressor import DeepseekCompressor
+from vllm.model_executor.layers.deepseek_v4_profile import (
+    deepseek_v4_profile_region,
+)
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.quantization.input_quant_fp8 import (
@@ -396,47 +399,51 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         # Attention (inside custom op for torch.compile boundary)
-        torch.ops.vllm.deepseek_v4_attention(
-            hidden_states,
-            positions,
-            o_padded,
-            self.layer_name,
-        )
-        o = o_padded[:, : self.n_local_heads, :]
+        with deepseek_v4_profile_region("attention.core_op"):
+            torch.ops.vllm.deepseek_v4_attention(
+                hidden_states,
+                positions,
+                o_padded,
+                self.layer_name,
+            )
+            o = o_padded[:, : self.n_local_heads, :]
 
         # O projection: inverse RoPE + FP8 quant + einsum + wo_b
-        o_fp8, o_scale = fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            n_groups=self.n_local_groups,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            tma_aligned_scales=self._tma_aligned_scales,
-        )
+        with deepseek_v4_profile_region("attention.o_quant"):
+            o_fp8, o_scale = fused_inv_rope_fp8_quant(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                tma_aligned_scales=self._tma_aligned_scales,
+            )
 
         wo_a_fp8 = self.wo_a.weight
         wo_a_scale = self.wo_a.weight_scale_inv
 
-        z = _allocate_deepseek_v4_wo_a_output(
-            num_tokens,
-            self.n_local_groups,
-            self.o_lora_rank,
-            torch.bfloat16,
-            hidden_states.device,
-        )
-        torch.ops.vllm.deepseek_v4_fp8_einsum(
-            o_fp8,
-            o_scale,
-            wo_a_fp8,
-            wo_a_scale,
-            z,
-            "bhr,hdr->bhd",
-            list(self._einsum_recipe),
-        )
+        with deepseek_v4_profile_region("attention.wo_a"):
+            z = _allocate_deepseek_v4_wo_a_output(
+                num_tokens,
+                self.n_local_groups,
+                self.o_lora_rank,
+                torch.bfloat16,
+                hidden_states.device,
+            )
+            torch.ops.vllm.deepseek_v4_fp8_einsum(
+                o_fp8,
+                o_scale,
+                wo_a_fp8,
+                wo_a_scale,
+                z,
+                "bhr,hdr->bhd",
+                list(self._einsum_recipe),
+            )
 
-        return self.wo_b(z.flatten(1))
+        with deepseek_v4_profile_region("attention.wo_b"):
+            return self.wo_b(z.flatten(1))
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         assert self.aux_stream_list is not None
@@ -498,18 +505,20 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
 
-        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            self.attn_gemm_parallel_execute(hidden_states)
-        )
+        with deepseek_v4_profile_region("attention.gemm_parallel"):
+            qr_kv, kv_score, indexer_kv_score, indexer_weights = (
+                self.attn_gemm_parallel_execute(hidden_states)
+            )
 
-        qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
-        qr, kv = fused_q_kv_rmsnorm(
-            qr,
-            kv,
-            self.q_norm.weight.data,
-            self.kv_norm.weight.data,
-            self.eps,
-        )
+        with deepseek_v4_profile_region("attention.qkv_norm"):
+            qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
+            qr, kv = fused_q_kv_rmsnorm(
+                qr,
+                kv,
+                self.q_norm.weight.data,
+                self.kv_norm.weight.data,
+                self.eps,
+            )
 
         # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
         # on the default stream so q stays on its consumer stream (mla_attn
@@ -529,20 +538,21 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 compressor(kv_score, positions, self.rotary_emb)
                 return q
 
-            q, _ = maybe_execute_in_parallel(
-                wq_b_kv_insert_and_compress,
-                lambda: indexer(
-                    hidden_states,
-                    qr,
-                    indexer_kv_score,
-                    indexer_weights,
-                    positions,
-                    self.indexer_rotary_emb,
-                ),
-                self.ln_events[0],
-                self.ln_events[1],
-                aux_stream,
-            )
+            with deepseek_v4_profile_region("attention.wq_insert_compress_indexer"):
+                q, _ = maybe_execute_in_parallel(
+                    wq_b_kv_insert_and_compress,
+                    lambda: indexer(
+                        hidden_states,
+                        qr,
+                        indexer_kv_score,
+                        indexer_weights,
+                        positions,
+                        self.indexer_rotary_emb,
+                    ),
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    aux_stream,
+                )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             assert self.aux_stream_list is not None
@@ -554,17 +564,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            q, _ = maybe_execute_in_parallel(
-                wq_b_kv_insert,
-                lambda: compressor(kv_score, positions, self.rotary_emb),
-                self.ln_events[0],
-                self.ln_events[1],
-                aux_stream,
-            )
+            with deepseek_v4_profile_region("attention.wq_insert_compress"):
+                q, _ = maybe_execute_in_parallel(
+                    wq_b_kv_insert,
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    aux_stream,
+                )
         else:
             # SWA-only layer: no compressor, no overlap.
-            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
-            self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+            with deepseek_v4_profile_region("attention.wq_insert"):
+                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         # Handle dummy run (no metadata).
         if not isinstance(attn_metadata, dict):
@@ -578,7 +590,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
-        self.mla_attn(q, kv, positions, output=out)
+        with deepseek_v4_profile_region("attention.mla"):
+            self.mla_attn(q, kv, positions, output=out)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -885,21 +898,22 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         if not mtp_decode:
-            fp8ds_paged_sparse_mla_attention_with_sink_multihead(
-                q=q,
-                k_cache=swa_k_cache,
-                seq_lens=swa_metadata.seq_lens[:num_decodes],
-                gather_lens=swa_lens,
-                block_table=swa_metadata.block_table[:num_decodes],
-                block_size=swa_metadata.block_size,
-                candidate_offset=0,
-                num_candidates=max_swa_len,
-                scale=self.scale,
-                attn_sink=self.attn_sink,
-                output=output,
-                head_block_size=head_block_size,
-                num_heads=self.num_heads,
-            )
+            with deepseek_v4_profile_region("sparse_mla.swa_paged"):
+                fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    seq_lens=swa_metadata.seq_lens[:num_decodes],
+                    gather_lens=swa_lens,
+                    block_table=swa_metadata.block_table[:num_decodes],
+                    block_size=swa_metadata.block_size,
+                    candidate_offset=0,
+                    num_candidates=max_swa_len,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    output=output,
+                    head_block_size=head_block_size,
+                    num_heads=self.num_heads,
+                )
             if output.shape[1] > self.num_heads:
                 output[:, self.num_heads :].zero_()
             return
@@ -916,25 +930,27 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_max_score.fill_(float("-inf"))
         swa_denom.zero_()
         swa_acc.zero_()
-        accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
-            q=q,
-            k_cache=swa_k_cache,
-            slot_ids=swa_indices,
-            lens=swa_lens,
-            block_size=swa_metadata.block_size,
-            scale=self.scale,
-            max_score=swa_max_score,
-            denom=swa_denom,
-            acc=swa_acc,
-            head_block_size=head_block_size,
-        )
-        finish_sparse_mla_attention_with_sink(
-            swa_max_score,
-            swa_denom,
-            swa_acc,
-            self.attn_sink,
-            output=output,
-        )
+        with deepseek_v4_profile_region("sparse_mla.swa_mtp_accumulate"):
+            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+                q=q,
+                k_cache=swa_k_cache,
+                slot_ids=swa_indices,
+                lens=swa_lens,
+                block_size=swa_metadata.block_size,
+                scale=self.scale,
+                max_score=swa_max_score,
+                denom=swa_denom,
+                acc=swa_acc,
+                head_block_size=head_block_size,
+            )
+        with deepseek_v4_profile_region("sparse_mla.swa_mtp_finish"):
+            finish_sparse_mla_attention_with_sink(
+                swa_max_score,
+                swa_denom,
+                swa_acc,
+                self.attn_sink,
+                output=output,
+            )
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
 
@@ -987,73 +1003,77 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 ((num_decode_tokens, total_candidates), torch.bool),
                 ((num_decode_tokens, self.num_heads, total_candidates), torch.bfloat16),
             )
-            if mtp_decode:
-                dequantize_global_slots_k_cache(
-                    combined_kv[:, :compressed_topk],
-                    compressed_k_cache,
-                    compressed_slot_ids,
-                    compressed_block_size,
-                )
-                dequantize_global_slots_k_cache(
-                    combined_kv[:, compressed_topk:],
-                    swa_k_cache,
-                    swa_indices,
-                    swa_metadata.block_size,
-                )
-            else:
-                dequantize_combined_sparse_mla_decode_kv(
-                    combined_kv,
-                    compressed_k_cache,
-                    compressed_slot_ids,
-                    compressed_block_size,
-                    swa_k_cache,
-                    swa_metadata.seq_lens[:num_decodes],
-                    swa_lens,
-                    swa_metadata.block_table[:num_decodes],
-                    swa_metadata.block_size,
-                )
+            with deepseek_v4_profile_region("sparse_mla.matmul_dequant"):
+                if mtp_decode:
+                    dequantize_global_slots_k_cache(
+                        combined_kv[:, :compressed_topk],
+                        compressed_k_cache,
+                        compressed_slot_ids,
+                        compressed_block_size,
+                    )
+                    dequantize_global_slots_k_cache(
+                        combined_kv[:, compressed_topk:],
+                        swa_k_cache,
+                        swa_indices,
+                        swa_metadata.block_size,
+                    )
+                else:
+                    dequantize_combined_sparse_mla_decode_kv(
+                        combined_kv,
+                        compressed_k_cache,
+                        compressed_slot_ids,
+                        compressed_block_size,
+                        swa_k_cache,
+                        swa_metadata.seq_lens[:num_decodes],
+                        swa_lens,
+                        swa_metadata.block_table[:num_decodes],
+                        swa_metadata.block_size,
+                    )
 
-            build_combined_sparse_mla_decode_valid_mask(
-                valid_tokens,
-                compressed_slot_ids,
-                topk_lens,
-                swa_lens,
-            )
+            with deepseek_v4_profile_region("sparse_mla.matmul_mask"):
+                build_combined_sparse_mla_decode_valid_mask(
+                    valid_tokens,
+                    compressed_slot_ids,
+                    topk_lens,
+                    swa_lens,
+                )
             use_dot_finish = num_decode_tokens <= 16
-            matmul_sparse_mla_attention_with_sink(
-                q=q,
-                kv=combined_kv,
-                valid_tokens=valid_tokens,
-                scale=self.scale,
-                attn_sink=self.attn_sink,
-                output=output,
-                num_heads=self.num_heads,
-                score_buffer=score_buffer,
-                value_block_size=512 if use_dot_finish else 256,
-                candidate_block_size=128 if use_dot_finish else None,
-            )
+            with deepseek_v4_profile_region("sparse_mla.matmul_attention"):
+                matmul_sparse_mla_attention_with_sink(
+                    q=q,
+                    kv=combined_kv,
+                    valid_tokens=valid_tokens,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    output=output,
+                    num_heads=self.num_heads,
+                    score_buffer=score_buffer,
+                    value_block_size=512 if use_dot_finish else 256,
+                    candidate_block_size=128 if use_dot_finish else None,
+                )
             return
 
         if not mtp_decode and compressed_topk <= topk_chunk_size:
-            fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
-                q=q,
-                compressed_k_cache=compressed_k_cache,
-                slot_ids=compressed_slot_ids,
-                topk_lens=topk_lens,
-                compressed_block_size=compressed_block_size,
-                swa_k_cache=swa_k_cache,
-                seq_lens=swa_metadata.seq_lens[:num_decodes],
-                gather_lens=swa_lens,
-                block_table=swa_metadata.block_table[:num_decodes],
-                swa_block_size=swa_metadata.block_size,
-                num_compressed_candidates=compressed_topk,
-                num_swa_candidates=max_swa_len,
-                scale=self.scale,
-                attn_sink=self.attn_sink,
-                output=output,
-                head_block_size=head_block_size,
-                num_heads=self.num_heads,
-            )
+            with deepseek_v4_profile_region("sparse_mla.compressed_paged"):
+                fp8ds_global_paged_sparse_mla_attention_with_sink_multihead(
+                    q=q,
+                    compressed_k_cache=compressed_k_cache,
+                    slot_ids=compressed_slot_ids,
+                    topk_lens=topk_lens,
+                    compressed_block_size=compressed_block_size,
+                    swa_k_cache=swa_k_cache,
+                    seq_lens=swa_metadata.seq_lens[:num_decodes],
+                    gather_lens=swa_lens,
+                    block_table=swa_metadata.block_table[:num_decodes],
+                    swa_block_size=swa_metadata.block_size,
+                    num_compressed_candidates=compressed_topk,
+                    num_swa_candidates=max_swa_len,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    output=output,
+                    head_block_size=head_block_size,
+                    num_heads=self.num_heads,
+                )
             if output.shape[1] > self.num_heads:
                 output[:, self.num_heads :].zero_()
             return
@@ -1082,58 +1102,62 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         for chunk_start in range(0, compressed_topk, topk_chunk_size):
             chunk_end = min(chunk_start + topk_chunk_size, compressed_topk)
-            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
-                q=q,
-                k_cache=compressed_k_cache,
-                slot_ids=compressed_slot_ids[:, chunk_start:chunk_end],
-                lens=topk_lens,
-                block_size=compressed_block_size,
-                candidate_offset=chunk_start,
-                scale=self.scale,
-                max_score=comp_max_score,
-                denom=comp_denom,
-                acc=comp_acc,
-                head_block_size=head_block_size,
-            )
+            with deepseek_v4_profile_region("sparse_mla.comp_accumulate"):
+                accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+                    q=q,
+                    k_cache=compressed_k_cache,
+                    slot_ids=compressed_slot_ids[:, chunk_start:chunk_end],
+                    lens=topk_lens,
+                    block_size=compressed_block_size,
+                    candidate_offset=chunk_start,
+                    scale=self.scale,
+                    max_score=comp_max_score,
+                    denom=comp_denom,
+                    acc=comp_acc,
+                    head_block_size=head_block_size,
+                )
         if mtp_decode:
-            accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
-                q=q,
-                k_cache=swa_k_cache,
-                slot_ids=swa_indices,
-                lens=swa_lens,
-                block_size=swa_metadata.block_size,
-                scale=self.scale,
-                max_score=swa_max_score,
-                denom=swa_denom,
-                acc=swa_acc,
-                head_block_size=head_block_size,
-            )
+            with deepseek_v4_profile_region("sparse_mla.swa_mtp_accumulate"):
+                accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    slot_ids=swa_indices,
+                    lens=swa_lens,
+                    block_size=swa_metadata.block_size,
+                    scale=self.scale,
+                    max_score=swa_max_score,
+                    denom=swa_denom,
+                    acc=swa_acc,
+                    head_block_size=head_block_size,
+                )
         else:
-            accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
-                q=q,
-                k_cache=swa_k_cache,
-                seq_lens=swa_metadata.seq_lens[:num_decodes],
-                gather_lens=swa_lens,
-                block_table=swa_metadata.block_table[:num_decodes],
-                block_size=swa_metadata.block_size,
-                candidate_offset=0,
-                num_candidates=max_swa_len,
-                scale=self.scale,
-                max_score=swa_max_score,
-                denom=swa_denom,
-                acc=swa_acc,
-                head_block_size=head_block_size,
+            with deepseek_v4_profile_region("sparse_mla.swa_accumulate"):
+                accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    seq_lens=swa_metadata.seq_lens[:num_decodes],
+                    gather_lens=swa_lens,
+                    block_table=swa_metadata.block_table[:num_decodes],
+                    block_size=swa_metadata.block_size,
+                    candidate_offset=0,
+                    num_candidates=max_swa_len,
+                    scale=self.scale,
+                    max_score=swa_max_score,
+                    denom=swa_denom,
+                    acc=swa_acc,
+                    head_block_size=head_block_size,
+                )
+        with deepseek_v4_profile_region("sparse_mla.two_state_finish"):
+            finish_two_sparse_mla_attention_states_with_sink(
+                comp_max_score,
+                comp_denom,
+                comp_acc,
+                swa_max_score,
+                swa_denom,
+                swa_acc,
+                self.attn_sink,
+                output=output,
             )
-        finish_two_sparse_mla_attention_states_with_sink(
-            comp_max_score,
-            comp_denom,
-            comp_acc,
-            swa_max_score,
-            swa_denom,
-            swa_acc,
-            self.attn_sink,
-            output=output,
-        )
         if output.shape[1] > self.num_heads:
             output[:, self.num_heads :].zero_()
 
@@ -1186,25 +1210,27 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     index_start + topk_chunk_size,
                     combined_indices.shape[-1],
                 )
-                accumulate_indexed_sparse_mla_attention_chunk(
-                    q=q_chunk,
-                    kv_flat=kv_flat,
-                    indices=indices_chunk_full[:, index_start:index_end],
-                    lens=lens_chunk,
-                    candidate_offset=index_start,
-                    scale=self.scale,
-                    max_score=max_score,
-                    denom=denom,
-                    acc=subset_acc,
-                )
+                with deepseek_v4_profile_region("sparse_mla.prefill_accumulate"):
+                    accumulate_indexed_sparse_mla_attention_chunk(
+                        q=q_chunk,
+                        kv_flat=kv_flat,
+                        indices=indices_chunk_full[:, index_start:index_end],
+                        lens=lens_chunk,
+                        candidate_offset=index_start,
+                        scale=self.scale,
+                        max_score=max_score,
+                        denom=denom,
+                        acc=subset_acc,
+                    )
 
-            finish_sparse_mla_attention_with_sink(
-                max_score,
-                denom,
-                subset_acc,
-                self.attn_sink,
-                output=output[token_start:token_end],
-            )
+            with deepseek_v4_profile_region("sparse_mla.prefill_finish"):
+                finish_sparse_mla_attention_with_sink(
+                    max_score,
+                    denom,
+                    subset_acc,
+                    self.attn_sink,
+                    output=output[token_start:token_end],
+                )
             if output.shape[1] > self.num_heads:
                 output[token_start:token_end, self.num_heads :].zero_()
 
@@ -1719,16 +1745,20 @@ class DeepseekV4Indexer(nn.Module):
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
         # ReplicatedLinear returns (output, bias); bias is None.
-        q, _ = self.wq_b(qr)
-        q = q.view(-1, self.n_head, self.head_dim)
-        k = self.compressor(compressed_kv_score, positions, rotary_emb)
-        q_quant, weights = fused_indexer_q_rope_quant(
-            positions,
-            q,
-            rotary_emb.cos_sin_cache,
-            indexer_weights,
-            self.softmax_scale,
-            self.n_head**-0.5,
-            use_fp4=self.use_fp4_kv,
-        )
-        return self.indexer_op(hidden_states, q_quant, k, weights)
+        with deepseek_v4_profile_region("indexer.wq_b"):
+            q, _ = self.wq_b(qr)
+            q = q.view(-1, self.n_head, self.head_dim)
+        with deepseek_v4_profile_region("indexer.compressor"):
+            k = self.compressor(compressed_kv_score, positions, rotary_emb)
+        with deepseek_v4_profile_region("indexer.quant"):
+            q_quant, weights = fused_indexer_q_rope_quant(
+                positions,
+                q,
+                rotary_emb.cos_sin_cache,
+                indexer_weights,
+                self.softmax_scale,
+                self.n_head**-0.5,
+                use_fp4=self.use_fp4_kv,
+            )
+        with deepseek_v4_profile_region("indexer.op"):
+            return self.indexer_op(hidden_states, q_quant, k, weights)

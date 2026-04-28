@@ -25,6 +25,10 @@ from vllm.model_executor.layers.deepseek_v4_attention import (
     DeepseekV4MLAModules,
     DeepseekV4MultiHeadLatentAttentionWrapper,
 )
+from vllm.model_executor.layers.deepseek_v4_profile import (
+    deepseek_v4_profile_region,
+    maybe_profile_deepseek_v4_forward,
+)
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
 from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -1212,20 +1216,28 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
         residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-        )
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
-        x = self.hc_post(x, residual, post, comb)
+        with deepseek_v4_profile_region("layer.attn_hc_pre"):
+            x, post, comb = self.hc_pre(
+                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            )
+        with deepseek_v4_profile_region("layer.attn_norm"):
+            x = self.attn_norm(x)
+        with deepseek_v4_profile_region("layer.attn"):
+            x = self.attn(positions, x, None)
+        with deepseek_v4_profile_region("layer.attn_hc_post"):
+            x = self.hc_post(x, residual, post, comb)
 
         residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
-        )
-        x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
-        x = self.hc_post(x, residual, post, comb)
+        with deepseek_v4_profile_region("layer.ffn_hc_pre"):
+            x, post, comb = self.hc_pre(
+                x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            )
+        with deepseek_v4_profile_region("layer.ffn_norm"):
+            x = self.ffn_norm(x)
+        with deepseek_v4_profile_region("layer.ffn"):
+            x = self.ffn(x, input_ids)
+        with deepseek_v4_profile_region("layer.ffn_hc_post"):
+            x = self.hc_post(x, residual, post, comb)
         return x
 
 
@@ -1330,42 +1342,54 @@ class DeepseekV4Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+        with maybe_profile_deepseek_v4_forward(positions.shape[0]):
+            if get_pp_group().is_first_rank:
+                with deepseek_v4_profile_region("model.embed"):
+                    if inputs_embeds is not None:
+                        hidden_states = inputs_embeds
+                    else:
+                        hidden_states = self.embed_input_ids(input_ids)
+                    hidden_states = hidden_states.unsqueeze(-2).repeat(
+                        1, self.hc_mult, 1
+                    )
             else:
-                hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"].view(
-                -1, self.hc_mult, self.config.hidden_size
-            )
+                assert intermediate_tensors is not None
+                with deepseek_v4_profile_region("model.pp_input"):
+                    hidden_states = intermediate_tensors["hidden_states"].view(
+                        -1, self.hc_mult, self.config.hidden_size
+                    )
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states = layer(
-                hidden_states,
-                positions,
-                input_ids,
-            )
+            with deepseek_v4_profile_region("model.layers"):
+                for layer in islice(self.layers, self.start_layer, self.end_layer):
+                    hidden_states = layer(
+                        hidden_states,
+                        positions,
+                        input_ids,
+                    )
 
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states.flatten(1)})
+            if not get_pp_group().is_last_rank:
+                with deepseek_v4_profile_region("model.pp_output"):
+                    return IntermediateTensors(
+                        {"hidden_states": hidden_states.flatten(1)}
+                    )
 
-        # Stash pre-hc_head residual for the MTP draft (captured copy_).
-        num_tokens = hidden_states.shape[0]
-        self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
+            # Stash pre-hc_head residual for the MTP draft (captured copy_).
+            num_tokens = hidden_states.shape[0]
+            with deepseek_v4_profile_region("model.mtp_copy"):
+                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head(
-            hidden_states,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            self.rms_norm_eps,
-            self.hc_eps,
-        )
-        hidden_states = self.norm(hidden_states)
-        return hidden_states
+            with deepseek_v4_profile_region("model.hc_head"):
+                hidden_states = hc_head(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_scale,
+                    self.hc_head_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                )
+            with deepseek_v4_profile_region("model.final_norm"):
+                hidden_states = self.norm(hidden_states)
+            return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
