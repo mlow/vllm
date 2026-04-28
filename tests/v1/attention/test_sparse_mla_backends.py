@@ -219,6 +219,68 @@ def test_sm120_fp8_paged_mqa_logits_fallback_matches_reference(
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
 )
+def test_sm120_fp8_paged_mqa_rowwise_logits_matches_reference():
+    torch.manual_seed(11)
+    batch_size, next_n, num_heads, head_dim = 2, 1, 8, 64
+    block_size, max_model_len, num_blocks = 4, 18, 8
+
+    q = torch.randn(
+        batch_size,
+        next_n,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_fp8 = q.to(torch.float8_e4m3fn).contiguous()
+    kv = torch.randn(
+        num_blocks, block_size, 1, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    kv_scale = kv.abs().float().amax(dim=-1, keepdim=True).clamp(1e-4) / 448.0
+    kv_fp8 = (kv * kv_scale.reciprocal()).to(torch.float8_e4m3fn)
+    fused_kv = torch.empty(
+        num_blocks,
+        block_size,
+        1,
+        head_dim + 4,
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    fused_kv[..., :head_dim] = kv_fp8.view(torch.uint8)
+    fused_kv[..., head_dim:] = kv_scale.contiguous().view(torch.uint8)
+
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device="cuda", dtype=torch.float32
+    )
+    context_lens = torch.tensor([[7], [17]], device="cuda", dtype=torch.int32)
+    block_tables = (
+        torch.arange(
+            batch_size * cdiv(max_model_len, block_size),
+            device="cuda",
+            dtype=torch.int32,
+        ).reshape(batch_size, -1)
+        % num_blocks
+    )
+
+    from vllm.model_executor.layers.deepseek_v4_triton_kernels import (
+        fp8_paged_mqa_logits_rowwise_triton,
+    )
+
+    actual = fp8_paged_mqa_logits_rowwise_triton(
+        q_fp8, fused_kv, weights, context_lens, block_tables, max_model_len
+    )
+    expected = deep_gemm_utils._fp8_paged_mqa_logits_torch(
+        (q_fp8, None), fused_kv, weights, context_lens, block_tables, max_model_len
+    )
+
+    assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
+    finite = torch.isfinite(expected)
+    assert (actual[finite] - expected[finite]).abs().max() < 2e-2
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
 def test_sm120_fp8_paged_mqa_topk_indices_streams_chunks(
     monkeypatch: pytest.MonkeyPatch,
 ):
