@@ -4,7 +4,6 @@
 DeepseekV4 MLA Attention Layer
 """
 
-import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -76,9 +75,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 )
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     disable_triton_sparse_mla_cudagraphs_if_enabled,
-    is_sparse_mla_attention_dump_enabled,
     is_triton_sparse_mla_enabled,
-    sparse_mla_attention_dump_path,
     triton_sparse_mla_matmul_decode_enabled,
     triton_sparse_mla_query_chunk_size,
     triton_sparse_mla_topk_chunk_size,
@@ -104,22 +101,6 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
-
-
-def _tensor_summary(tensor: torch.Tensor | None) -> dict[str, object] | None:
-    if tensor is None:
-        return None
-    return {
-        "shape": [int(dim) for dim in tensor.shape],
-        "dtype": str(tensor.dtype),
-        "stride": [int(stride) for stride in tensor.stride()],
-        "device": str(tensor.device),
-        "is_contiguous": tensor.is_contiguous(),
-    }
-
-
-def _optional_int(value: object) -> int | None:
-    return int(value) if value is not None else None
 
 
 def _sparse_mla_prefill_workspace_bounds(
@@ -182,108 +163,6 @@ def _allocate_deepseek_v4_wo_a_output(
     )
     return output
 
-
-def _dump_sparse_mla_attention_state(
-    phase: str,
-    prefix: str,
-    compress_ratio: int,
-    q: torch.Tensor,
-    output: torch.Tensor,
-    swa_metadata: "DeepseekSparseSWAMetadata",
-    attn_metadata: FlashMLASparseMetadata | None,
-    fields: dict[str, object],
-) -> None:
-    dump_path = sparse_mla_attention_dump_path()
-    payload = {
-        "phase": phase,
-        "prefix": prefix,
-        "compress_ratio": compress_ratio,
-        "q": _tensor_summary(q),
-        "output": _tensor_summary(output),
-        "attn_metadata_present": attn_metadata is not None,
-        "swa_metadata": {
-            "block_table": _tensor_summary(swa_metadata.block_table),
-            "slot_mapping": _tensor_summary(swa_metadata.slot_mapping),
-            "seq_lens": _tensor_summary(swa_metadata.seq_lens),
-            "query_start_loc": _tensor_summary(swa_metadata.query_start_loc),
-            "is_valid_token": _tensor_summary(swa_metadata.is_valid_token),
-            "token_to_req_indices": _tensor_summary(
-                swa_metadata.token_to_req_indices
-            ),
-            "decode_swa_indices": _tensor_summary(
-                swa_metadata.decode_swa_indices
-            ),
-            "decode_swa_lens": _tensor_summary(swa_metadata.decode_swa_lens),
-            "prefill_seq_lens": _tensor_summary(swa_metadata.prefill_seq_lens),
-            "prefill_gather_lens": _tensor_summary(
-                swa_metadata.prefill_gather_lens
-            ),
-            "block_size": int(swa_metadata.block_size),
-            "num_decodes": int(swa_metadata.num_decodes),
-            "num_prefills": int(swa_metadata.num_prefills),
-            "num_decode_tokens": int(swa_metadata.num_decode_tokens),
-            "num_prefill_tokens": int(swa_metadata.num_prefill_tokens),
-        },
-        "flashmla_metadata": {
-            "block_table": _tensor_summary(
-                attn_metadata.block_table if attn_metadata is not None else None
-            ),
-            "slot_mapping": _tensor_summary(
-                attn_metadata.slot_mapping if attn_metadata is not None else None
-            ),
-            "c128a_global_decode_topk_indices": _tensor_summary(
-                attn_metadata.c128a_global_decode_topk_indices
-                if attn_metadata is not None
-                else None
-            ),
-            "c128a_decode_topk_lens": _tensor_summary(
-                attn_metadata.c128a_decode_topk_lens
-                if attn_metadata is not None
-                else None
-            ),
-            "c128a_prefill_topk_indices": _tensor_summary(
-                attn_metadata.c128a_prefill_topk_indices
-                if attn_metadata is not None
-                else None
-            ),
-            "block_size": _optional_int(
-                attn_metadata.block_size if attn_metadata is not None else None
-            ),
-            "topk_tokens": _optional_int(
-                attn_metadata.topk_tokens if attn_metadata is not None else None
-            ),
-        },
-        "fields": fields,
-    }
-    with open(dump_path, "a", encoding="utf-8") as dump_file:
-        dump_file.write(json.dumps(payload, sort_keys=True) + "\n")
-    raise RuntimeError(
-        f"DeepseekV4 sparse MLA diagnostic dump written to {dump_path}"
-    )
-
-
-def _write_sparse_mla_attention_state_if_enabled(
-    phase: str,
-    prefix: str,
-    compress_ratio: int,
-    q: torch.Tensor,
-    output: torch.Tensor,
-    swa_metadata: "DeepseekSparseSWAMetadata",
-    attn_metadata: FlashMLASparseMetadata | None,
-    fields: dict[str, object],
-) -> None:
-    if not is_sparse_mla_attention_dump_enabled():
-        return
-    _dump_sparse_mla_attention_state(
-        phase=phase,
-        prefix=prefix,
-        compress_ratio=compress_ratio,
-        q=q,
-        output=output,
-        swa_metadata=swa_metadata,
-        attn_metadata=attn_metadata,
-        fields=fields,
-    )
 
 # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
 # workspace allocated at _forward_prefill (and the matching profile-time
@@ -1368,31 +1247,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         if kv_cache is not None:
             kv_cache = kv_cache.unsqueeze(-2)
 
-        decode_fields = {
-            "kv_cache": _tensor_summary(kv_cache),
-            "swa_cache": _tensor_summary(swa_cache),
-            "topk_indices": _tensor_summary(topk_indices),
-            "topk_lens": _tensor_summary(topk_lens),
-            "swa_indices": _tensor_summary(swa_indices),
-            "swa_lens": _tensor_summary(swa_lens),
-            "attn_sink": _tensor_summary(self.attn_sink),
-            "scale": float(self.scale),
-            "swa_only": swa_only,
-            "padded_heads": int(self.padded_heads),
-            "num_decodes": int(num_decodes),
-            "num_decode_tokens": int(num_decode_tokens),
-        }
-        _write_sparse_mla_attention_state_if_enabled(
-            phase="decode",
-            prefix=self.prefix,
-            compress_ratio=self.compress_ratio,
-            q=q,
-            output=output,
-            swa_metadata=swa_metadata,
-            attn_metadata=attn_metadata,
-            fields=decode_fields,
-        )
-
         if is_triton_sparse_mla_enabled(q.device):
             if swa_only:
                 self._forward_sparse_mla_swa_decode_triton(
@@ -1418,17 +1272,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     output=output,
                 )
                 return
-            _dump_sparse_mla_attention_state(
-                phase="decode_unsupported_compressed",
-                prefix=self.prefix,
-                compress_ratio=self.compress_ratio,
-                q=q,
-                output=output,
-                swa_metadata=swa_metadata,
-                attn_metadata=attn_metadata,
-                fields=decode_fields,
-            )
-
         # One FlashMLASchedMeta per layer type, shared across all same-type
         # layers within this decode step. The first forward call per type
         # triggers the in-kernel planner (allocating tile_scheduler_metadata
@@ -1636,32 +1479,6 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 combined_indices=combined_indices_buffer[:query_tokens],
                 combined_lens=combined_lens_buffer[:query_tokens],
             )
-
-            if is_sparse_mla_attention_dump_enabled():
-                _dump_sparse_mla_attention_state(
-                    phase="prefill",
-                    prefix=self.prefix,
-                    compress_ratio=self.compress_ratio,
-                    q=q[query_start:query_end],
-                    output=output[query_start:query_end],
-                    swa_metadata=swa_metadata,
-                    attn_metadata=attn_metadata,
-                    fields={
-                        "compressed_k_cache": _tensor_summary(compressed_k_cache),
-                        "swa_k_cache": _tensor_summary(swa_k_cache),
-                        "gathered_kv": _tensor_summary(kv[:chunk_size]),
-                        "topk_indices": _tensor_summary(topk_indices),
-                        "combined_indices": _tensor_summary(combined_indices),
-                        "combined_lens": _tensor_summary(combined_lens),
-                        "attn_sink": _tensor_summary(self.attn_sink),
-                        "scale": float(self.scale),
-                        "swa_only": swa_only,
-                        "chunk_start": int(chunk_start),
-                        "chunk_end": int(chunk_end),
-                        "query_start": int(query_start),
-                        "query_end": int(query_end),
-                    },
-                )
 
             if triton_sparse_mla_enabled:
                 self._forward_sparse_mla_prefill_triton(

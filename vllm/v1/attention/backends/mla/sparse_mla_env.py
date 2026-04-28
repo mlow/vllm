@@ -10,8 +10,6 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 _TRITON_MLA_SPARSE_ENV = "VLLM_TRITON_MLA_SPARSE"
-_TRITON_MLA_SPARSE_DUMP_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP"
-_TRITON_MLA_SPARSE_DUMP_PATH_ENV = "VLLM_TRITON_MLA_SPARSE_DUMP_PATH"
 _TRITON_MLA_SPARSE_TOPK_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE"
 _TRITON_MLA_SPARSE_QUERY_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE"
 _TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV = (
@@ -43,13 +41,6 @@ def _is_sm12x_device(device: torch.device) -> bool:
         return False
     index = device.index if device.index is not None else torch.cuda.current_device()
     return torch.cuda.get_device_capability(index)[0] == 12
-
-
-def is_sparse_mla_attention_dump_enabled() -> bool:
-    configured = _optional_env_flag(_TRITON_MLA_SPARSE_DUMP_ENV)
-    if configured is not None:
-        return configured
-    return False
 
 
 def triton_sparse_mla_configured() -> bool | None:
@@ -117,13 +108,6 @@ def disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config) -> None:
     compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     compilation_config.cudagraph_capture_sizes = []
     compilation_config.max_cudagraph_capture_size = 0
-
-
-def sparse_mla_attention_dump_path() -> str:
-    return (
-        os.getenv(_TRITON_MLA_SPARSE_DUMP_PATH_ENV)
-        or "/tmp/deepseek_v4_triton_mla_sparse_dump.jsonl"
-    )
 
 
 def triton_sparse_mla_topk_chunk_size() -> int:

@@ -9,9 +9,7 @@ import torch
 
 from vllm.envs import environment_variables
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
-    is_sparse_mla_attention_dump_enabled,
     is_triton_sparse_mla_enabled,
-    sparse_mla_attention_dump_path,
     triton_sparse_mla_cudagraphs_allowed,
     triton_sparse_mla_head_block_size,
     triton_sparse_mla_query_chunk_size,
@@ -20,8 +18,6 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
 
 _SPARSE_MLA_ENV_NAMES = (
     "VLLM_TRITON_MLA_SPARSE",
-    "VLLM_TRITON_MLA_SPARSE_DUMP",
-    "VLLM_TRITON_MLA_SPARSE_DUMP_PATH",
     "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE",
     "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE",
     "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH",
@@ -51,14 +47,6 @@ def test_triton_sparse_mla_env_uses_new_name() -> None:
 
     with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE="1"):
         assert is_triton_sparse_mla_enabled(torch.device("cpu"))
-
-
-def test_sparse_mla_dump_env_uses_new_name() -> None:
-    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_DUMP="0"):
-        assert not is_sparse_mla_attention_dump_enabled()
-
-    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_DUMP="1"):
-        assert is_sparse_mla_attention_dump_enabled()
 
 
 def test_sparse_mla_cudagraph_env_defaults_to_allowed() -> None:
@@ -106,8 +94,3 @@ def test_sparse_mla_chunk_env_defaults_invalid_values() -> None:
     ):
         assert triton_sparse_mla_topk_chunk_size() == 512
         assert triton_sparse_mla_query_chunk_size() == 1
-
-
-def test_sparse_mla_dump_path_uses_new_name() -> None:
-    with _patched_sparse_mla_env(VLLM_TRITON_MLA_SPARSE_DUMP_PATH="/tmp/new.jsonl"):
-        assert sparse_mla_attention_dump_path() == "/tmp/new.jsonl"
