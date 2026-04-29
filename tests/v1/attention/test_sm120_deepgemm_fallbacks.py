@@ -62,7 +62,7 @@ def test_sm120_deepgemm_kernel_override_env_is_registered(
     assert not environment_variables[env_name]()
 
 
-def test_sm120_deepgemm_kernel_override_routes_wrappers_to_deepgemm(
+def test_sm120_deepgemm_kernel_override_keeps_fp8_mqa_on_sm12x_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "1")
@@ -79,11 +79,17 @@ def test_sm120_deepgemm_kernel_override_routes_wrappers_to_deepgemm(
     hc_result = torch.empty(1)
 
     def fake_mqa_impl(*args, **kwargs):
-        calls.append("mqa")
-        return mqa_result
+        raise AssertionError("SM120 FP8 MQA should stay on vLLM fallback")
 
     def fake_paged_impl(*args, **kwargs):
-        calls.append("paged")
+        raise AssertionError("SM120 FP8 paged MQA should stay on vLLM fallback")
+
+    def fake_mqa_fallback(*args, **kwargs):
+        calls.append("mqa_fallback")
+        return mqa_result
+
+    def fake_paged_fallback(*args, **kwargs):
+        calls.append("paged_fallback")
         return paged_result
 
     def fake_hc_impl(*args, **kwargs):
@@ -93,6 +99,10 @@ def test_sm120_deepgemm_kernel_override_routes_wrappers_to_deepgemm(
     monkeypatch.setattr(deep_gemm_utils, "_fp8_fp4_mqa_logits_impl", fake_mqa_impl)
     monkeypatch.setattr(
         deep_gemm_utils, "_fp8_fp4_paged_mqa_logits_impl", fake_paged_impl
+    )
+    monkeypatch.setattr(deep_gemm_utils, "_fp8_mqa_logits_sm12x", fake_mqa_fallback)
+    monkeypatch.setattr(
+        deep_gemm_utils, "_fp8_paged_mqa_logits_sm12x", fake_paged_fallback
     )
     monkeypatch.setattr(deep_gemm_utils, "_tf32_hc_prenorm_gemm_impl", fake_hc_impl)
 
@@ -135,10 +145,10 @@ def test_sm120_deepgemm_kernel_override_routes_wrappers_to_deepgemm(
         )
         is hc_result
     )
-    assert calls == ["mqa", "paged", "hc"]
+    assert calls == ["mqa_fallback", "paged_fallback", "hc"]
 
 
-def test_sm120_deepgemm_kernel_override_disables_direct_topk(
+def test_sm120_deepgemm_kernel_override_keeps_direct_topk_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "1")
@@ -150,24 +160,21 @@ def test_sm120_deepgemm_kernel_override_disables_direct_topk(
         lambda capability: capability == 120,
     )
 
+    def fake_topk(*args, **kwargs):
+        kwargs["out"].fill_(0)
+        return kwargs["out"]
+
+    monkeypatch.setattr(deep_gemm_utils, "_fp8_mqa_logits_topk_torch", fake_topk)
+
     q = (torch.empty(1, 1, 1), None)
     kv = (torch.empty(1, 1), torch.empty(1))
     weights = torch.empty(1, 1)
     cu_seqlen = torch.empty(1, dtype=torch.int32)
     topk_indices = torch.empty(1, 1, dtype=torch.int32)
-    assert not deep_gemm_utils.fp8_fp4_mqa_topk_indices(
+    assert deep_gemm_utils.fp8_fp4_mqa_topk_indices(
         q, kv, weights, cu_seqlen, cu_seqlen, topk_indices
     )
-
-    assert not deep_gemm_utils.fp8_fp4_paged_mqa_topk_indices(
-        (torch.empty(1, 1, 1, 1), None),
-        torch.empty(1, 1, 1, 5, dtype=torch.uint8),
-        weights,
-        torch.empty(1, 1, dtype=torch.int32),
-        torch.empty(1, 1, dtype=torch.int32),
-        max_model_len=1,
-        topk_indices=topk_indices,
-    )
+    assert topk_indices.item() == 0
 
 
 @pytest.mark.skipif(
@@ -176,6 +183,7 @@ def test_sm120_deepgemm_kernel_override_disables_direct_topk(
 def test_sm120_paged_mqa_direct_topk_matches_truncated_decode_width(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "1")
     torch.manual_seed(7)
     batch_size, next_n, num_heads, head_dim = 2, 2, 8, 32
     block_size, max_model_len, num_blocks = 4, 64, 16
