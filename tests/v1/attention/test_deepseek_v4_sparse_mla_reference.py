@@ -476,6 +476,81 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_matches_deepgemm_reference(
     _assert_fp8_einsum_close(actual, expected)
 
 
+def test_deepseek_v4_fp8_einsum_slices_full_group_weight_for_tp(
+    monkeypatch,
+) -> None:
+    captured: dict[str, torch.Tensor] = {}
+    num_tokens = 2
+    local_groups = 4
+    full_groups = 8
+    out_rank = 512
+    hidden_size = 4096
+    recipe = [1, 128, 128]
+
+    def fake_sm12_fp8_einsum(
+        a: torch.Tensor,
+        a_scale: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        captured["b"] = b
+        captured["b_scale"] = b_scale
+
+    monkeypatch.setattr(
+        deepseek_v4_attention_module.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=12),
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "get_tensor_model_parallel_rank",
+        lambda: 1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "deepseek_v4_sm12_fp8_einsum",
+        fake_sm12_fp8_einsum,
+    )
+
+    a = torch.empty(
+        (num_tokens, local_groups, hidden_size),
+        dtype=torch.float8_e4m3fn,
+    )
+    a_scale = torch.empty(
+        (num_tokens, local_groups, hidden_size // 128),
+        dtype=torch.float32,
+    )
+    b = torch.arange(
+        full_groups * out_rank * hidden_size,
+        dtype=torch.uint8,
+    ).view(torch.float8_e4m3fn)
+    b = b.view(full_groups * out_rank, hidden_size)
+    b_scale = torch.arange(
+        full_groups * (out_rank // 128) * (hidden_size // 128),
+        dtype=torch.float32,
+    ).view(full_groups * (out_rank // 128), hidden_size // 128)
+    out = torch.empty((num_tokens, local_groups, out_rank), dtype=torch.bfloat16)
+
+    deepseek_v4_fp8_einsum(
+        a,
+        a_scale,
+        b,
+        b_scale,
+        out,
+        "bhr,hdr->bhd",
+        recipe,
+    )
+
+    expected_b = b.view(full_groups, out_rank, hidden_size)[local_groups:]
+    expected_b_scale = b_scale.view(
+        full_groups, out_rank // 128, hidden_size // 128
+    )[local_groups:]
+    assert torch.equal(captured["b"].view(torch.uint8), expected_b.view(torch.uint8))
+    assert torch.equal(captured["b_scale"], expected_b_scale)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 def test_deepseek_v4_sm12_triton_fp8_einsum_primitive_matches_reference() -> None:
     torch.manual_seed(0)
