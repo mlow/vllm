@@ -19,7 +19,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import fp8_einsum
+from vllm.utils.deep_gemm import fp8_einsum, use_deepgemm_sm12x_kernels
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
@@ -158,6 +158,7 @@ def _use_deepseek_v4_sm12_triton_fp8_einsum(
     return (
         capability is not None
         and capability.major == 12
+        and not use_deepgemm_sm12x_kernels()
         and equation == "bhr,hdr->bhd"
         and tuple(recipe) == (1, 128, 128)
         and b_scale.dtype in (torch.float32, e8m0_dtype)

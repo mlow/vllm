@@ -117,6 +117,10 @@ def is_deep_gemm_e8m0_used() -> bool:
     return False
 
 
+def use_deepgemm_sm12x_kernels() -> bool:
+    return envs.VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS
+
+
 def _missing(*_: Any, **__: Any) -> NoReturn:
     """Placeholder for unavailable DeepGEMM backend."""
     raise RuntimeError(
@@ -548,6 +552,8 @@ def fp8_fp4_mqa_topk_indices(
 ) -> bool:
     """Write SM120 FP8 MQA top-k indices without materializing full logits."""
     _lazy_init()
+    if use_deepgemm_sm12x_kernels():
+        return False
     if not (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(120)
@@ -619,7 +625,11 @@ def fp8_fp4_mqa_logits(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
     _lazy_init()
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    if (
+        current_platform.is_device_capability_family(120)
+        and q[1] is None
+        and not use_deepgemm_sm12x_kernels()
+    ):
         return _fp8_mqa_logits_sm12x(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
@@ -764,6 +774,8 @@ def fp8_fp4_paged_mqa_topk_indices(
     """Write SM120 FP8 paged MQA top-k indices without full logits."""
     _lazy_init()
     q_values, q_scale = q
+    if use_deepgemm_sm12x_kernels():
+        return False
     if not (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(120)
@@ -906,7 +918,11 @@ def fp8_fp4_paged_mqa_logits(
         `torch.float32`.
     """
     _lazy_init()
-    if current_platform.is_device_capability_family(120) and q[1] is None:
+    if (
+        current_platform.is_device_capability_family(120)
+        and q[1] is None
+        and not use_deepgemm_sm12x_kernels()
+    ):
         return _fp8_paged_mqa_logits_sm12x(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )
@@ -985,7 +1001,10 @@ def tf32_hc_prenorm_gemm(
     See the caller function for shape requirement
     """
     _lazy_init()
-    if current_platform.is_device_capability_family(120):
+    if (
+        current_platform.is_device_capability_family(120)
+        and not use_deepgemm_sm12x_kernels()
+    ):
         return _tf32_hc_prenorm_gemm_sm12x(x, fn, out, sqrsum, num_split)
     if _tf32_hc_prenorm_gemm_impl is None:
         return _missing()
@@ -1092,6 +1111,7 @@ __all__ = [
     "per_block_cast_to_fp8",
     "is_deep_gemm_e8m0_used",
     "is_deep_gemm_supported",
+    "use_deepgemm_sm12x_kernels",
     "get_num_sms",
     "set_num_sms",
     "should_use_deepgemm_for_fp8_linear",

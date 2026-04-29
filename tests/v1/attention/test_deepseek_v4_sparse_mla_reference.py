@@ -778,6 +778,63 @@ def test_deepseek_v4_fp8_einsum_slices_full_group_weight_for_tp(
     assert torch.equal(captured["b_scale"], expected_b_scale)
 
 
+def test_deepseek_v4_fp8_einsum_deepgemm_override_skips_sm12_triton(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "1")
+    monkeypatch.setattr(
+        deepseek_v4_attention_module.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=12),
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "deepseek_v4_sm12_fp8_einsum",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("SM12 Triton fp8 einsum should not be used")
+        ),
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_fp8_einsum(equation, a_tuple, b_tuple, out, recipe):
+        captured["equation"] = equation
+        captured["a_tuple"] = a_tuple
+        captured["b_tuple"] = b_tuple
+        captured["out"] = out
+        captured["recipe"] = recipe
+
+    monkeypatch.setattr(deepseek_v4_attention_module, "fp8_einsum", fake_fp8_einsum)
+
+    num_tokens = 2
+    num_groups = 4
+    out_rank = 8
+    hidden_size = 16
+    recipe = [1, 128, 128]
+    a = torch.empty(num_tokens, num_groups, hidden_size)
+    a_scale = torch.empty(num_tokens, num_groups, 1)
+    b = torch.empty(num_groups * out_rank, hidden_size)
+    b_scale = torch.empty(num_groups, 1, 1)
+    out = torch.empty(num_tokens, num_groups, out_rank)
+
+    deepseek_v4_fp8_einsum(
+        a,
+        a_scale,
+        b,
+        b_scale,
+        out,
+        "bhr,hdr->bhd",
+        recipe,
+    )
+
+    assert captured["equation"] == "bhr,hdr->bhd"
+    assert captured["a_tuple"] == (a, a_scale)
+    _, captured_b_scale = captured["b_tuple"]
+    assert captured_b_scale is b_scale
+    assert captured["out"] is out
+    assert captured["recipe"] == tuple(recipe)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 def test_deepseek_v4_sm12_triton_fp8_einsum_primitive_matches_reference() -> None:
     torch.manual_seed(0)
