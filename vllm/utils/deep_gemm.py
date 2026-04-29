@@ -552,8 +552,6 @@ def fp8_fp4_mqa_topk_indices(
 ) -> bool:
     """Write SM120 FP8 MQA top-k indices without materializing full logits."""
     _lazy_init()
-    if use_deepgemm_sm12x_kernels():
-        return False
     if not (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(120)
@@ -625,11 +623,7 @@ def fp8_fp4_mqa_logits(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
     _lazy_init()
-    if (
-        current_platform.is_device_capability_family(120)
-        and q[1] is None
-        and not use_deepgemm_sm12x_kernels()
-    ):
+    if current_platform.is_device_capability_family(120) and q[1] is None:
         return _fp8_mqa_logits_sm12x(
             q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
@@ -770,8 +764,6 @@ def fp8_fp4_paged_mqa_topk_indices(
     """Write SM120 FP8 paged MQA top-k indices without full logits."""
     _lazy_init()
     q_values, q_scale = q
-    if use_deepgemm_sm12x_kernels():
-        return False
     if not (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(120)
@@ -913,11 +905,7 @@ def fp8_fp4_paged_mqa_logits(
         `torch.float32`.
     """
     _lazy_init()
-    if (
-        current_platform.is_device_capability_family(120)
-        and q[1] is None
-        and not use_deepgemm_sm12x_kernels()
-    ):
+    if current_platform.is_device_capability_family(120) and q[1] is None:
         return _fp8_paged_mqa_logits_sm12x(
             q, kv_cache, weights, context_lens, block_tables, max_model_len
         )
