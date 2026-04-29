@@ -46,7 +46,10 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
@@ -654,17 +657,59 @@ def deepseek_v4_fp8_einsum(
         num_groups = out.shape[1]
         out_rank = out.shape[2]
         hidden_size = a.shape[2]
-        b = b.view(num_groups, out_rank, hidden_size)
+        if b.shape[0] % out_rank != 0:
+            raise RuntimeError(
+                "DeepSeek V4 fp8 einsum weight rows must be divisible by "
+                f"out_rank={out_rank}, got {b.shape[0]}"
+            )
+        b_groups = b.shape[0] // out_rank
+        group_start = 0
+        if b_groups != num_groups:
+            if b_groups % num_groups != 0:
+                raise RuntimeError(
+                    "DeepSeek V4 fp8 einsum weight groups must match the "
+                    "TP-local output groups or be an integer multiple of "
+                    f"them, got weight_groups={b_groups}, "
+                    f"output_groups={num_groups}"
+                )
+            group_partitions = b_groups // num_groups
+            group_start = (
+                get_tensor_model_parallel_rank() % group_partitions
+            ) * num_groups
+        b = b.view(b_groups, out_rank, hidden_size)
+        if group_start != 0 or b_groups != num_groups:
+            b = b.narrow(0, group_start, num_groups)
 
         if b_scale.dim() == 2:
             scale_mn = recipe[1]
             scale_k_pack = 4 if b_scale.dtype == torch.int32 else 1
             scale_k = recipe[2] * scale_k_pack
+            scale_out_blocks = (out_rank + scale_mn - 1) // scale_mn
+            scale_hidden_blocks = (hidden_size + scale_k - 1) // scale_k
+            if b_scale.shape[0] % scale_out_blocks != 0:
+                raise RuntimeError(
+                    "DeepSeek V4 fp8 einsum scale rows must be divisible by "
+                    f"scale_out_blocks={scale_out_blocks}, "
+                    f"got {b_scale.shape[0]}"
+                )
+            scale_groups = b_scale.shape[0] // scale_out_blocks
+            if scale_groups not in (num_groups, b_groups):
+                raise RuntimeError(
+                    "DeepSeek V4 fp8 einsum scale groups must match the "
+                    "TP-local output groups or weight groups, got "
+                    f"scale_groups={scale_groups}, output_groups={num_groups}, "
+                    f"weight_groups={b_groups}"
+                )
             b_scale = b_scale.view(
-                num_groups,
-                (out_rank + scale_mn - 1) // scale_mn,
-                (hidden_size + scale_k - 1) // scale_k,
+                scale_groups,
+                scale_out_blocks,
+                scale_hidden_blocks,
             )
+            if scale_groups == b_groups and scale_groups != num_groups:
+                b_scale = b_scale.narrow(0, group_start, num_groups)
+        elif b_scale.dim() == 3 and b_scale.shape[0] == b_groups:
+            if b_groups != num_groups:
+                b_scale = b_scale.narrow(0, group_start, num_groups)
 
         if _use_deepseek_v4_sm12_triton_fp8_einsum(equation, recipe, b_scale):
             deepseek_v4_sm12_fp8_einsum(a, a_scale, b, b_scale, out)
