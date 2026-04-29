@@ -1803,12 +1803,10 @@ class SpecDecodeBaseProposer:
         return cudagraph_mode, num_tokens_padded, num_tokens_across_dp
 
 
-# NOTE(woosuk): Currently, the below code is not used and we always use argmax
-# to sample the draft tokens. We will use this after we find a way to manage
-# the draft prob tensor.
-# Refer to https://github.com/vllm-project/vllm/pull/16899 for the details.
-# FIXME(woosuk): The logic here is duplicated with the main sampling code.
-# We should refactor this to reuse the same sampling implementation.
+# NOTE(woosuk): This duplicates part of the main sampling code because MTP
+# needs both the sampled draft token ids and the draft probability tensor for
+# rejection sampling. Refactor this once the sampler exposes a reusable helper
+# that returns both values without extra packing.
 def compute_probs_and_sample_next_token(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
