@@ -4,6 +4,9 @@
 
 import torch
 
+from vllm.model_executor.layers.deepseek_v4_profile import (
+    deepseek_v4_profile_region,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     triton_sparse_mla_head_block_size,
@@ -369,19 +372,21 @@ def matmul_sparse_mla_attention_with_sink(
     else:
         q_score = q_active.to(score_buffer.dtype)
         kv_score = kv.to(score_buffer.dtype)
-    torch.bmm(q_score, kv_score.transpose(1, 2), out=score_buffer)
+    with deepseek_v4_profile_region("sparse_mla.matmul.score_bmm"):
+        torch.bmm(q_score, kv_score.transpose(1, 2), out=score_buffer)
     score_buffer.mul_(scale)
-    finish_materialized_sparse_mla_scores_with_sink(
-        score_buffer,
-        kv,
-        valid_tokens,
-        attn_sink,
-        output,
-        num_heads=active_heads,
-        head_block_size=head_block_size,
-        value_block_size=value_block_size,
-        candidate_block_size=candidate_block_size,
-    )
+    with deepseek_v4_profile_region("sparse_mla.matmul.finish"):
+        finish_materialized_sparse_mla_scores_with_sink(
+            score_buffer,
+            kv,
+            valid_tokens,
+            attn_sink,
+            output,
+            num_heads=active_heads,
+            head_block_size=head_block_size,
+            value_block_size=value_block_size,
+            candidate_block_size=candidate_block_size,
+        )
 
 
 @triton.jit
