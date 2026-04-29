@@ -5,6 +5,7 @@ import pytest
 import torch
 
 import vllm.utils.deep_gemm as deep_gemm_utils
+from vllm.envs import environment_variables
 from vllm.model_executor.layers.sparse_attn_indexer import (
     _decode_logits_width,
     _decode_topk_logits_width,
@@ -48,6 +49,125 @@ def test_non_sm120_cuda_sparse_indexer_still_requires_deep_gemm(monkeypatch):
     )
 
     assert _sparse_indexer_requires_deep_gemm() is True
+
+
+def test_sm120_deepgemm_kernel_override_env_is_registered(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    env_name = "VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS"
+    assert env_name in environment_variables
+    monkeypatch.setenv(env_name, "1")
+    assert environment_variables[env_name]()
+    monkeypatch.setenv(env_name, "0")
+    assert not environment_variables[env_name]()
+
+
+def test_sm120_deepgemm_kernel_override_routes_wrappers_to_deepgemm(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "1")
+    monkeypatch.setattr(deep_gemm_utils, "_lazy_init", lambda: None)
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability_family",
+        lambda capability: capability == 120,
+    )
+
+    calls: list[str] = []
+    mqa_result = torch.empty(1)
+    paged_result = torch.empty(1)
+    hc_result = torch.empty(1)
+
+    def fake_mqa_impl(*args, **kwargs):
+        calls.append("mqa")
+        return mqa_result
+
+    def fake_paged_impl(*args, **kwargs):
+        calls.append("paged")
+        return paged_result
+
+    def fake_hc_impl(*args, **kwargs):
+        calls.append("hc")
+        return hc_result
+
+    monkeypatch.setattr(deep_gemm_utils, "_fp8_fp4_mqa_logits_impl", fake_mqa_impl)
+    monkeypatch.setattr(
+        deep_gemm_utils, "_fp8_fp4_paged_mqa_logits_impl", fake_paged_impl
+    )
+    monkeypatch.setattr(deep_gemm_utils, "_tf32_hc_prenorm_gemm_impl", fake_hc_impl)
+
+    q = (torch.empty(1, 1, 1), None)
+    kv = (torch.empty(1, 1), torch.empty(1))
+    weights = torch.empty(1, 1)
+    cu_seqlen = torch.empty(1, dtype=torch.int32)
+    assert (
+        deep_gemm_utils.fp8_fp4_mqa_logits(
+            q, kv, weights, cu_seqlen, cu_seqlen, clean_logits=False
+        )
+        is mqa_result
+    )
+
+    kv_cache = torch.empty(1, 1, 1, 5, dtype=torch.uint8)
+    context_lens = torch.empty(1, 1, dtype=torch.int32)
+    block_tables = torch.empty(1, 1, dtype=torch.int32)
+    schedule_metadata = torch.empty(1, dtype=torch.int32)
+    assert (
+        deep_gemm_utils.fp8_fp4_paged_mqa_logits(
+            (torch.empty(1, 1, 1, 1), None),
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            schedule_metadata,
+            max_model_len=1,
+            clean_logits=False,
+        )
+        is paged_result
+    )
+
+    assert (
+        deep_gemm_utils.tf32_hc_prenorm_gemm(
+            torch.empty(1, 1),
+            torch.empty(1, 1),
+            torch.empty(1, 1),
+            torch.empty(1),
+            num_split=1,
+        )
+        is hc_result
+    )
+    assert calls == ["mqa", "paged", "hc"]
+
+
+def test_sm120_deepgemm_kernel_override_disables_direct_topk(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "1")
+    monkeypatch.setattr(deep_gemm_utils, "_lazy_init", lambda: None)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability_family",
+        lambda capability: capability == 120,
+    )
+
+    q = (torch.empty(1, 1, 1), None)
+    kv = (torch.empty(1, 1), torch.empty(1))
+    weights = torch.empty(1, 1)
+    cu_seqlen = torch.empty(1, dtype=torch.int32)
+    topk_indices = torch.empty(1, 1, dtype=torch.int32)
+    assert not deep_gemm_utils.fp8_fp4_mqa_topk_indices(
+        q, kv, weights, cu_seqlen, cu_seqlen, topk_indices
+    )
+
+    assert not deep_gemm_utils.fp8_fp4_paged_mqa_topk_indices(
+        (torch.empty(1, 1, 1, 1), None),
+        torch.empty(1, 1, 1, 5, dtype=torch.uint8),
+        weights,
+        torch.empty(1, 1, dtype=torch.int32),
+        torch.empty(1, 1, dtype=torch.int32),
+        max_model_len=1,
+        topk_indices=topk_indices,
+    )
 
 
 @pytest.mark.skipif(
