@@ -740,6 +740,70 @@ def test_deepseek_v4_fp8_einsum_deepgemm_override_skips_sm12_triton(
     assert captured["recipe"] == tuple(recipe)
 
 
+def test_deepseek_v4_fp8_einsum_deepgemm_override_keeps_triton_for_e8m0_scale(
+    monkeypatch,
+) -> None:
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is None:
+        pytest.skip("torch does not expose float8_e8m0fnu")
+
+    monkeypatch.setenv("VLLM_DEEPSEEK_V4_USE_DEEPGEMM_SM12X_KERNELS", "1")
+    monkeypatch.setattr(
+        deepseek_v4_attention_module.current_platform,
+        "get_device_capability",
+        lambda: SimpleNamespace(major=12),
+    )
+
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_sm12_fp8_einsum(
+        a: torch.Tensor,
+        a_scale: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        captured["a_scale"] = a_scale
+        captured["b_scale"] = b_scale
+
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "deepseek_v4_sm12_fp8_einsum",
+        fake_sm12_fp8_einsum,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "fp8_einsum",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("DeepGEMM fp8_einsum should not receive E8M0 scales")
+        ),
+    )
+
+    num_tokens = 2
+    num_groups = 4
+    out_rank = 8
+    hidden_size = 16
+    recipe = [1, 128, 128]
+    a = torch.empty(num_tokens, num_groups, hidden_size)
+    a_scale = torch.empty(num_tokens, num_groups, 1)
+    b = torch.empty(num_groups * out_rank, hidden_size)
+    b_scale = torch.empty(num_groups, 1, 1, dtype=e8m0_dtype)
+    out = torch.empty(num_tokens, num_groups, out_rank)
+
+    deepseek_v4_fp8_einsum(
+        a,
+        a_scale,
+        b,
+        b_scale,
+        out,
+        "bhr,hdr->bhd",
+        recipe,
+    )
+
+    assert captured["a_scale"] is a_scale
+    assert captured["b_scale"] is b_scale
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 def test_deepseek_v4_sm12_triton_fp8_einsum_primitive_matches_reference() -> None:
     torch.manual_seed(0)

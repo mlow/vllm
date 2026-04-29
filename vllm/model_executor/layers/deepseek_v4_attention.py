@@ -134,17 +134,23 @@ def _deepseek_v4_fp8_einsum_config(
 def _use_deepseek_v4_sm12_triton_fp8_einsum(
     equation: str,
     recipe: list[int],
+    a_scale: torch.Tensor,
     b_scale: torch.Tensor,
 ) -> bool:
     capability = current_platform.get_device_capability()
     e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    supported_scale_dtypes = (torch.float32, e8m0_dtype)
+    has_e8m0_scale = e8m0_dtype is not None and (
+        a_scale.dtype == e8m0_dtype or b_scale.dtype == e8m0_dtype
+    )
     return (
         capability is not None
         and capability.major == 12
-        and not use_deepgemm_sm12x_kernels()
         and equation == "bhr,hdr->bhd"
         and tuple(recipe) == (1, 128, 128)
-        and b_scale.dtype in (torch.float32, e8m0_dtype)
+        and a_scale.dtype in supported_scale_dtypes
+        and b_scale.dtype in supported_scale_dtypes
+        and (not use_deepgemm_sm12x_kernels() or has_e8m0_scale)
     )
 
 
@@ -709,7 +715,9 @@ def deepseek_v4_fp8_einsum(
             if b_groups != num_groups:
                 b_scale = b_scale.narrow(0, group_start, num_groups)
 
-        if _use_deepseek_v4_sm12_triton_fp8_einsum(equation, recipe, b_scale):
+        if _use_deepseek_v4_sm12_triton_fp8_einsum(
+            equation, recipe, a_scale, b_scale
+        ):
             deepseek_v4_sm12_fp8_einsum(a, a_scale, b, b_scale, out)
             return
 
