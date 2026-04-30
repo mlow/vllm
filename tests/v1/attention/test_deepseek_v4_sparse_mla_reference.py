@@ -3,6 +3,7 @@
 """Correctness tests for the DeepSeek V4 Triton sparse MLA path and reference oracle."""
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -346,7 +347,7 @@ def _compressed_mtp_decode_inputs() -> tuple[
 def test_compressed_mtp_decode_triton_uses_matmul_with_global_slots(
     monkeypatch,
 ) -> None:
-    captured: dict[str, object] = {"dequant_slot_ids": []}
+    captured: dict[str, Any] = {"dequant_slot_ids": []}
 
     def fake_dequantize_global_slots(output, k_cache, slot_ids, block_size) -> None:
         captured["dequant_slot_ids"].append(slot_ids)
@@ -700,7 +701,7 @@ def test_deepseek_v4_fp8_einsum_deepgemm_override_skips_sm12_triton(
         ),
     )
 
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_fp8_einsum(equation, a_tuple, b_tuple, out, recipe):
         captured["equation"] = equation

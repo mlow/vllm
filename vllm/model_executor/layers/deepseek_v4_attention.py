@@ -718,9 +718,7 @@ def deepseek_v4_fp8_einsum(
             if b_groups != num_groups:
                 b_scale = b_scale.narrow(0, group_start, num_groups)
 
-        if _use_deepseek_v4_sm12_triton_fp8_einsum(
-            equation, recipe, a_scale, b_scale
-        ):
+        if _use_deepseek_v4_sm12_triton_fp8_einsum(equation, recipe, a_scale, b_scale):
             deepseek_v4_sm12_fp8_einsum(a, a_scale, b, b_scale, out)
             return
 
