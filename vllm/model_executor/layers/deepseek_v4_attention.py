@@ -295,8 +295,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         cap = current_platform.get_device_capability()
         assert cap is not None, "DeepseekV4 attention requires a CUDA device"
-        self._einsum_recipe, self._tma_aligned_scales = (
-            _deepseek_v4_fp8_einsum_config(cap.major)
+        self._einsum_recipe, self._tma_aligned_scales = _deepseek_v4_fp8_einsum_config(
+            cap.major
         )
 
         self.rotary_emb = mla_modules.rotary_emb
@@ -978,12 +978,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             (
                 combined_kv,
                 valid_tokens,
+                score_buffer,
             ) = current_workspace_manager().get_simultaneous(
                 (
                     (num_decode_tokens, total_candidates, q.shape[-1]),
                     torch.bfloat16,
                 ),
                 ((num_decode_tokens, total_candidates), torch.bool),
+                ((num_decode_tokens, self.num_heads, total_candidates), torch.bfloat16),
             )
             dequantize_combined_sparse_mla_decode_kv(
                 combined_kv,
@@ -1003,6 +1005,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 topk_lens,
                 swa_lens,
             )
+            use_dot_finish = num_decode_tokens <= 16
             matmul_sparse_mla_attention_with_sink(
                 q=q,
                 kv=combined_kv,
@@ -1011,6 +1014,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 attn_sink=self.attn_sink,
                 output=output,
                 num_heads=self.num_heads,
+                score_buffer=score_buffer,
+                value_block_size=512 if use_dot_finish else 256,
+                candidate_block_size=128 if use_dot_finish else None,
             )
             return
 
@@ -1439,13 +1445,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
 
         workspace_manager = current_workspace_manager()
-        triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(
-            q.device
-        )
+        triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
         if triton_sparse_mla_enabled:
-            query_chunk_size = min(
-                q.shape[0], triton_sparse_mla_query_chunk_size()
-            )
+            query_chunk_size = min(q.shape[0], triton_sparse_mla_query_chunk_size())
             (
                 kv,
                 combined_indices_buffer,

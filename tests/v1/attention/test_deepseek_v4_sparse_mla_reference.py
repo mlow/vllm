@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_indexed_sparse_mla_attention_chunk,
     build_combined_sparse_mla_decode_valid_mask,
     finish_gathered_sparse_mla_attention,
+    finish_materialized_sparse_mla_scores_with_sink,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
     fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
@@ -75,7 +76,6 @@ _TOKEN_DATA_SIZE = _FP8_DIM + _ROPE_DIM * 2
 
 
 class _FakeWorkspaceManager:
-
     def get_simultaneous(self, *specs):
         return tuple(torch.empty(shape, dtype=dtype) for shape, dtype in specs)
 
@@ -121,8 +121,7 @@ def test_wo_a_output_allocation_uses_workspace_outside_compile(monkeypatch) -> N
         def get_simultaneous(self, *shapes_and_dtypes):
             captured["request"] = shapes_and_dtypes
             return [
-                torch.empty(shape, dtype=dtype)
-                for shape, dtype in shapes_and_dtypes
+                torch.empty(shape, dtype=dtype) for shape, dtype in shapes_and_dtypes
             ]
 
     monkeypatch.setattr(
@@ -143,6 +142,7 @@ def test_wo_a_output_allocation_uses_workspace_outside_compile(monkeypatch) -> N
     assert captured["request"] == (((2, 3, 5), torch.bfloat16),)
     assert output.shape == (2, 3, 5)
     assert output.dtype == torch.bfloat16
+
 
 def test_triton_sparse_mla_default_topk_chunk_size(monkeypatch) -> None:
     monkeypatch.delenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", raising=False)
@@ -201,8 +201,7 @@ def test_triton_sparse_mla_decode_head_block_size(
     monkeypatch.delenv("VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE", raising=False)
 
     assert (
-        sparse_mla_decode_head_block_size(num_decode_tokens)
-        == expected_head_block_size
+        sparse_mla_decode_head_block_size(num_decode_tokens) == expected_head_block_size
     )
 
 
@@ -446,9 +445,7 @@ def test_deepseek_v4_sm12_triton_fp8_einsum_matches_deepgemm_reference(
             dtype=torch.float32,
         ).uniform_(0.01, 0.02)
         b_scale_ref_flat = b_scale_flat
-    b_scale_ref = b_scale_ref_flat.view(
-        num_groups, out_rank // 128, hidden_size // 128
-    )
+    b_scale_ref = b_scale_ref_flat.view(num_groups, out_rank // 128, hidden_size // 128)
     expected = torch.empty(
         (num_tokens, num_groups, out_rank),
         device="cuda",
@@ -544,9 +541,9 @@ def test_deepseek_v4_fp8_einsum_slices_full_group_weight_for_tp(
     )
 
     expected_b = b.view(full_groups, out_rank, hidden_size)[local_groups:]
-    expected_b_scale = b_scale.view(
-        full_groups, out_rank // 128, hidden_size // 128
-    )[local_groups:]
+    expected_b_scale = b_scale.view(full_groups, out_rank // 128, hidden_size // 128)[
+        local_groups:
+    ]
     assert torch.equal(captured["b"].view(torch.uint8), expected_b.view(torch.uint8))
     assert torch.equal(captured["b_scale"], expected_b_scale)
 
@@ -739,8 +736,7 @@ def _write_fp8_ds_mla_token(
     block_offset = slot % block_size
 
     values = (
-        (torch.arange(_FP8_DIM, device=k_cache.device, dtype=torch.float32) % 17)
-        - 8
+        (torch.arange(_FP8_DIM, device=k_cache.device, dtype=torch.float32) % 17) - 8
     ) / 16.0
     values = values + float(slot) / 32.0
     scale_exponents = torch.tensor(
@@ -754,8 +750,7 @@ def _write_fp8_ds_mla_token(
     fp8_values = (values / scale_per_dim).to(torch.float8_e4m3fn)
     expected_nope = fp8_values.float() * scale_per_dim
     rope = (
-        torch.linspace(-1.0, 1.0, _ROPE_DIM, device=k_cache.device)
-        + float(slot) / 16.0
+        torch.linspace(-1.0, 1.0, _ROPE_DIM, device=k_cache.device) + float(slot) / 16.0
     ).to(torch.bfloat16)
 
     flat_block = k_cache[block_idx].view(-1)
@@ -764,9 +759,9 @@ def _write_fp8_ds_mla_token(
     flat_block[token_data_start : token_data_start + _FP8_DIM] = fp8_values.view(
         torch.uint8
     )
-    flat_block[
-        token_data_start + _FP8_DIM : token_data_start + _TOKEN_DATA_SIZE
-    ] = rope.view(torch.uint8)
+    flat_block[token_data_start + _FP8_DIM : token_data_start + _TOKEN_DATA_SIZE] = (
+        rope.view(torch.uint8)
+    )
 
     encoded_scales = (scale_exponents.to(torch.int32) + 127).to(torch.uint8)
     flat_block[token_scale_start : token_scale_start + encoded_scales.numel()] = (
@@ -802,7 +797,6 @@ def test_reference_attention_no_sink_matches_logsumexp() -> None:
 
     torch.testing.assert_close(output, expected_output, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(lse, expected_lse, rtol=1e-6, atol=1e-6)
-
 
 
 def test_reference_attention_ignores_nan_kv_for_invalid_tokens() -> None:
@@ -1009,9 +1003,7 @@ def test_triton_finish_with_sink_returns_zero_when_no_tokens_or_sink() -> None:
     acc = torch.full((2, 3, 17), float("nan"), device="cuda")
     sink = torch.full((3,), float("-inf"), device="cuda")
 
-    single_output = torch.full(
-        (2, 3, 17), 7.0, device="cuda", dtype=torch.bfloat16
-    )
+    single_output = torch.full((2, 3, 17), 7.0, device="cuda", dtype=torch.bfloat16)
     finish_sparse_mla_attention_with_sink(
         max_score,
         denom,
@@ -1242,8 +1234,7 @@ def test_dequantize_global_slots_k_cache_fp8_ds_mla_layout() -> None:
         device="cuda",
     )
     expected_by_slot = {
-        slot: _write_fp8_ds_mla_token(k_cache, slot, block_size)
-        for slot in (0, 3, 4)
+        slot: _write_fp8_ds_mla_token(k_cache, slot, block_size) for slot in (0, 3, 4)
     }
     slot_ids = torch.tensor(
         [
@@ -2046,6 +2037,183 @@ def test_matmul_sparse_mla_attention_with_sink_matches_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_matmul_sparse_mla_attention_accepts_bf16_score_buffer() -> None:
+    torch.manual_seed(67)
+    q = torch.randn(2, 1, 5, 512, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(2, 7, 512, device="cuda", dtype=torch.bfloat16)
+    valid_tokens = torch.tensor(
+        [
+            [True, True, False, True, False, True, True],
+            [False, True, True, False, True, False, False],
+        ],
+        dtype=torch.bool,
+        device="cuda",
+    )
+    sink = torch.linspace(-0.25, 0.25, 5, device="cuda")
+    scale = 0.0625
+
+    expected = torch.empty(2, 5, 512, device="cuda", dtype=torch.bfloat16)
+    sink_aware_reference_attention(q, kv, valid_tokens, scale, sink, expected)
+
+    actual = torch.empty_like(expected)
+    score_buffer = torch.empty(2, 5, 7, device="cuda", dtype=torch.bfloat16)
+    matmul_sparse_mla_attention_with_sink(
+        q,
+        kv,
+        valid_tokens,
+        scale,
+        sink,
+        actual,
+        num_heads=5,
+        score_buffer=score_buffer,
+        value_block_size=512,
+        candidate_block_size=128,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize(
+    ("candidate_block_size", "value_block_size"),
+    [(32, 128), (64, 128), (64, 256), (128, 512)],
+)
+def test_finish_materialized_scores_candidate_block_matches_reference(
+    candidate_block_size: int,
+    value_block_size: int,
+) -> None:
+    torch.manual_seed(61)
+    q = torch.randn(3, 1, 7, 512, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(3, 13, 512, device="cuda", dtype=torch.bfloat16)
+    valid_tokens = torch.tensor(
+        [
+            [
+                True,
+                True,
+                False,
+                True,
+                False,
+                True,
+                True,
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+            ],
+            [
+                False,
+                True,
+                True,
+                False,
+                True,
+                False,
+                False,
+                True,
+                False,
+                True,
+                True,
+                False,
+                True,
+            ],
+            [
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ],
+        ],
+        dtype=torch.bool,
+        device="cuda",
+    )
+    sink = torch.linspace(-0.25, 0.25, 7, device="cuda")
+    scale = 0.0625
+
+    expected = torch.empty(3, 7, 512, device="cuda", dtype=torch.bfloat16)
+    sink_aware_reference_attention(q, kv, valid_tokens, scale, sink, expected)
+
+    scores = torch.bmm(q[:, 0].float(), kv.float().transpose(1, 2))
+    scores.mul_(scale)
+    actual = torch.empty_like(expected)
+    finish_materialized_sparse_mla_scores_with_sink(
+        scores,
+        kv,
+        valid_tokens,
+        sink,
+        actual,
+        num_heads=7,
+        value_block_size=value_block_size,
+        candidate_block_size=candidate_block_size,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("value_block_size", [128, 256])
+def test_finish_materialized_scores_value_block_matches_reference(
+    value_block_size: int,
+) -> None:
+    torch.manual_seed(53)
+    q = torch.randn(3, 1, 7, 512, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(3, 11, 512, device="cuda", dtype=torch.bfloat16)
+    valid_tokens = torch.tensor(
+        [
+            [True, True, False, True, False, True, True, False, True, True, False],
+            [False, True, True, False, True, False, False, True, False, True, True],
+            [
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+                False,
+            ],
+        ],
+        dtype=torch.bool,
+        device="cuda",
+    )
+    sink = torch.linspace(-0.25, 0.25, 7, device="cuda")
+    scale = 0.0625
+
+    expected = torch.empty(3, 7, 512, device="cuda", dtype=torch.bfloat16)
+    sink_aware_reference_attention(q, kv, valid_tokens, scale, sink, expected)
+
+    scores = torch.bmm(
+        q[:, 0].float(),
+        kv.float().transpose(1, 2),
+    )
+    scores.mul_(scale)
+    actual = torch.empty_like(expected)
+    finish_materialized_sparse_mla_scores_with_sink(
+        scores,
+        kv,
+        valid_tokens,
+        sink,
+        actual,
+        num_heads=7,
+        value_block_size=value_block_size,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 def test_build_combined_sparse_mla_decode_valid_mask_matches_torch() -> None:
     compressed_slot_ids = torch.tensor(
         [
@@ -2394,9 +2562,7 @@ def test_reference_sparse_mla_prefill_matches_dense_golden(
 
     kv_flat = kv.reshape(-1, q.shape[-1])
     offsets = torch.arange(combined_indices.shape[-1])
-    valid_tokens = (offsets[None, :] < combined_lens[:, None]) & (
-        combined_indices >= 0
-    )
+    valid_tokens = (offsets[None, :] < combined_lens[:, None]) & (combined_indices >= 0)
     safe_indices = torch.where(
         valid_tokens,
         combined_indices,
@@ -2438,6 +2604,7 @@ def test_chunked_reference_accumulation_matches_one_shot(chunk_size: int) -> Non
 
     torch.testing.assert_close(output, expected_output, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(lse, expected_lse, rtol=1e-6, atol=1e-6)
+
 
 def test_triton_sparse_mla_path_allows_cudagraph_support_by_default(
     monkeypatch,
@@ -2494,7 +2661,6 @@ def test_triton_sparse_mla_path_allows_cudagraph_support_by_default(
     )
     assert vllm_config.compilation_config.cudagraph_capture_sizes == [1, 2, 4]
     assert vllm_config.compilation_config.max_cudagraph_capture_size == 4
-
 
 
 def test_triton_sparse_mla_path_can_disable_cudagraphs(monkeypatch) -> None:
@@ -2590,14 +2756,20 @@ def test_triton_sparse_mla_path_disables_cudagraphs_for_mtp(
         ),
     )
 
-    assert FlashMLASparseMetadataBuilder.get_cudagraph_support(
-        vllm_config,
-        mla_spec,
-    ) is AttentionCGSupport.NEVER
-    assert DeepseekSparseSWAMetadataBuilder.get_cudagraph_support(
-        vllm_config,
-        swa_spec,
-    ) is AttentionCGSupport.NEVER
+    assert (
+        FlashMLASparseMetadataBuilder.get_cudagraph_support(
+            vllm_config,
+            mla_spec,
+        )
+        is AttentionCGSupport.NEVER
+    )
+    assert (
+        DeepseekSparseSWAMetadataBuilder.get_cudagraph_support(
+            vllm_config,
+            swa_spec,
+        )
+        is AttentionCGSupport.NEVER
+    )
 
     disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config)
 
