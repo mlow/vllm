@@ -218,6 +218,33 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+def _should_disable_mtp_full_cudagraph_for_padded_batch(
+    speculative_config: Any,
+    cudagraph_mode: CUDAGraphMode,
+    num_tokens: int,
+    num_reqs: int,
+    batch_descriptor: BatchDescriptor,
+) -> bool:
+    """Return true for MTP decode batches that need graph padding.
+
+    MTP schedules num_speculative_tokens + 1 tokens per request. FULL
+    cudagraph dispatch may pad a partially filled batch, e.g. 7 requests x 3
+    tokens to a captured 8-request graph. On SM12x this shape has been observed
+    to hang during graph replay, so only those padded FULL-graph steps fall back
+    to eager execution.
+    """
+    if cudagraph_mode != CUDAGraphMode.FULL:
+        return False
+    if getattr(speculative_config, "method", None) != "mtp":
+        return False
+    if batch_descriptor.num_tokens != num_tokens:
+        return True
+    if batch_descriptor.num_reqs is None:
+        return False
+    return batch_descriptor.num_reqs != num_reqs
+
+
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
@@ -3706,6 +3733,15 @@ class GPUModelRunner(
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(
             num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
         )
+        if _should_disable_mtp_full_cudagraph_for_padded_batch(
+            self.speculative_config,
+            cudagraph_mode,
+            num_tokens_padded,
+            num_reqs,
+            batch_descriptor,
+        ):
+            cudagraph_mode = CUDAGraphMode.NONE
+            batch_descriptor = BatchDescriptor(num_tokens_padded)
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
             assert (

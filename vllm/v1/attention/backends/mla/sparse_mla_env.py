@@ -35,10 +35,15 @@ def _optional_env_flag(name: str) -> bool | None:
 
 
 def _is_sm12x_device(device: torch.device) -> bool:
-    if not torch.cuda.is_available():
+    if not current_platform.is_cuda():
         return False
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    return torch.cuda.get_device_capability(index)[0] == 12
+    index = (
+        device.index
+        if device.index is not None
+        else torch.accelerator.current_device_index()
+    )
+    capability = current_platform.get_device_capability(device_id=index)
+    return capability is not None and capability[0] == 12
 
 
 def triton_sparse_mla_configured() -> bool | None:
@@ -59,15 +64,34 @@ def is_triton_sparse_mla_enabled(device: torch.device) -> bool:
     return _is_sm12x_device(device)
 
 
+def _uses_speculative_decoding(vllm_config) -> bool:
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return False
+    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", 0)
+    return bool(num_speculative_tokens)
+
+
 def triton_sparse_mla_cudagraphs_allowed(vllm_config=None) -> bool:
     configured = _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV)
     if configured is not None:
         return configured
-    return True
+    return not _uses_speculative_decoding(vllm_config)
 
 
 def disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config) -> None:
     if not is_triton_sparse_mla_enabled_for_platform():
+        return
+
+    configured = _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV)
+    if configured is None and _uses_speculative_decoding(vllm_config):
+        logger.warning_once(
+            "Disabling CUDA graph capture for the DeepSeek V4 Triton sparse "
+            "MLA attention kernels under speculative decoding, while keeping "
+            "vLLM compile enabled. Set "
+            f"{_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV}=1 to opt into the "
+            "experimental graph-captured MTP path."
+        )
         return
     if triton_sparse_mla_cudagraphs_allowed(vllm_config):
         logger.warning_once(
