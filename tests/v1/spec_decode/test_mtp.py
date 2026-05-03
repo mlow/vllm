@@ -23,6 +23,9 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.load import LoadConfig
+from vllm.model_executor.models.deepseek_v4_mtp import (
+    DeepSeekV4MultiTokenPredictorLayer,
+)
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -35,6 +38,16 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 mimo_7b_dir = "XiaomiMiMo/MiMo-7B-Base"
 DEVICE_TYPE = current_platform.device_type
+
+
+class _CapturingMTPBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.input_ids = None
+
+    def forward(self, *, positions, x, input_ids):
+        self.input_ids = input_ids
+        return x
 
 
 def _create_sampling_metadata(
@@ -155,6 +168,32 @@ def test_mtp_load_model_unified(mock_get_model, mock_get_layers, mock_get_pp_gro
     assert proposer.model.lm_head == target_model.lm_head
     # MTP shares embed_tokens with target model
     assert proposer.model.model.embed_tokens == target_model.model.embed_tokens
+
+
+def test_deepseek_v4_mtp_layer_passes_input_ids_to_decoder_block():
+    layer = object.__new__(DeepSeekV4MultiTokenPredictorLayer)
+    torch.nn.Module.__init__(layer)
+    layer.config = mock.MagicMock(hidden_size=2)
+    layer.hc_mult = 2
+    layer.enorm = torch.nn.Identity()
+    layer.hnorm = torch.nn.Identity()
+    layer.e_proj = torch.nn.Identity()
+    layer.h_proj = torch.nn.Identity()
+    layer.mtp_block = _CapturingMTPBlock()
+
+    input_ids = torch.tensor([10, 11], dtype=torch.int32)
+    positions = torch.tensor([1, 2], dtype=torch.int64)
+    inputs_embeds = torch.ones(2, 2)
+    previous_hidden_states = torch.ones(2, 4)
+
+    layer(
+        input_ids=input_ids,
+        positions=positions,
+        previous_hidden_states=previous_hidden_states,
+        inputs_embeds=inputs_embeds,
+    )
+
+    assert layer.mtp_block.input_ids is input_ids
 
 
 @pytest.mark.parametrize("num_speculative_tokens", [1])
@@ -391,8 +430,7 @@ def test_mtp_sequential_drafting_passes_spec_step_indices():
         for call in model_mock.compute_logits.call_args_list
     ] == [0, 1]
     assert [
-        call.kwargs.get("spec_step_idx", 0)
-        for call in model_mock.call_args_list
+        call.kwargs.get("spec_step_idx", 0) for call in model_mock.call_args_list
     ] == [0, 1]
 
 

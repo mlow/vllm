@@ -142,7 +142,7 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             inputs_embeds
         ).unsqueeze(-2)
         hidden_states = self.mtp_block(
-            positions=positions, x=hidden_states, input_ids=None
+            positions=positions, x=hidden_states, input_ids=input_ids
         )
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when

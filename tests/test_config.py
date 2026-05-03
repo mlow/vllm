@@ -33,6 +33,7 @@ from vllm.config.vllm import (
     OptimizationLevel,
 )
 from vllm.platforms import current_platform
+from vllm.v1.engine.core import _disable_batch_queue_for_mtp_pp
 
 DEVICE_TYPE = current_platform.device_type
 
@@ -138,6 +139,87 @@ def test_async_scheduling_with_pipeline_parallelism_is_allowed():
         ),
     )
     assert cfg.scheduler_config.async_scheduling is True
+
+
+def _make_mtp_speculative_config(num_speculative_tokens: int = 2):
+    speculative_config = object.__new__(SpeculativeConfig)
+    speculative_config.method = "mtp"
+    speculative_config.num_speculative_tokens = num_speculative_tokens
+    speculative_config.disable_padded_drafter_batch = False
+    speculative_config.draft_model_config = None
+    speculative_config.model = "stub"
+    speculative_config.draft_tensor_parallel_size = None
+    return speculative_config
+
+
+def test_async_scheduling_with_mtp_pipeline_parallelism_is_disabled_by_default():
+    cfg = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
+            async_scheduling=None,
+        ),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=2,
+            distributed_executor_backend="mp",
+            nnodes=2,
+        ),
+        speculative_config=_make_mtp_speculative_config(),
+    )
+
+    assert cfg.scheduler_config.async_scheduling is False
+
+
+def test_async_scheduling_with_mtp_pipeline_parallelism_fails_when_forced():
+    with pytest.raises(ValueError, match="MTP speculative decoding"):
+        VllmConfig(
+            scheduler_config=SchedulerConfig(
+                max_model_len=8192,
+                is_encoder_decoder=False,
+                async_scheduling=True,
+            ),
+            parallel_config=ParallelConfig(
+                pipeline_parallel_size=2,
+                distributed_executor_backend="mp",
+                nnodes=2,
+            ),
+            speculative_config=_make_mtp_speculative_config(),
+        )
+
+
+def test_mtp_pipeline_parallelism_disables_batch_queue():
+    cfg = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
+            async_scheduling=False,
+        ),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=2,
+            distributed_executor_backend="mp",
+            nnodes=2,
+        ),
+        speculative_config=_make_mtp_speculative_config(),
+    )
+
+    assert _disable_batch_queue_for_mtp_pp(cfg)
+
+
+def test_non_mtp_pipeline_parallelism_keeps_batch_queue():
+    cfg = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_model_len=8192,
+            is_encoder_decoder=False,
+            async_scheduling=False,
+        ),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=2,
+            distributed_executor_backend="mp",
+            nnodes=2,
+        ),
+    )
+
+    assert not _disable_batch_queue_for_mtp_pp(cfg)
 
 
 @dataclass

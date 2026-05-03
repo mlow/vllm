@@ -2398,7 +2398,11 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and spec_decode_common_attn_metadata is None
+            ):
                 if isinstance(
                     self.drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)
                 ):
@@ -2407,7 +2411,11 @@ class GPUModelRunner(
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and isinstance(self.drafter, Gemma4Proposer)
+            ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
@@ -5803,7 +5811,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if self.speculative_config and get_pp_group().is_last_rank and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -6618,7 +6626,7 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
@@ -6671,7 +6679,7 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
         ):

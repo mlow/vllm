@@ -88,6 +88,16 @@ HANDSHAKE_TIMEOUT_MINS = 5
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
+def _disable_batch_queue_for_mtp_pp(vllm_config: VllmConfig) -> bool:
+    speculative_config = vllm_config.speculative_config
+    return (
+        speculative_config is not None
+        and speculative_config.method == "mtp"
+        and vllm_config.parallel_config.pipeline_parallel_size > 1
+        and not vllm_config.scheduler_config.async_scheduling
+    )
+
+
 class EngineCore:
     """Inner loop of vLLM's Engine."""
 
@@ -186,6 +196,14 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = self.model_executor.max_concurrent_batches
+        if _disable_batch_queue_for_mtp_pp(vllm_config):
+            # Sync PP normally schedules ahead to keep the pipeline full, but
+            # MTP draft tokens must be committed after their target output has
+            # updated scheduler-side sequence and grammar state. This keeps
+            # PP+MTP correct at the cost of pipeline overlap until draft tokens
+            # can be associated with their queued target batch.
+            self.batch_queue_size = 1
+            logger.info("Disabling batch queue for MTP with pipeline parallelism.")
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None

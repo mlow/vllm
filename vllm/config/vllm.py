@@ -774,12 +774,22 @@ class VllmConfig:
         executor_backend = self.parallel_config.distributed_executor_backend
         executor_class = Executor.get_class(self)
         executor_supports_async_sched = executor_class.supports_async_scheduling()
+        mtp_with_pp = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.parallel_config.pipeline_parallel_size > 1
+        )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
             # decoding.
             if self.speculative_config is not None:
+                if mtp_with_pp:
+                    raise ValueError(
+                        "Async scheduling is not compatible with pipeline "
+                        "parallelism for MTP speculative decoding."
+                    )
                 if (
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
@@ -820,6 +830,12 @@ class VllmConfig:
                     "Async scheduling not supported with %s-based "
                     "speculative decoding and will be disabled.",
                     self.speculative_config.method,
+                )
+                self.scheduler_config.async_scheduling = False
+            elif mtp_with_pp:
+                logger.warning_once(
+                    "Async scheduling is not compatible with pipeline "
+                    "parallelism for MTP speculative decoding and will be disabled.",
                 )
                 self.scheduler_config.async_scheduling = False
             elif (
