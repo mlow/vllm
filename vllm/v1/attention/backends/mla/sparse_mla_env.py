@@ -64,34 +64,15 @@ def is_triton_sparse_mla_enabled(device: torch.device) -> bool:
     return _is_sm12x_device(device)
 
 
-def _uses_speculative_decoding(vllm_config) -> bool:
-    speculative_config = getattr(vllm_config, "speculative_config", None)
-    if speculative_config is None:
-        return False
-    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", 0)
-    return bool(num_speculative_tokens)
-
-
 def triton_sparse_mla_cudagraphs_allowed(vllm_config=None) -> bool:
     configured = _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV)
     if configured is not None:
         return configured
-    return not _uses_speculative_decoding(vllm_config)
+    return True
 
 
 def disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config) -> None:
     if not is_triton_sparse_mla_enabled_for_platform():
-        return
-
-    configured = _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV)
-    if configured is None and _uses_speculative_decoding(vllm_config):
-        logger.warning_once(
-            "Disabling CUDA graph capture for the DeepSeek V4 Triton sparse "
-            "MLA attention kernels under speculative decoding, while keeping "
-            "vLLM compile enabled. Set "
-            f"{_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV}=1 to opt into the "
-            "experimental graph-captured MTP path."
-        )
         return
     if triton_sparse_mla_cudagraphs_allowed(vllm_config):
         logger.warning_once(
