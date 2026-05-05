@@ -50,6 +50,34 @@ def test_non_sm120_cuda_sparse_indexer_still_requires_deep_gemm(monkeypatch):
     assert _sparse_indexer_requires_deep_gemm() is True
 
 
+def test_sm120_paged_mqa_metadata_does_not_call_deep_gemm(monkeypatch):
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability_family",
+        lambda capability: capability == 120,
+    )
+    monkeypatch.setattr(deep_gemm_utils, "_lazy_init", lambda: None)
+
+    def fail_deep_gemm_metadata(*args, **kwargs):
+        raise AssertionError("SM120 metadata should not call DeepGEMM")
+
+    monkeypatch.setattr(
+        deep_gemm_utils,
+        "_get_paged_mqa_logits_metadata_impl",
+        fail_deep_gemm_metadata,
+    )
+    context_lens = torch.tensor([[1], [3]], dtype=torch.int32)
+
+    metadata = deep_gemm_utils.get_paged_mqa_logits_metadata(
+        context_lens, block_size=256, num_sms=4
+    )
+
+    assert metadata.shape == (5, 2)
+    assert metadata.dtype == torch.int32
+    assert metadata.device == context_lens.device
+    torch.testing.assert_close(metadata, torch.zeros_like(metadata), rtol=0, atol=0)
+
+
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
 )

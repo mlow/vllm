@@ -651,6 +651,10 @@ def get_paged_mqa_logits_metadata(
         schedule work across SMs.
     """
     _lazy_init()
+    if current_platform.is_device_capability_family(120):
+        return torch.zeros(
+            (num_sms + 1, 2), dtype=torch.int32, device=context_lens.device
+        )
     if _get_paged_mqa_logits_metadata_impl is None:
         return _missing()
     return _get_paged_mqa_logits_metadata_impl(context_lens, block_size, num_sms)
