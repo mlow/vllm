@@ -10,6 +10,7 @@ low-batch, long-candidate DeepSeek V4 decode shapes on SM12x.
 """
 
 import dataclasses
+import inspect
 import json
 import math
 import time
@@ -17,21 +18,16 @@ from collections.abc import Callable, Iterable
 
 import torch
 
-from vllm.triton_utils import LOG2E, LOGE2, tl, triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+    choose_sparse_mla_splitkv_splits,
     matmul_sparse_mla_attention_with_sink,
+    splitkv_sparse_mla_attention_with_sink,
 )
 
-_HEAD_BLOCK = 16
-_MERGE_HEAD_BLOCK = 1
 _DIM = 512
-_BLOCK_N = 32
 _MERGE_BLOCK_D = 128
-_NUM_MERGE_D_TILES = _DIM // _MERGE_BLOCK_D
-_MIN_CANDIDATES_PER_SPLIT = 128
-_SPLIT_MAX_OCCUPANCY = 4
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,34 +50,20 @@ class BenchmarkResult:
     mean_abs_diff: float
 
 
-def _next_power_of_2(value: int) -> int:
-    return 1 << max(0, value - 1).bit_length()
-
-
 def choose_num_kv_splits(
     num_tokens: int,
     num_heads: int,
     num_candidates: int,
     sm_count: int,
-    head_block_size: int = _HEAD_BLOCK,
+    head_block_size: int = 16,
 ) -> int:
-    """Pick the split count used by the prototype auto mode.
-
-    Mirrors the split heuristic from PR #38476 but takes `num_heads` directly
-    so the benchmark can compare against the current SM12x materialized path.
-    """
-    num_head_groups = math.ceil(num_heads / min(head_block_size, num_heads))
-    baseline = num_tokens * num_head_groups
-    if baseline == 0 or baseline * _SPLIT_MAX_OCCUPANCY >= sm_count:
-        return 1
-
-    ideal = _next_power_of_2(max(1, num_candidates // _MIN_CANDIDATES_PER_SPLIT))
-    max_splits = max(1, sm_count // baseline)
-    max_splits = 1 << (max_splits.bit_length() - 1)
-    num_splits = min(ideal, max_splits)
-    while num_splits > 1 and num_candidates % num_splits != 0:
-        num_splits //= 2
-    return max(1, num_splits)
+    return choose_sparse_mla_splitkv_splits(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        num_candidates=num_candidates,
+        sm_count=sm_count,
+        head_block_size=head_block_size,
+    )
 
 
 def _parse_int_list(raw: str) -> list[int]:
@@ -109,6 +91,16 @@ def _parse_splits(raw: str) -> list[int | None]:
     return splits
 
 
+def _filter_matmul_kwargs(
+    fn: Callable[..., object],
+    optional_kwargs: dict[str, object],
+) -> dict[str, object]:
+    parameters = inspect.signature(fn).parameters
+    return {
+        name: value for name, value in optional_kwargs.items() if name in parameters
+    }
+
+
 def _iter_cases(
     token_counts: Iterable[int],
     candidate_counts: Iterable[int],
@@ -121,239 +113,6 @@ def _iter_cases(
                 num_candidates=num_candidates,
                 num_heads=num_heads,
             )
-
-
-@triton.jit
-def _splitkv_stage1_kernel(
-    q_ptr,
-    kv_ptr,
-    valid_ptr,
-    mid_ptr,
-    stride_qt: tl.constexpr,
-    stride_qh: tl.constexpr,
-    stride_qd: tl.constexpr,
-    stride_kvt: tl.constexpr,
-    stride_kvc: tl.constexpr,
-    stride_kvd: tl.constexpr,
-    stride_vt: tl.constexpr,
-    stride_vc: tl.constexpr,
-    stride_mt: tl.constexpr,
-    stride_mh: tl.constexpr,
-    stride_ms: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_candidates: tl.constexpr,
-    scale: tl.constexpr,
-    num_splits: tl.constexpr,
-    HEAD_BLOCK: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    LOGE2_VALUE: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    head_group = tl.program_id(1)
-    split_id = tl.program_id(2)
-
-    offs_h = head_group * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
-    mask_h = offs_h < num_heads
-    offs_d = tl.arange(0, BLOCK_D)
-
-    q = tl.load(
-        q_ptr
-        + token_id * stride_qt
-        + offs_h[:, None] * stride_qh
-        + offs_d[None, :] * stride_qd,
-        mask=mask_h[:, None],
-        other=0.0,
-    )
-
-    split_size: tl.constexpr = tl.cdiv(num_candidates, num_splits)
-    split_start = split_id * split_size
-    split_end = tl.minimum(split_start + split_size, num_candidates)
-
-    neg_large = -1.0e30
-    e_max = tl.full((HEAD_BLOCK,), neg_large, dtype=tl.float32)
-    e_sum = tl.zeros((HEAD_BLOCK,), dtype=tl.float32)
-    acc = tl.zeros((HEAD_BLOCK, BLOCK_D), dtype=tl.float32)
-
-    for cand_start in range(split_start, split_end, BLOCK_N):
-        offs_c = cand_start + tl.arange(0, BLOCK_N)
-        mask_c = offs_c < split_end
-        valid = tl.load(
-            valid_ptr + token_id * stride_vt + offs_c * stride_vc,
-            mask=mask_c,
-            other=0,
-        )
-        mask_kv = mask_c & valid
-        k = tl.load(
-            kv_ptr
-            + token_id * stride_kvt
-            + offs_c[:, None] * stride_kvc
-            + offs_d[None, :] * stride_kvd,
-            mask=mask_kv[:, None],
-            other=0.0,
-        )
-        qk = tl.dot(q, tl.trans(k.to(q.dtype))) * scale
-        qk = tl.where(mask_h[:, None] & mask_kv[None, :], qk, neg_large)
-
-        n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-        re_scale = tl.exp2(e_max - n_e_max)
-        p = tl.exp2(qk - n_e_max[:, None])
-        acc *= re_scale[:, None]
-        acc += tl.dot(p.to(k.dtype), k)
-        e_sum = e_sum * re_scale + tl.sum(p, 1)
-        e_max = n_e_max
-
-    e_sum_safe = tl.where(e_sum > 0, e_sum, 1.0)
-    mid_base = (
-        mid_ptr
-        + token_id * stride_mt
-        + offs_h[:, None] * stride_mh
-        + split_id * stride_ms
-    )
-    tl.store(
-        mid_base + offs_d[None, :],
-        acc / e_sum_safe[:, None],
-        mask=mask_h[:, None],
-    )
-    tl.store(
-        mid_ptr
-        + token_id * stride_mt
-        + offs_h * stride_mh
-        + split_id * stride_ms
-        + BLOCK_D,
-        (e_max + tl.log2(e_sum)) * LOGE2_VALUE,
-        mask=mask_h,
-    )
-
-
-@triton.jit
-def _splitkv_merge_kernel(
-    mid_ptr,
-    sink_ptr,
-    output_ptr,
-    stride_mt: tl.constexpr,
-    stride_mh: tl.constexpr,
-    stride_ms: tl.constexpr,
-    stride_out_t: tl.constexpr,
-    stride_oh: tl.constexpr,
-    stride_od: tl.constexpr,
-    num_heads: tl.constexpr,
-    num_splits: tl.constexpr,
-    HEAD_BLOCK: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_D_TILE: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    head_group = tl.program_id(1)
-    d_tile = tl.program_id(2)
-
-    offs_h = head_group * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
-    mask_h = offs_h < num_heads
-    offs_d = d_tile * BLOCK_D_TILE + tl.arange(0, BLOCK_D_TILE)
-    mask_d = offs_d < BLOCK_D
-
-    e_max = tl.full((HEAD_BLOCK,), -float("inf"), dtype=tl.float32)
-    e_sum = tl.zeros((HEAD_BLOCK,), dtype=tl.float32)
-    acc = tl.zeros((HEAD_BLOCK, BLOCK_D_TILE), dtype=tl.float32)
-    mid_base = mid_ptr + token_id * stride_mt + offs_h[:, None] * stride_mh
-    mid_lse = mid_ptr + token_id * stride_mt + offs_h * stride_mh + BLOCK_D
-
-    for split_id in range(num_splits):
-        part = tl.load(
-            mid_base + split_id * stride_ms + offs_d[None, :],
-            mask=mask_h[:, None] & mask_d[None, :],
-            other=0.0,
-        )
-        lse = tl.load(
-            mid_lse + split_id * stride_ms,
-            mask=mask_h,
-            other=-float("inf"),
-        )
-        n_e_max = tl.maximum(lse, e_max)
-        old_scale = tl.exp(e_max - n_e_max)
-        part_scale = tl.exp(lse - n_e_max)
-        acc = acc * old_scale[:, None] + part * part_scale[:, None]
-        e_sum = e_sum * old_scale + part_scale
-        e_max = n_e_max
-
-    sink = tl.load(sink_ptr + offs_h, mask=mask_h, other=-float("inf"))
-    n_e_max = tl.maximum(sink, e_max)
-    value_scale = tl.exp(e_max - n_e_max)
-    sink_scale = tl.exp(sink - n_e_max)
-    denom = e_sum * value_scale + sink_scale
-    denom = tl.where(denom > 0, denom, 1.0)
-    merged = acc * value_scale[:, None] / denom[:, None]
-
-    tl.store(
-        output_ptr
-        + token_id * stride_out_t
-        + offs_h[:, None] * stride_oh
-        + offs_d[None, :] * stride_od,
-        merged.to(tl.bfloat16),
-        mask=mask_h[:, None] & mask_d[None, :],
-    )
-
-
-def splitkv_sparse_mla_attention_with_sink(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    valid_tokens: torch.Tensor,
-    scale: float,
-    attn_sink: torch.Tensor,
-    output: torch.Tensor,
-    mid: torch.Tensor,
-    num_splits: int,
-) -> None:
-    num_tokens, num_heads, head_dim = q.shape
-    assert head_dim == _DIM
-    assert kv.shape == (num_tokens, valid_tokens.shape[1], _DIM)
-    assert output.shape == (num_tokens, num_heads, _DIM)
-    assert mid.shape == (num_tokens, num_heads, num_splits, _DIM + 1)
-    num_candidates = kv.shape[1]
-    num_head_groups = triton.cdiv(num_heads, _HEAD_BLOCK)
-    _splitkv_stage1_kernel[(num_tokens, num_head_groups, num_splits)](
-        q,
-        kv,
-        valid_tokens,
-        mid,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        kv.stride(0),
-        kv.stride(1),
-        kv.stride(2),
-        valid_tokens.stride(0),
-        valid_tokens.stride(1),
-        mid.stride(0),
-        mid.stride(1),
-        mid.stride(2),
-        num_heads,
-        num_candidates,
-        scale * LOG2E,
-        num_splits,
-        HEAD_BLOCK=_HEAD_BLOCK,
-        BLOCK_N=_BLOCK_N,
-        BLOCK_D=_DIM,
-        LOGE2_VALUE=LOGE2,
-        num_warps=4,
-    )
-    _splitkv_merge_kernel[(num_tokens, num_heads, _NUM_MERGE_D_TILES)](
-        mid,
-        attn_sink,
-        output,
-        mid.stride(0),
-        mid.stride(1),
-        mid.stride(2),
-        output.stride(0),
-        output.stride(1),
-        output.stride(2),
-        num_heads,
-        num_splits,
-        HEAD_BLOCK=_MERGE_HEAD_BLOCK,
-        BLOCK_D=_DIM,
-        BLOCK_D_TILE=_MERGE_BLOCK_D,
-        num_warps=2,
-    )
 
 
 def _benchmark_cuda(fn: Callable[[], None], warmup: int, iters: int) -> float:
@@ -465,6 +224,15 @@ def run_case(
     )
 
     def run_current() -> None:
+        kwargs = _filter_matmul_kwargs(
+            matmul_sparse_mla_attention_with_sink,
+            {
+                "num_heads": case.num_heads,
+                "score_buffer": score_buffer,
+                "value_block_size": 512,
+                "candidate_block_size": 128,
+            },
+        )
         matmul_sparse_mla_attention_with_sink(
             q,
             kv,
@@ -472,10 +240,7 @@ def run_case(
             scale,
             attn_sink,
             current_out,
-            num_heads=case.num_heads,
-            score_buffer=score_buffer,
-            value_block_size=512,
-            candidate_block_size=128,
+            **kwargs,
         )
 
     def run_splitkv() -> None:

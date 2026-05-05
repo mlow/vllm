@@ -15,6 +15,7 @@ _TRITON_MLA_SPARSE_QUERY_CHUNK_ENV = "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE"
 _TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV = "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH"
 _TRITON_MLA_SPARSE_HEAD_BLOCK_ENV = "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE"
 _TRITON_MLA_SPARSE_MATMUL_DECODE_ENV = "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE"
+_TRITON_MLA_SPARSE_SPLITKV_DECODE_ENV = "VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE"
 
 _ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ENV_FALSE_VALUES = {"0", "false", "no", "off"}
@@ -143,3 +144,10 @@ def triton_sparse_mla_matmul_decode_enabled() -> bool:
     if configured is not None:
         return configured
     return current_platform.is_device_capability_family(120)
+
+
+def triton_sparse_mla_splitkv_decode_enabled() -> bool:
+    configured = _optional_env_flag(_TRITON_MLA_SPARSE_SPLITKV_DECODE_ENV)
+    if configured is not None:
+        return configured
+    return False

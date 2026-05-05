@@ -20,6 +20,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import fp8_einsum, use_deepgemm_sm12x_kernels
+from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
@@ -88,6 +89,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled_for_platform,
     triton_sparse_mla_matmul_decode_enabled,
     triton_sparse_mla_query_chunk_size,
+    triton_sparse_mla_splitkv_decode_enabled,
     triton_sparse_mla_topk_chunk_size,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
@@ -95,12 +97,14 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_sparse_mla_attention_chunk,
     build_combined_sparse_mla_decode_valid_mask,
+    choose_sparse_mla_splitkv_splits,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
     fp8ds_global_paged_sparse_mla_attention_with_sink_multihead,
     fp8ds_paged_sparse_mla_attention_with_sink_multihead,
     matmul_sparse_mla_attention_with_sink,
     sparse_mla_decode_head_block_size,
+    splitkv_sparse_mla_attention_with_sink,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
@@ -1088,17 +1092,49 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             and triton_sparse_mla_matmul_decode_enabled()
         ):
             total_candidates = compressed_topk + max_swa_len
-            (
-                combined_kv,
-                valid_tokens,
-                score_buffer,
-            ) = current_workspace_manager().get_simultaneous(
+            num_splitkv_splits = 1
+            if triton_sparse_mla_splitkv_decode_enabled():
+                num_splitkv_splits = choose_sparse_mla_splitkv_splits(
+                    num_tokens=num_decode_tokens,
+                    num_heads=self.num_heads,
+                    num_candidates=total_candidates,
+                    sm_count=num_compute_units(
+                        torch.accelerator.current_device_index()
+                    ),
+                )
+            use_splitkv = num_splitkv_splits > 1
+            workspace_specs = [
                 (
                     (num_decode_tokens, total_candidates, q.shape[-1]),
                     torch.bfloat16,
                 ),
                 ((num_decode_tokens, total_candidates), torch.bool),
-                ((num_decode_tokens, self.num_heads, total_candidates), torch.bfloat16),
+            ]
+            if use_splitkv:
+                workspace_specs.append(
+                    (
+                        (
+                            num_decode_tokens,
+                            self.num_heads,
+                            num_splitkv_splits,
+                            q.shape[-1] + 1,
+                        ),
+                        torch.float32,
+                    )
+                )
+            else:
+                workspace_specs.append(
+                    (
+                        (num_decode_tokens, self.num_heads, total_candidates),
+                        torch.bfloat16,
+                    )
+                )
+            (
+                combined_kv,
+                valid_tokens,
+                score_or_mid_buffer,
+            ) = current_workspace_manager().get_simultaneous(
+                *workspace_specs,
             )
             if mtp_decode:
                 dequantize_global_slots_k_cache(
@@ -1132,6 +1168,22 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 topk_lens,
                 swa_lens,
             )
+            if use_splitkv:
+                splitkv_sparse_mla_attention_with_sink(
+                    q=q,
+                    kv=combined_kv,
+                    valid_tokens=valid_tokens,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    output=output,
+                    mid=score_or_mid_buffer,
+                    num_splits=num_splitkv_splits,
+                    num_heads=self.num_heads,
+                )
+                if output.shape[1] > self.num_heads:
+                    output[:, self.num_heads :].zero_()
+                return
+
             use_dot_finish = num_decode_tokens <= 16
             matmul_sparse_mla_attention_with_sink(
                 q=q,
@@ -1141,7 +1193,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 attn_sink=self.attn_sink,
                 output=output,
                 num_heads=self.num_heads,
-                score_buffer=score_buffer,
+                score_buffer=score_or_mid_buffer,
                 value_block_size=512 if use_dot_finish else 256,
                 candidate_block_size=128 if use_dot_finish else None,
             )
