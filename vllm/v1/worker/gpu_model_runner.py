@@ -3436,6 +3436,12 @@ class GPUModelRunner(
             return None
 
         prev_positions = self.prev_positions.np[: len(num_draft_tokens)]
+        if (
+            not self.use_async_scheduling
+            and np.all(prev_positions < 0)
+            and draft_probs.shape[0] >= len(num_draft_tokens)
+        ):
+            prev_positions = np.arange(len(num_draft_tokens))
         stable_positions = np.array_equal(
             prev_positions, np.arange(len(num_draft_tokens))
         )

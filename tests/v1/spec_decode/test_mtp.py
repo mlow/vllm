@@ -318,6 +318,82 @@ def test_mtp_propose_random_sampling_records_draft_probs():
     expected_probs = torch.softmax(logits, dim=-1).view(batch_size, 1, vocab_size)
     assert torch.allclose(proposer.draft_probs, expected_probs)
 
+def test_mtp_sequential_drafting_passes_spec_step_indices():
+    device = torch.device(DEVICE_TYPE)
+    batch_size = 2
+    seq_lens = [3, 2]
+    total_tokens = sum(seq_lens)
+    vocab_size = 4
+    num_spec_tokens = 2
+
+    proposer = _create_mtp_proposer(num_speculative_tokens=num_spec_tokens)
+    proposer.block_size = 16
+    hidden_size = proposer.hidden_size
+
+    model_mock = mock.MagicMock()
+    model_mock.side_effect = [
+        torch.zeros(total_tokens, hidden_size, device=device),
+        torch.zeros(batch_size, hidden_size, device=device),
+    ]
+
+    def logits_for_token(token_id: int):
+        logits = torch.full((batch_size, vocab_size), -100.0, device=device)
+        logits[:, token_id] = 100.0
+        return logits
+
+    model_mock.compute_logits.side_effect = [
+        logits_for_token(1),
+        logits_for_token(2),
+    ]
+    proposer.model = model_mock
+    proposer._draft_attn_layer_names = {"layer.0"}
+
+    batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=seq_lens)
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec, block_size=16, device=device
+    )
+    attn_metadata_builder_cls, _ = try_get_attention_backend(
+        AttentionBackendEnum.FLASH_ATTN
+    )
+    attn_metadata_builder = attn_metadata_builder_cls(
+        kv_cache_spec=create_standard_kv_cache_spec(proposer.vllm_config),
+        layer_names=list(proposer._draft_attn_layer_names),
+        vllm_config=proposer.vllm_config,
+        device=device,
+    )
+    mock_attn_group = mock.MagicMock()
+    mock_attn_group.get_metadata_builder.return_value = attn_metadata_builder
+    mock_attn_group.layer_names = list(proposer._draft_attn_layer_names)
+    mock_attn_group.kv_cache_spec = attn_metadata_builder.kv_cache_spec
+    proposer.draft_attn_groups = [mock_attn_group]
+
+    result = proposer.propose(
+        target_token_ids=torch.randint(0, vocab_size, (total_tokens,), device=device),
+        target_positions=torch.arange(total_tokens, device=device),
+        target_hidden_states=torch.randn(total_tokens, hidden_size, device=device),
+        next_token_ids=torch.randint(
+            0, vocab_size, (batch_size,), dtype=torch.int32, device=device
+        ),
+        token_indices_to_sample=None,
+        common_attn_metadata=common_attn_metadata,
+        sampling_metadata=_create_sampling_metadata(
+            all_greedy=True, batch_size=batch_size
+        ),
+    )
+
+    assert torch.equal(
+        result,
+        torch.tensor([[1, 2], [1, 2]], device=device),
+    )
+    assert [
+        call.kwargs.get("spec_step_idx", 0)
+        for call in model_mock.compute_logits.call_args_list
+    ] == [0, 1]
+    assert [
+        call.kwargs.get("spec_step_idx", 0)
+        for call in model_mock.call_args_list
+    ] == [0, 1]
+
 
 def test_mtp_draft_sampling_applies_top_k_to_draft_probs():
     logits = torch.tensor([[0.0, 1.0, 2.0, 3.0]], device=DEVICE_TYPE)
@@ -451,5 +527,25 @@ def test_gpu_runner_packs_mtp_draft_probs_after_batch_reorder():
     packed = GPUModelRunner._get_draft_probs_for_rejection(runner_stub, metadata)
 
     expected = torch.cat([draft_probs[2, :1], draft_probs[0, :2]], dim=0)
+    assert torch.equal(packed, expected)
+    assert packed.is_contiguous()
+
+
+def test_gpu_runner_packs_sync_mtp_draft_probs_without_prev_request_map():
+    vocab_size = 5
+    draft_probs = torch.arange(
+        3 * 2 * vocab_size, dtype=torch.float32, device=DEVICE_TYPE
+    ).view(3, 2, vocab_size)
+    metadata = SpecDecodeMetadata.make_dummy(
+        draft_token_ids=[[1, 2], [], [3]], device=torch.device(DEVICE_TYPE)
+    )
+    runner_stub = mock.MagicMock()
+    runner_stub._draft_probs = draft_probs
+    runner_stub.prev_positions.np = np.full(3, -1)
+    runner_stub.use_async_scheduling = False
+
+    packed = GPUModelRunner._get_draft_probs_for_rejection(runner_stub, metadata)
+
+    expected = torch.cat([draft_probs[0, :2], draft_probs[2, :1]], dim=0)
     assert torch.equal(packed, expected)
     assert packed.is_contiguous()
