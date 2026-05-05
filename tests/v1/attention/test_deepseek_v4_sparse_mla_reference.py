@@ -49,6 +49,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     merge_sparse_mla_subset_with_sink,
     merge_two_sparse_mla_subsets_with_sink,
     sparse_mla_decode_head_block_size,
+    splitkv_sparse_mla_attention_with_sink,
 )
 from vllm.v1.attention.backends.mla.sparse_mla_reference import (
     accumulate_reference_attention_chunk,
@@ -524,6 +525,105 @@ def test_compressed_mtp_decode_triton_uses_matmul_with_global_slots(
     assert captured["valid_mask_shape"] == (6, 12)
     assert captured["matmul_kv_shape"] == (6, 12, 512)
     assert captured["matmul_valid_tokens_shape"] == (6, 12)
+
+
+def test_compressed_mtp_decode_triton_uses_splitkv_when_enabled(
+    monkeypatch,
+) -> None:
+    captured: dict[str, Any] = {"dequant_slot_ids": []}
+
+    def fake_dequantize_global_slots(output, k_cache, slot_ids, block_size) -> None:
+        captured["dequant_slot_ids"].append(slot_ids)
+        output.zero_()
+
+    def fake_build_valid_mask(output, compressed_slot_ids, topk_lens, swa_lens) -> None:
+        captured["valid_mask_shape"] = output.shape
+        output.zero_()
+
+    def fail_matmul_decode(**kwargs) -> None:
+        raise AssertionError("split-KV decode should bypass matmul path")
+
+    def fake_splitkv_decode(**kwargs) -> None:
+        captured["splitkv_kv_shape"] = kwargs["kv"].shape
+        captured["splitkv_valid_tokens_shape"] = kwargs["valid_tokens"].shape
+        captured["splitkv_mid_shape"] = kwargs["mid"].shape
+        captured["splitkv_num_splits"] = kwargs["num_splits"]
+        kwargs["output"].zero_()
+
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "current_workspace_manager",
+        lambda: _FakeWorkspaceManager(),
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "triton_sparse_mla_matmul_decode_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "triton_sparse_mla_splitkv_decode_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "choose_sparse_mla_splitkv_splits",
+        lambda **kwargs: 4,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "dequantize_global_slots_k_cache",
+        fake_dequantize_global_slots,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "build_combined_sparse_mla_decode_valid_mask",
+        fake_build_valid_mask,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "matmul_sparse_mla_attention_with_sink",
+        fail_matmul_decode,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_attention_module,
+        "splitkv_sparse_mla_attention_with_sink",
+        fake_splitkv_decode,
+    )
+
+    (
+        attention,
+        q,
+        compressed_k_cache,
+        swa_k_cache,
+        topk_slot_ids,
+        topk_lens,
+        swa_metadata,
+        attn_metadata,
+        output,
+    ) = _compressed_mtp_decode_inputs()
+
+    deepseek_v4_attention_module.DeepseekV4MLAAttention._forward_sparse_mla_compressed_decode_triton(
+        attention,
+        q=q,
+        compressed_k_cache=compressed_k_cache,
+        swa_k_cache=swa_k_cache,
+        topk_indices=topk_slot_ids,
+        topk_lens=topk_lens,
+        swa_metadata=swa_metadata,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+
+    dequant_slot_ids = captured["dequant_slot_ids"]
+    assert len(dequant_slot_ids) == 2
+    torch.testing.assert_close(dequant_slot_ids[0], topk_slot_ids[:, 0])
+    torch.testing.assert_close(dequant_slot_ids[1], swa_metadata.decode_swa_indices)
+    assert captured["valid_mask_shape"] == (6, 12)
+    assert captured["splitkv_kv_shape"] == (6, 12, 512)
+    assert captured["splitkv_valid_tokens_shape"] == (6, 12)
+    assert captured["splitkv_mid_shape"] == (6, 2, 4, 513)
+    assert captured["splitkv_num_splits"] == 4
 
 
 def test_compressed_mtp_decode_triton_falls_back_to_global_swa_slots(
@@ -2596,6 +2696,47 @@ def test_matmul_sparse_mla_attention_with_sink_matches_reference() -> None:
     )
 
     torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_splitkv_sparse_mla_attention_with_sink_matches_matmul_path() -> None:
+    torch.manual_seed(89)
+    q = torch.randn(2, 1, 5, 512, device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(2, 128, 512, device="cuda", dtype=torch.bfloat16)
+    valid_tokens = torch.ones(2, 128, dtype=torch.bool, device="cuda")
+    valid_tokens[0, 5::7] = False
+    valid_tokens[1, 3::5] = False
+    sink = torch.linspace(-0.25, 0.25, 5, device="cuda")
+    scale = 0.0625
+
+    expected = torch.empty(2, 5, 512, device="cuda", dtype=torch.bfloat16)
+    matmul_sparse_mla_attention_with_sink(
+        q,
+        kv,
+        valid_tokens,
+        scale,
+        sink,
+        expected,
+        num_heads=5,
+        value_block_size=512,
+        candidate_block_size=128,
+    )
+
+    actual = torch.empty_like(expected)
+    mid = torch.empty(2, 5, 4, 513, device="cuda", dtype=torch.float32)
+    splitkv_sparse_mla_attention_with_sink(
+        q,
+        kv,
+        valid_tokens,
+        scale,
+        sink,
+        actual,
+        mid,
+        num_splits=4,
+        num_heads=5,
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")

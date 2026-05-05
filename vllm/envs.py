@@ -176,6 +176,7 @@ if TYPE_CHECKING:
     VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH: bool = True
     VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
     VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool | None = None
+    VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1337,6 +1338,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE") is None
         else os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE", "").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE": lambda: (
+        os.getenv("VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE", "0").lower()
         in ("1", "true", "yes", "on")
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
