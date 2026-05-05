@@ -256,6 +256,59 @@ def test_deepseek_v4_uses_v4_tool_prompt_from_request_tools():
     assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
 
 
+def test_deepseek_v4_drops_prior_reasoning_on_new_user_turn_with_tools():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+    messages = [
+        {"role": "user", "content": "Question one"},
+        {
+            "role": "assistant",
+            "reasoning": "private prior reasoning",
+            "content": "Answer one",
+        },
+        {"role": "user", "content": "Question two"},
+    ]
+    request = ChatCompletionRequest.model_validate(
+        {
+            "model": "deepseek-ai/DeepSeek-V4-Flash",
+            "messages": messages,
+            "tools": tools,
+        }
+    )
+    chat_kwargs = request.apply_chat_template_kwargs(
+        request.build_chat_params(None, "auto").chat_template_kwargs
+    )
+    conversation, _, _ = parse_chat_messages(
+        messages,
+        _model_config(),
+        content_format="string",
+    )
+
+    prompt = _tokenizer().apply_chat_template(
+        conversation,
+        tools=tools,
+        tokenize=False,
+        **chat_kwargs,
+    )
+
+    assert '"name": "get_weather"' in prompt
+    assert "private prior reasoning" not in prompt
+    assert "Answer one<｜end▁of▁sentence｜>" in prompt
+    assert prompt.endswith("<｜User｜>Question two<｜Assistant｜><think>")
+
+
 def test_deepseek_v4_renders_parsed_history_tool_arguments():
     messages = [
         {"role": "user", "content": "List the repo"},
