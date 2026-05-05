@@ -144,7 +144,12 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
             inputs_embeds
         ).unsqueeze(-2)
         hidden_states, residual, post_mix, res_mix = self.mtp_block(
-            positions=positions, x=hidden_states, input_ids=None
+            x=hidden_states,
+            positions=positions,
+            input_ids=input_ids,
+            post_mix=None,
+            res_mix=None,
+            residual=None,
         )
         hidden_states = self.mtp_block.hc_post(
             hidden_states, residual, post_mix, res_mix
@@ -235,7 +240,12 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         hidden_states = hidden_states.view(
             -1, mtp_layer.hc_mult, mtp_layer.config.hidden_size
         )
-        hidden_states = self.hc_head_op(
+        # NOTE: upstream a8887c208 (#41946) installs the ``HCHeadOp`` instance
+        # on the inner ``DeepSeekV4MultiTokenPredictorLayer`` (the ``mtp_layer``
+        # we selected above), not on this parent module. Calling it through
+        # ``self.hc_head_op`` would AttributeError. Access via ``mtp_layer``,
+        # which already owns the matching ``hc_head_{fn,scale,base}`` weights.
+        hidden_states = mtp_layer.hc_head_op(
             hidden_states,
             mtp_layer.hc_head_fn,
             mtp_layer.hc_head_scale,
