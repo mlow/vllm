@@ -952,6 +952,54 @@ def test_deepseek_v4_sm12x_triton_fp8_einsum_primitive_matches_reference() -> No
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 15, 16, 17])
+def test_deepseek_v4_sm12x_triton_fp8_einsum_small_token_tiles_match_reference(
+    num_tokens: int,
+) -> None:
+    torch.manual_seed(41 + num_tokens)
+    num_groups = 2
+    hidden_size = 1024
+    out_rank = 256
+    recipe = (1, 128, 128)
+
+    a_backing = torch.randn(
+        (num_groups, num_tokens, hidden_size),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    a = a_backing.transpose(0, 1)
+    a_scale_backing = torch.empty(
+        (num_groups, num_tokens, hidden_size // 128),
+        device="cuda",
+        dtype=torch.float32,
+    ).uniform_(0.01, 0.02)
+    a_scale = a_scale_backing.transpose(0, 1)
+    b_flat = torch.randn(
+        (num_groups * out_rank, hidden_size),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    b = b_flat.view(num_groups, out_rank, hidden_size)
+    b_scale_flat = torch.empty(
+        (num_groups * (out_rank // 128), hidden_size // 128),
+        device="cuda",
+        dtype=torch.float32,
+    ).uniform_(0.01, 0.02)
+    b_scale = b_scale_flat.view(num_groups, out_rank // 128, hidden_size // 128)
+    expected = torch.empty(
+        (num_tokens, num_groups, out_rank),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    actual = torch.empty_like(expected)
+
+    fp8_einsum("bhr,hdr->bhd", (a, a_scale), (b, b_scale), expected, recipe=recipe)
+    deepseek_v4_sm12x_fp8_einsum(a, a_scale, b, b_scale, actual)
+
+    _assert_fp8_einsum_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
 @pytest.mark.parametrize("num_groups", [1, 2, 4])
 def test_deepseek_v4_sm12x_triton_fp8_einsum_supports_tp_local_group_counts(
     num_groups: int,
@@ -3481,7 +3529,7 @@ def test_triton_sparse_mla_path_can_disable_cudagraphs(monkeypatch) -> None:
     assert vllm_config.compilation_config.max_cudagraph_capture_size == 0
 
 
-def test_triton_sparse_mla_path_marks_attention_non_cudagraph_for_mtp(
+def test_triton_sparse_mla_path_allows_cudagraph_support_for_mtp(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE", "1")
@@ -3527,14 +3575,14 @@ def test_triton_sparse_mla_path_marks_attention_non_cudagraph_for_mtp(
             vllm_config,
             mla_spec,
         )
-        is AttentionCGSupport.NEVER
+        is AttentionCGSupport.UNIFORM_BATCH
     )
     assert (
         DeepseekSparseSWAMetadataBuilder.get_cudagraph_support(
             vllm_config,
             swa_spec,
         )
-        is AttentionCGSupport.NEVER
+        is AttentionCGSupport.UNIFORM_BATCH
     )
 
     disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config)

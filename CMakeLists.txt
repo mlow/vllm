@@ -1105,7 +1105,11 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   # - sm80 doesn't support fp8 computation
   # - sm90 and sm100 don't support QMMA.16832.F32.E4M3.E4M3 SAAS instruction
   # so we only enable fp8 computation for SM89 (e.g. RTX 40x0)  and 12.0 (e.g. RTX 50x0)
-  cuda_archs_loose_intersection(MARLIN_MOE_FP8_ARCHS "8.9;12.0;12.1" "${CUDA_ARCHS}")
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(MARLIN_MOE_FP8_ARCHS "8.9;12.0f" "${CUDA_ARCHS}")
+  else()
+    cuda_archs_loose_intersection(MARLIN_MOE_FP8_ARCHS "8.9;12.0a;12.1a" "${CUDA_ARCHS}")
+  endif()
   # moe marlin arches for other files
   cuda_archs_loose_intersection(MARLIN_MOE_OTHER_ARCHS "7.5;8.0+PTX" "${CUDA_ARCHS}")
   if (MARLIN_MOE_OTHER_ARCHS)
