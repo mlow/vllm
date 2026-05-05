@@ -76,14 +76,19 @@ def make_request(tools=None) -> MagicMock:
     return req
 
 
-def make_tool(name: str, properties: dict[str, dict]) -> MagicMock:
-    tool = MagicMock()
-    tool.function.name = name
-    tool.function.parameters = {
-        "type": "object",
-        "properties": properties,
-    }
-    return tool
+def make_tool(name: str, properties: dict[str, dict]) -> ChatCompletionToolsParam:
+    return ChatCompletionToolsParam.model_validate(
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                },
+            },
+        }
+    )
 
 
 def build_tool_call(func_name: str, params: dict[str, str]) -> str:
@@ -293,9 +298,8 @@ def test_streaming_plain_text_empty_delta_without_tokens_does_not_flush_marker_s
 
 
 def test_extract_tool_calls_non_streaming_preserves_typed_arguments():
-    parser = make_parser()
-    request = make_request(
-        [
+    parser = make_parser(
+        tools=[
             make_tool(
                 "plan_trip",
                 {
@@ -307,6 +311,7 @@ def test_extract_tool_calls_non_streaming_preserves_typed_arguments():
             )
         ]
     )
+    request = make_request()
     model_output = (
         f"{TC_START}"
         f'{INV_START}plan_trip">'
@@ -330,8 +335,10 @@ def test_extract_tool_calls_non_streaming_preserves_typed_arguments():
 
 
 def test_extract_tool_calls_repairs_arguments_wrapper_object():
-    parser = make_parser()
-    request = make_request([make_tool("get_weather", {"location": {"type": "string"}})])
+    parser = make_parser(
+        tools=[make_tool("get_weather", {"location": {"type": "string"}})]
+    )
+    request = make_request()
     model_output = (
         f"{TC_START}"
         f'{INV_START}get_weather">'
@@ -349,8 +356,10 @@ def test_extract_tool_calls_repairs_arguments_wrapper_object():
 
 
 def test_extract_tool_calls_repairs_input_wrapper_string():
-    parser = make_parser()
-    request = make_request([make_tool("get_weather", {"location": {"type": "string"}})])
+    parser = make_parser(
+        tools=[make_tool("get_weather", {"location": {"type": "string"}})]
+    )
+    request = make_request()
     model_output = (
         f"{TC_START}"
         f'{INV_START}get_weather">'
@@ -368,8 +377,10 @@ def test_extract_tool_calls_repairs_input_wrapper_string():
 
 
 def test_extract_tool_calls_unescapes_arguments_field_name():
-    parser = make_parser()
-    request = make_request([make_tool("echo_args", {"arguments": {"type": "string"}})])
+    parser = make_parser(
+        tools=[make_tool("echo_args", {"arguments": {"type": "string"}})]
+    )
+    request = make_request()
     model_output = (
         f"{TC_START}"
         f'{INV_START}echo_args">'
@@ -382,3 +393,20 @@ def test_extract_tool_calls_unescapes_arguments_field_name():
 
     assert result.tools_called
     assert json.loads(result.tool_calls[0].function.arguments) == {"arguments": "hello"}
+
+
+def test_streaming_extract_tool_calls_repairs_input_wrapper_from_parser_tools():
+    parser = make_parser(
+        tools=[make_tool("get_weather", {"location": {"type": "string"}})]
+    )
+    full_text = (
+        f"{TC_START}"
+        f'{INV_START}get_weather">'
+        f'{PARAM_START}input" string="true">{{"location": "Beijing"}}{PARAM_END}'
+        f"{INV_END}"
+        f"{TC_END}"
+    )
+
+    deltas = stream(parser, full_text, chunk_size=5)
+
+    assert json.loads(reconstruct_args(deltas)) == {"location": "Beijing"}

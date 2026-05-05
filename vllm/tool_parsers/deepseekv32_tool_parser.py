@@ -105,7 +105,12 @@ class DeepSeekV32ToolParser(ToolParser):
         """Generate a unique tool call ID."""
         return f"call_{uuid.uuid4().hex[:24]}"
 
-    def _parse_invoke_params(self, invoke_str: str) -> dict[str, str]:
+    def _parse_invoke_params(
+        self,
+        invoke_str: str,
+        request: ChatCompletionRequest | None = None,  # pylint: disable=unused-argument
+        function_name: str | None = None,  # pylint: disable=unused-argument
+    ) -> dict[str, str]:
         param_dict: dict[str, str] = {}
         for param_name, param_val in self.parameter_complete_regex.findall(invoke_str):
             param_dict[param_name] = param_val
@@ -155,7 +160,7 @@ class DeepSeekV32ToolParser(ToolParser):
     ) -> dict[str, Any]:
         """Normalize model-generated nested arguments wrapper.
 
-        DeepSeek V4 Flash may generate DSML parameters like:
+        Some DSML models may generate parameters like:
 
             <｜DSML｜parameter name="arguments" string="false">
             {"path": "/tmp/a", "content": "hello"}
@@ -237,7 +242,11 @@ class DeepSeekV32ToolParser(ToolParser):
                 for invoke_name, invoke_content in self.invoke_complete_regex.findall(
                     tool_call_match
                 ):
-                    param_dict = self._parse_invoke_params(invoke_content)
+                    param_dict = self._parse_invoke_params(
+                        invoke_content,
+                        request=request,
+                        function_name=invoke_name,
+                    )
                     converted = self._convert_params_with_schema(
                         invoke_name,
                         param_dict,
@@ -293,7 +302,11 @@ class DeepSeekV32ToolParser(ToolParser):
 
         while len(complete_invokes) > self.current_tool_index:
             invoke_name, invoke_body = complete_invokes[self.current_tool_index]
-            param_dict = self._parse_invoke_params(invoke_body)
+            param_dict = self._parse_invoke_params(
+                invoke_body,
+                request=request,
+                function_name=invoke_name,
+            )
 
             converted = self._convert_params_with_schema(invoke_name, param_dict)
             args_json = json.dumps(converted, ensure_ascii=False)

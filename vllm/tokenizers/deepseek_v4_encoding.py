@@ -330,6 +330,7 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
     tool_calls = msg.get("tool_calls")
     reasoning = msg.get("reasoning")
     wo_eos = msg.get("wo_eos", False)
+    preserve_reasoning = msg.get("__vllm_preserve_reasoning", False)
 
     if tools:
         tools = tools_from_openai_format(tools)
@@ -421,7 +422,7 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
         prev_has_task = index - 1 >= 0 and messages[index - 1].get("task") is not None
 
         if thinking_mode == "thinking" and not prev_has_task:
-            if not drop_thinking or index > last_user_idx:
+            if not drop_thinking or index > last_user_idx or preserve_reasoning:
                 thinking_part = thinking_template.format(reasoning=reasoning) + thinking_end_token
             else:
                 thinking_part = ""
@@ -463,9 +464,17 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
     elif messages[index].get("role") in ["user", "developer"]:
         # Normal generation: append Assistant + thinking token
         prompt += ASSISTANT_SP_TOKEN
+        next_preserves_reasoning = (
+            index + 1 < len(messages)
+            and messages[index + 1].get("__vllm_preserve_reasoning", False)
+        )
         if not drop_thinking and thinking_mode == "thinking":
             prompt += thinking_start_token
-        elif drop_thinking and thinking_mode == "thinking" and index >= last_user_idx:
+        elif (
+            drop_thinking
+            and thinking_mode == "thinking"
+            and (index >= last_user_idx or next_preserves_reasoning)
+        ):
             prompt += thinking_start_token
         else:
             prompt += thinking_end_token
@@ -624,10 +633,7 @@ def encode_messages(
 
     prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
 
-    # Resolve drop_thinking: if any message has tools defined, don't drop thinking
     effective_drop_thinking = drop_thinking
-    if any(m.get("tools") for m in full_messages):
-        effective_drop_thinking = False
 
     if thinking_mode == "thinking" and effective_drop_thinking:
         full_messages = _drop_thinking_messages(full_messages)
@@ -651,6 +657,60 @@ def encode_messages(
     return prompt
 
 
+def _has_tool_result_blocks(msg: Dict[str, Any]) -> bool:
+    return any(
+        block.get("type") == "tool_result"
+        for block in msg.get("content_blocks", [])
+    )
+
+
+def _tool_result_ids(msg: Dict[str, Any]) -> set[str]:
+    return {
+        block["tool_use_id"]
+        for block in msg.get("content_blocks", [])
+        if block.get("type") == "tool_result" and block.get("tool_use_id")
+    }
+
+
+def _tool_call_ids(msg: Dict[str, Any]) -> set[str]:
+    ids: set[str] = set()
+    for tool_call in msg.get("tool_calls", []):
+        if not isinstance(tool_call, dict):
+            continue
+        tool_call_id = tool_call.get("id")
+        function = tool_call.get("function")
+        if not tool_call_id and isinstance(function, dict):
+            tool_call_id = function.get("id")
+        if tool_call_id:
+            ids.add(tool_call_id)
+    return ids
+
+
+def _active_tool_call_reasoning_indices(
+    messages: List[Dict[str, Any]],
+    last_user_idx: int,
+) -> set[int]:
+    """Return assistant tool-call messages needed for the active tool result."""
+    if last_user_idx < 1 or not _has_tool_result_blocks(messages[last_user_idx]):
+        return set()
+
+    result_ids = _tool_result_ids(messages[last_user_idx])
+    for idx in range(last_user_idx - 1, -1, -1):
+        msg = messages[idx]
+        role = msg.get("role")
+
+        if role == "assistant" and msg.get("tool_calls"):
+            call_ids = _tool_call_ids(msg)
+            if not result_ids or not call_ids or result_ids & call_ids:
+                return {idx}
+            return set()
+
+        if role == "user" and not _has_tool_result_blocks(msg):
+            break
+
+    return set()
+
+
 def _drop_thinking_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Drop reasoning and non-essential messages before the last user message.
@@ -658,16 +718,34 @@ def _drop_thinking_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
     Behavior:
     - Messages with role in ["user", "system", "tool", "latest_reminder"] are always kept.
     - Messages at or after the last user index are always kept.
+    - Assistant tool-call reasoning is kept while rendering active tool results.
     - Assistant messages before the last user get reasoning removed.
     - Developer messages before the last user are dropped entirely.
     """
     last_user_idx = find_last_user_index(messages)
+    active_tool_call_indices = _active_tool_call_reasoning_indices(
+        messages,
+        last_user_idx,
+    )
+    active_tool_context_indices = {
+        idx - 1
+        for idx in active_tool_call_indices
+        if idx > 0 and messages[idx - 1].get("role") == "developer"
+    }
     result = []
     keep_roles = {"user", "system", "tool", "latest_reminder", "direct_search_results"}
 
     for idx, msg in enumerate(messages):
         role = msg.get("role")
-        if role in keep_roles or idx >= last_user_idx:
+        if (
+            role in keep_roles
+            or idx >= last_user_idx
+            or idx in active_tool_context_indices
+        ):
+            result.append(msg)
+        elif idx in active_tool_call_indices:
+            msg = copy.copy(msg)
+            msg["__vllm_preserve_reasoning"] = True
             result.append(msg)
         elif role == "assistant":
             msg = copy.copy(msg)
