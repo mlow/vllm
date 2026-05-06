@@ -318,10 +318,17 @@ class SingleTypeKVCacheManager(ABC):
             if not self._release_one_protected_prompt_block():
                 return
 
-    def _release_one_protected_prompt_block(self) -> bool:
-        while self._protected_prompt_block_queue:
+    def _release_one_protected_prompt_block(
+        self, block_ids_to_skip: set[int] | None = None
+    ) -> bool:
+        attempts = len(self._protected_prompt_block_queue)
+        while attempts:
             block_id = self._protected_prompt_block_queue.popleft()
+            attempts -= 1
             if block_id not in self._protected_prompt_block_ids:
+                continue
+            if block_ids_to_skip is not None and block_id in block_ids_to_skip:
+                self._protected_prompt_block_queue.append(block_id)
                 continue
 
             self._protected_prompt_block_ids.remove(block_id)
@@ -332,7 +339,9 @@ class SingleTypeKVCacheManager(ABC):
         return False
 
     def release_protected_prompt_blocks(
-        self, target_free_blocks: int | None = None
+        self,
+        target_free_blocks: int | None = None,
+        block_ids_to_skip: set[int] | None = None,
     ) -> None:
         while self._protected_prompt_block_ids:
             if (
@@ -340,7 +349,7 @@ class SingleTypeKVCacheManager(ABC):
                 and self.block_pool.get_num_free_blocks() >= target_free_blocks
             ):
                 return
-            if not self._release_one_protected_prompt_block():
+            if not self._release_one_protected_prompt_block(block_ids_to_skip):
                 return
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
