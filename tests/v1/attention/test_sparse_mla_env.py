@@ -106,9 +106,29 @@ def test_sparse_mla_graph_gate_can_be_forced_off(
 
     disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config)
 
-    assert vllm_config.compilation_config.mode == CompilationMode.NONE
-    assert vllm_config.compilation_config.compile_sizes == []
-    assert vllm_config.compilation_config.compile_ranges_endpoints == []
+    assert vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert vllm_config.compilation_config.compile_sizes == [1, 2]
+    assert vllm_config.compilation_config.compile_ranges_endpoints == [(1, 8)]
+    assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+    assert vllm_config.compilation_config.cudagraph_capture_sizes == []
+    assert vllm_config.compilation_config.max_cudagraph_capture_size == 0
+
+
+def test_sparse_mla_graph_gate_defaults_to_off_for_mtp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.mla.sparse_mla_env."
+        "is_triton_sparse_mla_enabled_for_platform",
+        lambda: True,
+    )
+    vllm_config = _vllm_config(num_speculative_tokens=2)
+
+    disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config)
+
+    assert vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
+    assert vllm_config.compilation_config.compile_sizes == [1, 2]
+    assert vllm_config.compilation_config.compile_ranges_endpoints == [(1, 8)]
     assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
     assert vllm_config.compilation_config.cudagraph_capture_sizes == []
     assert vllm_config.compilation_config.max_cudagraph_capture_size == 0

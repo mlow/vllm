@@ -64,41 +64,32 @@ def disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config) -> None:
         return
 
     configured = _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV)
-    if configured is None and _uses_speculative_decoding(vllm_config):
-        logger.warning_once(
-            "Disabling CUDA graph capture for the DeepSeek V4 Triton sparse "
-            "MLA attention path under speculative decoding, while keeping "
-            "vLLM compile enabled. Set "
-            f"{_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV}=1 to opt into the "
-            "experimental graph-captured MTP path."
-        )
-        return
     if triton_sparse_mla_cudagraphs_allowed(vllm_config):
         logger.warning_once(
-            "Keeping vLLM compile and CUDA graphs enabled for the DeepSeek V4 "
-            "Triton sparse MLA path. Set "
+            "Keeping the requested vLLM compile and CUDA graph settings for "
+            "the DeepSeek V4 Triton sparse MLA path. Set "
             f"{_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV}=0 to opt out if "
             "a graph-safety issue is found."
         )
         return
 
-    from vllm.config.compilation import CompilationMode, CUDAGraphMode
+    from vllm.config.compilation import CUDAGraphMode
 
     compilation_config = vllm_config.compilation_config
-    if (
-        compilation_config.mode == CompilationMode.NONE
-        and compilation_config.cudagraph_mode == CUDAGraphMode.NONE
-    ):
+    if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
         return
 
-    logger.warning_once(
-        "Disabling vLLM compile and CUDA graphs for the DeepSeek V4 Triton "
-        "sparse MLA path because "
-        f"{_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV}=0."
+    reason = (
+        "under speculative decoding. Set "
+        f"{_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV}=1 to opt into the "
+        "experimental graph-captured MTP path."
+        if configured is None and _uses_speculative_decoding(vllm_config)
+        else f"because {_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV}=0."
     )
-    compilation_config.mode = CompilationMode.NONE
-    compilation_config.compile_sizes = []
-    compilation_config.compile_ranges_endpoints = []
+    logger.warning_once(
+        "Disabling CUDA graphs for the DeepSeek V4 Triton sparse MLA path "
+        f"{reason} vLLM compile remains enabled."
+    )
     compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     compilation_config.cudagraph_capture_sizes = []
     compilation_config.max_cudagraph_capture_size = 0
