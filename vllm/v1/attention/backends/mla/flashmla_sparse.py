@@ -32,6 +32,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled_for_platform,
+    needs_constant_topk_for_flashmla_cudagraph,
     triton_sparse_mla_cudagraphs_allowed,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -363,6 +364,12 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             (vllm_config.scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
             device=device,
+        )
+
+        # Full CUDA graphs require topk_length / extra_topk_length to be
+        # constant between capture and replay for the FlashMLA tile scheduler.
+        self.needs_constant_topk = needs_constant_topk_for_flashmla_cudagraph(
+            vllm_config
         )
 
         # DeepseekV4: has compress_ratios in hf_config.
@@ -713,6 +720,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             self.c128a_decode_lens_buffer,
             self.c128a_prefill_buffer,
             max_compressed_tokens=self.c128a_max_compressed,
+            needs_constant_topk=self.needs_constant_topk,
         )
 
         result: dict[str, torch.Tensor | None] = {}
@@ -1081,6 +1089,7 @@ def build_c128a_topk_metadata(
     decode_lens_buffer: torch.Tensor,
     prefill_buffer: torch.Tensor,
     max_compressed_tokens: int = 8192,
+    needs_constant_topk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single kernel for all C128A tokens (decode + prefill).
 
@@ -1116,6 +1125,7 @@ def build_c128a_topk_metadata(
         block_size,
         slot_mapping,
         BLOCK_SIZE=1024,
+        CONSTANT_TOPK_LEN=needs_constant_topk,
     )
     return global_decode, decode_lens, prefill_local
 
@@ -1140,6 +1150,7 @@ def _build_c128a_topk_metadata_kernel(
     block_size,
     slot_mapping_ptr,
     BLOCK_SIZE: tl.constexpr,
+    CONSTANT_TOPK_LEN: tl.constexpr = False,
 ):
     token_idx = tl.program_id(0)
     position = tl.load(positions_ptr + token_idx)
@@ -1155,12 +1166,13 @@ def _build_c128a_topk_metadata_kernel(
         for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
             mask = offset < max_compressed_tokens
-            is_valid = offset < num_compressed
+            is_valid = (offset < num_compressed) & is_valid_token
 
             block_indices = offset // block_size
             block_numbers = tl.load(
                 block_table_ptr + req_idx * block_table_stride + block_indices,
                 mask=mask & is_valid,
+                other=0,
             )
             block_offsets = offset % block_size
             slot_ids = block_numbers * block_size + block_offsets
@@ -1172,10 +1184,13 @@ def _build_c128a_topk_metadata_kernel(
             )
             count += tl.sum(is_valid.to(tl.int32), axis=0)
 
-        tl.store(
-            decode_lens_ptr + token_idx,
-            tl.where(is_valid_token, count, 0),
-        )
+        if CONSTANT_TOPK_LEN:
+            tl.store(decode_lens_ptr + token_idx, max_compressed_tokens)
+        else:
+            tl.store(
+                decode_lens_ptr + token_idx,
+                tl.where(is_valid_token, count, 0),
+            )
     else:
         # --- Prefill: write local indices ---
         pfx_idx = token_idx - num_decode_tokens

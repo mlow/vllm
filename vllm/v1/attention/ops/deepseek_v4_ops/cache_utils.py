@@ -357,6 +357,7 @@ def compute_global_topk_indices_and_lens(
     is_valid_token: torch.Tensor,
     global_topk_indices: torch.Tensor | None = None,
     topk_lens: torch.Tensor | None = None,
+    needs_constant_topk: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map local topk indices to global KV cache slots and count valid entries.
 
@@ -393,6 +394,7 @@ def compute_global_topk_indices_and_lens(
         block_size,
         is_valid_token,
         TRITON_BLOCK_SIZE=1024,
+        CONSTANT_TOPK_LEN=needs_constant_topk,
     )
     return global_topk_indices, topk_lens
 
@@ -411,6 +413,7 @@ def _compute_global_topk_indices_and_lens_kernel(
     block_size,
     is_valid_token_ptr,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    CONSTANT_TOPK_LEN: tl.constexpr = False,
 ):
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
@@ -444,8 +447,10 @@ def _compute_global_topk_indices_and_lens_kernel(
         )
         count += tl.sum(is_valid.to(tl.int32), axis=0)
 
-    # Zero out length for padding tokens.
-    tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
+    if CONSTANT_TOPK_LEN:
+        tl.store(topk_lens_ptr + token_idx, topk)
+    else:
+        tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
 
 
 # FlashMLA sparse prefill asserts `params.topk % B_TOPK == 0` (see

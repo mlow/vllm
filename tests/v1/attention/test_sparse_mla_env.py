@@ -11,6 +11,7 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.mla import flashmla_sparse, sparse_swa
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     disable_triton_sparse_mla_cudagraphs_if_enabled,
+    needs_constant_topk_for_flashmla_cudagraph,
     triton_sparse_mla_cudagraphs_allowed,
 )
 
@@ -159,3 +160,26 @@ def test_sparse_mla_metadata_builders_follow_graph_gate(
             )
             == AttentionCGSupport.NEVER
         )
+
+
+def test_constant_topk_is_only_required_for_flashmla_full_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vllm_config = _vllm_config()
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.mla.sparse_mla_env."
+        "is_triton_sparse_mla_enabled_for_platform",
+        lambda: True,
+    )
+    assert not needs_constant_topk_for_flashmla_cudagraph(vllm_config)
+
+    monkeypatch.setattr(
+        "vllm.v1.attention.backends.mla.sparse_mla_env."
+        "is_triton_sparse_mla_enabled_for_platform",
+        lambda: False,
+    )
+    assert needs_constant_topk_for_flashmla_cudagraph(vllm_config)
+
+    vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+    assert not needs_constant_topk_for_flashmla_cudagraph(vllm_config)

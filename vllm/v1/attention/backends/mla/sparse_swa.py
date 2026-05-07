@@ -19,6 +19,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled,
     is_triton_sparse_mla_enabled_for_platform,
+    needs_constant_topk_for_flashmla_cudagraph,
     triton_sparse_mla_cudagraphs_allowed,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
@@ -250,6 +251,12 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         for ratio in compress_ratios:
             self._layer_types.add(_layer_type_for(int(ratio)))
 
+        # Full CUDA graphs require topk_length / extra_topk_length to be
+        # constant between capture and replay for the FlashMLA tile scheduler.
+        self.needs_constant_topk = needs_constant_topk_for_flashmla_cudagraph(
+            self.vllm_config
+        )
+
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_indices = torch.zeros(
             max_tokens,
@@ -327,6 +334,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
                 block_table.stride(0),
                 self.block_size,
                 TRITON_BLOCK_SIZE=1024,
+                CONSTANT_TOPK_LEN=self.needs_constant_topk,
             )
 
         # Pre-compute DeepseekV4 prefill metadata shared across all attention layers.
@@ -497,11 +505,22 @@ def _compute_swa_indices_and_lens_kernel(
     block_table_stride,
     block_size,
     TRITON_BLOCK_SIZE: tl.constexpr,
+    CONSTANT_TOPK_LEN: tl.constexpr = False,
 ):
     token_idx = tl.program_id(0)
     is_valid = tl.load(is_valid_token_ptr + token_idx)
     if not is_valid:
-        tl.store(swa_lens_ptr + token_idx, 0)
+        if CONSTANT_TOPK_LEN:
+            for i in range(0, window_size, TRITON_BLOCK_SIZE):
+                offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+                tl.store(
+                    swa_indices_ptr + token_idx * swa_indices_stride + offset,
+                    -1,
+                    mask=offset < window_size,
+                )
+            tl.store(swa_lens_ptr + token_idx, window_size)
+        else:
+            tl.store(swa_lens_ptr + token_idx, 0)
         return
 
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
@@ -518,7 +537,10 @@ def _compute_swa_indices_and_lens_kernel(
     end_pos = pos + 1
 
     swa_len = end_pos - start_pos
-    tl.store(swa_lens_ptr + token_idx, swa_len)
+    if CONSTANT_TOPK_LEN:
+        tl.store(swa_lens_ptr + token_idx, window_size)
+    else:
+        tl.store(swa_lens_ptr + token_idx, swa_len)
 
     for i in range(0, window_size, TRITON_BLOCK_SIZE):
         offset = i + tl.arange(0, TRITON_BLOCK_SIZE)

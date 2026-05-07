@@ -59,6 +59,16 @@ def triton_sparse_mla_cudagraphs_allowed(vllm_config=None) -> bool:
     return not _uses_speculative_decoding(vllm_config)
 
 
+def needs_constant_topk_for_flashmla_cudagraph(vllm_config) -> bool:
+    compilation_config = vllm_config.compilation_config
+    if not compilation_config.cudagraph_mode.has_full_cudagraphs():
+        return False
+    # Constant topk lengths are a FlashMLA tile-scheduler requirement. The
+    # SM12x Triton sparse MLA path consumes lens directly and keeps dynamic
+    # counts even when its experimental cudagraph opt-in is enabled.
+    return not is_triton_sparse_mla_enabled_for_platform()
+
+
 def disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config) -> None:
     if not is_triton_sparse_mla_enabled_for_platform():
         return

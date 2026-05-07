@@ -80,6 +80,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     disable_triton_sparse_mla_cudagraphs_if_enabled,
     is_triton_sparse_mla_enabled,
     is_triton_sparse_mla_enabled_for_platform,
+    needs_constant_topk_for_flashmla_cudagraph,
     triton_sparse_mla_query_chunk_size,
     triton_sparse_mla_topk_chunk_size,
 )
@@ -751,8 +752,13 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         self.kv_cache_dtype = kv_cache_dtype
 
-        # Register with compilation context for metadata lookup
+        # Full CUDA graphs require topk_length / extra_topk_length to be
+        # constant between capture and replay for the FlashMLA tile scheduler.
         compilation_config = vllm_config.compilation_config
+        self.needs_constant_topk = needs_constant_topk_for_flashmla_cudagraph(
+            vllm_config
+        )
+
         if prefix and prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         if prefix:
@@ -1182,6 +1188,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     block_size,
                     is_valid,
                     global_topk_indices=local_topk_indices,
+                    needs_constant_topk=self.needs_constant_topk,
                 )
                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
             else:
