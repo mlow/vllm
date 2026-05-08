@@ -21,7 +21,7 @@ from vllm.utils.network_utils import (
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.engine import ReconfigureDistributedRequest, ReconfigureRankType
-from vllm.v1.executor.abstract import Executor
+from vllm.v1.executor.abstract import Executor, max_concurrent_batches_for_async
 from vllm.v1.executor.ray_utils import (
     WORKER_SPECIFIC_ENV_VARS,
     FutureWrapper,
@@ -101,8 +101,11 @@ class RayDistributedExecutor(Executor):
         """Ray distributed executor supports pipeline parallelism,
         meaning that it allows PP size batches to be executed concurrently.
         """
-        pp_size = self.parallel_config.pipeline_parallel_size
-        return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
+        return max_concurrent_batches_for_async(
+            self.vllm_config,
+            self.scheduler_config.async_scheduling,
+            self.parallel_config.pipeline_parallel_size,
+        )
 
     def shutdown(self) -> None:
         if logger:

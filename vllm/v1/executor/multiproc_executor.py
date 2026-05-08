@@ -59,7 +59,11 @@ from vllm.utils.system_utils import (
     set_process_title,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.executor.abstract import Executor, FailureCallback
+from vllm.v1.executor.abstract import (
+    Executor,
+    FailureCallback,
+    max_concurrent_batches_for_async,
+)
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
@@ -473,9 +477,11 @@ class MultiprocExecutor(Executor):
 
     @cached_property
     def max_concurrent_batches(self) -> int:
-        # PP requires PP-size concurrent batches to fill the pipeline.
-        pp_size = self.parallel_config.pipeline_parallel_size
-        return 2 if pp_size <= 1 and self.scheduler_config.async_scheduling else pp_size
+        return max_concurrent_batches_for_async(
+            self.vllm_config,
+            self.scheduler_config.async_scheduling,
+            self.parallel_config.pipeline_parallel_size,
+        )
 
     def _get_output_rank(self) -> int:
         # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1

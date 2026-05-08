@@ -136,7 +136,10 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+from vllm.v1.cudagraph_dispatcher import (
+    CudagraphDispatcher,
+    should_disable_sm12x_mtp_full_decode_cudagraph,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
@@ -222,29 +225,6 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
-
-
-def _should_disable_mtp_full_cudagraph_for_padded_batch(
-    speculative_config: Any,
-    cudagraph_mode: CUDAGraphMode,
-    num_tokens: int,
-    num_reqs: int,
-    batch_descriptor: BatchDescriptor,
-) -> bool:
-    """Return true for MTP decode batches that need graph padding."""
-    if cudagraph_mode != CUDAGraphMode.FULL:
-        return False
-    if getattr(speculative_config, "method", None) != "mtp":
-        return False
-    if batch_descriptor.num_tokens != num_tokens:
-        return False
-    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", 0)
-    decode_group = num_speculative_tokens + 1
-    if decode_group <= 1 or num_reqs <= 0:
-        return False
-    if num_tokens != num_reqs * decode_group:
-        return False
-    return batch_descriptor.num_reqs > num_reqs
 
 
 def _should_sync_mtp_logits_gather(speculative_config: Any) -> bool:
@@ -3830,18 +3810,17 @@ class GPUModelRunner(
                 invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
             )
 
-        cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-            num_tokens_padded, disable_full=use_cascade_attn or has_encoder_output
+        disable_full_cudagraph = (
+            use_cascade_attn
+            or has_encoder_output
+            or should_disable_sm12x_mtp_full_decode_cudagraph(
+                self.speculative_config,
+                uniform_decode=uniform_decode,
+            )
         )
-        if _should_disable_mtp_full_cudagraph_for_padded_batch(
-            self.speculative_config,
-            cudagraph_mode,
-            num_tokens_padded,
-            num_reqs,
-            batch_descriptor,
-        ):
-            cudagraph_mode = CUDAGraphMode.NONE
-            batch_descriptor = BatchDescriptor(num_tokens_padded)
+        cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+            num_tokens_padded, disable_full=disable_full_cudagraph
+        )
         num_tokens_padded = batch_descriptor.num_tokens
         if self.compilation_config.pass_config.enable_sp:
             assert (

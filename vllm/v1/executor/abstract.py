@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.platforms import current_platform
 from vllm.tasks import SupportedTask
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -32,6 +33,28 @@ logger = init_logger(__name__)
 _R = TypeVar("_R")
 
 FailureCallback = Callable[[], None]
+
+
+def max_concurrent_batches_for_async(
+    vllm_config: VllmConfig,
+    async_scheduling: bool,
+    pipeline_parallel_size: int,
+) -> int:
+    # PP requires PP-size concurrent batches to fill the pipeline.
+    if pipeline_parallel_size > 1:
+        return pipeline_parallel_size
+    if not async_scheduling:
+        return 1
+
+    speculative_config = vllm_config.speculative_config
+    if (
+        speculative_config is not None
+        and speculative_config.method == "mtp"
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    ):
+        return 1
+    return 2
 
 
 class Executor(ABC):

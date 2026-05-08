@@ -3,13 +3,29 @@
 from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
+from typing import Any
 
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+
+def should_disable_sm12x_mtp_full_decode_cudagraph(
+    speculative_config: Any,
+    *,
+    uniform_decode: bool,
+) -> bool:
+    """Return true when SM12x MTP uniform decode should avoid FULL cudagraph."""
+    return (
+        uniform_decode
+        and getattr(speculative_config, "method", None) == "mtp"
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+    )
 
 
 class CudagraphDispatcher:
@@ -206,6 +222,10 @@ class CudagraphDispatcher:
         if (
             cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
             and cudagraph_mode.separate_routine()
+            and not should_disable_sm12x_mtp_full_decode_cudagraph(
+                self.vllm_config.speculative_config,
+                uniform_decode=True,
+            )
         ):
             max_num_tokens = (
                 uniform_decode_query_len

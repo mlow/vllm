@@ -240,6 +240,42 @@ def test_mtp_logits_gather_sync_is_enabled_only_for_sm12x_mtp(
     assert drafter_logits.sync_after_gather is expected
 
 
+@pytest.mark.parametrize(
+    ("method", "uniform_decode", "is_cuda", "is_sm12x", "expected"),
+    [
+        ("mtp", True, True, True, True),
+        ("mtp", False, True, True, False),
+        ("eagle", True, True, True, False),
+        ("mtp", True, False, True, False),
+        ("mtp", True, True, False, False),
+    ],
+)
+def test_mtp_full_decode_cudagraph_is_disabled_only_for_sm12x_mtp(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    uniform_decode: bool,
+    is_cuda: bool,
+    is_sm12x: bool,
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(
+        gpu_model_runner.current_platform, "is_cuda", lambda: is_cuda
+    )
+    monkeypatch.setattr(
+        gpu_model_runner.current_platform,
+        "is_device_capability_family",
+        lambda family: is_sm12x and family == 120,
+    )
+
+    assert (
+        gpu_model_runner.should_disable_sm12x_mtp_full_decode_cudagraph(
+            mock.Mock(method=method),
+            uniform_decode=uniform_decode,
+        )
+        is expected
+    )
+
+
 @pytest.mark.parametrize("num_speculative_tokens", [1])
 def test_mtp_propose(num_speculative_tokens, monkeypatch):
     """Test that MTP's forward method returns hidden states directly"""

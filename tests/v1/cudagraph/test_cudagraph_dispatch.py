@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import vllm.v1.cudagraph_dispatcher as cudagraph_dispatcher_module
 from tests.utils import create_new_process_for_each_test
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
@@ -236,6 +237,38 @@ class TestCudagraphDispatcher:
             uniform_decode=True,
             invalid_modes={CUDAGraphMode.FULL},
         )
+        assert rt_mode == CUDAGraphMode.NONE
+        assert key == BatchDescriptor(num_tokens=6)
+
+    def test_sm12x_mtp_does_not_create_full_decode_capture_keys(self, monkeypatch):
+        monkeypatch.setattr(
+            cudagraph_dispatcher_module.current_platform, "is_cuda", lambda: True
+        )
+        monkeypatch.setattr(
+            cudagraph_dispatcher_module.current_platform,
+            "is_device_capability_family",
+            lambda family: family == 120,
+        )
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL_AND_PIECEWISE",
+            mode=CompilationMode.VLLM_COMPILE,
+            cudagraph_capture_sizes=[3, 6],
+        )
+        config = _create_vllm_config(
+            comp_config,
+            max_num_seqs=2,
+            num_speculative_tokens=2,
+        )
+        config.speculative_config.method = "mtp"
+        dispatcher = CudagraphDispatcher(config)
+
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=3,
+        )
+
+        assert dispatcher.cudagraph_keys[CUDAGraphMode.FULL] == set()
+        rt_mode, key = dispatcher.dispatch(num_tokens=6, uniform_decode=True)
         assert rt_mode == CUDAGraphMode.NONE
         assert key == BatchDescriptor(num_tokens=6)
 
