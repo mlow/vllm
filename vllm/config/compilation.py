@@ -752,6 +752,12 @@ class CompilationConfig:
         "vllm::deepseek_v4_attention",
         "vllm::deepseek_v4_fp8_einsum",
     ]
+    _sm12x_piecewise_split_ops: ClassVar[list[str]] = [
+        "vllm::all_reduce",
+        "vllm::mhc_pre",
+        "vllm::mhc_post",
+        "vllm::hc_head_fused_kernel",
+    ]
 
     def compute_hash(self) -> str:
         """
@@ -1122,6 +1128,24 @@ class CompilationConfig:
                         self.pass_config.fuse_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+                    if current_platform.is_device_capability_family(120):
+                        self.splitting_ops.extend(
+                            op
+                            for op in self._sm12x_piecewise_split_ops
+                            if op not in self.splitting_ops
+                        )
+                        if (
+                            self.cudagraph_mode is not None
+                            and self.cudagraph_mode.has_piecewise_cudagraphs()
+                            and not self.cudagraph_copy_inputs
+                        ):
+                            logger.warning_once(
+                                "Enabling cudagraph_copy_inputs for SM12x "
+                                "piecewise CUDA graphs because SM12x split "
+                                "ops can produce new input buffers between "
+                                "capture and replay."
+                            )
+                            self.cudagraph_copy_inputs = True
 
             elif len(self.splitting_ops) == 0:
                 if (

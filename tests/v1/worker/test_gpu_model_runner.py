@@ -11,6 +11,7 @@ import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
+    CUDAGraphMode,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -1426,6 +1427,35 @@ def test_is_uniform_decode() -> None:
         num_reqs=15,
         force_uniform_decode=False,
     )
+
+
+def test_piecewise_cudagraph_warmup_forces_attention() -> None:
+    class DummyRunner:
+        compilation_config = SimpleNamespace(cudagraph_num_of_warmups=1)
+
+        def __init__(self) -> None:
+            self.dummy_runs: list[dict] = []
+
+        def _dummy_run(self, num_tokens: int, **kwargs) -> None:
+            self.dummy_runs.append({"num_tokens": num_tokens, **kwargs})
+
+    runner = DummyRunner()
+    desc = SimpleNamespace(num_tokens=4, uniform=True, num_active_loras=0)
+
+    GPUModelRunner._warmup_and_capture(
+        runner,  # type: ignore[arg-type]
+        desc,
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+    )
+
+    assert len(runner.dummy_runs) == 2
+    warmup_run, capture_run = runner.dummy_runs
+    assert warmup_run["num_tokens"] == 4
+    assert warmup_run["cudagraph_runtime_mode"] == CUDAGraphMode.NONE
+    assert warmup_run["force_attention"] is True
+    assert capture_run["num_tokens"] == 4
+    assert capture_run["cudagraph_runtime_mode"] == CUDAGraphMode.PIECEWISE
+    assert capture_run["is_graph_capturing"] is True
 
 
 @pytest.mark.skipif(

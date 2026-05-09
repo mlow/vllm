@@ -57,6 +57,10 @@ def is_triton_sparse_mla_enabled_for_platform() -> bool:
     return current_platform.is_device_capability_family(120)
 
 
+def _is_sm12x_platform() -> bool:
+    return current_platform.is_device_capability_family(120)
+
+
 def is_triton_sparse_mla_enabled(device: torch.device) -> bool:
     configured = triton_sparse_mla_configured()
     if configured is not None:
@@ -75,8 +79,22 @@ def disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config) -> None:
     if not is_triton_sparse_mla_enabled_for_platform():
         return
 
+    from vllm.config.compilation import CUDAGraphMode
+
+    compilation_config = vllm_config.compilation_config
     configured = _optional_env_flag(_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV)
     if triton_sparse_mla_cudagraphs_allowed():
+        if (
+            _is_sm12x_platform()
+            and compilation_config.cudagraph_mode is not None
+            and compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            logger.warning_once(
+                "Using PIECEWISE CUDA graphs for the DeepSeek V4 Triton "
+                "sparse MLA path because FULL decode CUDA graphs can hang on "
+                "SM12x under decode sampling pressure."
+            )
+            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
         logger.warning_once(
             "Keeping the requested vLLM compile and CUDA graph settings for "
             "the DeepSeek V4 Triton sparse MLA path. Set "
@@ -85,9 +103,6 @@ def disable_triton_sparse_mla_cudagraphs_if_enabled(vllm_config) -> None:
         )
         return
 
-    from vllm.config.compilation import CUDAGraphMode
-
-    compilation_config = vllm_config.compilation_config
     if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
         return
 

@@ -133,6 +133,7 @@ class CUDAGraphEntry:
     # for cudagraph debugging, track the input addresses
     # during capture, and check if they are the same during replay
     input_addresses: list[int] | None = None
+    input_tensors: list[torch.Tensor] | None = None
 
 
 @dataclasses.dataclass
@@ -276,10 +277,10 @@ class CUDAGraphWrapper:
             # validate that cudagraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
-            input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            entry.input_addresses = input_addresses
+            input_tensors = [x for x in args if isinstance(x, torch.Tensor)]
+            entry.input_addresses = [x.data_ptr() for x in input_tensors]
+            if self.compilation_config.cudagraph_copy_inputs:
+                entry.input_tensors = input_tensors
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
@@ -343,16 +344,36 @@ class CUDAGraphWrapper:
             # manage the memory during cuda graph capture
             return output
 
-        if self.is_debugging_mode:
-            # check if the input addresses are the same
-            new_input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            assert new_input_addresses == entry.input_addresses, (
-                f"Input addresses for cudagraphs are different "
-                f"during replay. Expected {entry.input_addresses}, "
-                f"got {new_input_addresses}"
-            )
+        # CUDA graph replay reads the captured addresses. When requested, copy
+        # runtime tensors into the captured input buffers before replay. This is
+        # especially important for piecewise graphs whose inputs may be produced
+        # by non-captured split ops and therefore have different addresses on
+        # each model step.
+        if self.compilation_config.cudagraph_copy_inputs or self.is_debugging_mode:
+            new_input_tensors = [x for x in args if isinstance(x, torch.Tensor)]
+            new_input_addresses = [x.data_ptr() for x in new_input_tensors]
+            if (
+                new_input_addresses != entry.input_addresses
+                and self.compilation_config.cudagraph_copy_inputs
+                and entry.input_tensors is not None
+            ):
+                assert len(new_input_tensors) == len(entry.input_tensors)
+                for static_tensor, runtime_tensor in zip(
+                    entry.input_tensors, new_input_tensors
+                ):
+                    if static_tensor.data_ptr() != runtime_tensor.data_ptr():
+                        static_tensor.copy_(runtime_tensor)
+            elif new_input_addresses != entry.input_addresses:
+                runnable = self.runnable
+                piecewise_index = getattr(runnable, "piecewise_compile_index", None)
+                total_piecewise = getattr(runnable, "total_piecewise_compiles", None)
+                submod_name = getattr(runnable, "submod_name", "")
+                raise AssertionError(
+                    "Input addresses for cudagraphs are different during replay. "
+                    f"mode={self.runtime_mode.name} piecewise={piecewise_index}/"
+                    f"{total_piecewise} submod={submod_name} "
+                    f"expected={entry.input_addresses} got={new_input_addresses}"
+                )
 
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.

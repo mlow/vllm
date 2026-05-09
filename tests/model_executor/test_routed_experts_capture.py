@@ -70,6 +70,30 @@ def test_bind_routing_capture_to_model_noop_when_disabled(monkeypatch):
     rec_mod.bind_routing_capture_to_model(DummyModel())
 
 
+def test_issue_routing_d2h_copy_skips_capturers_without_host_cache(monkeypatch):
+    import vllm.model_executor.layers.fused_moe.routed_experts_capturer as rec_mod
+
+    class DummyCapturer:
+        def get_host_cache(self):
+            return None
+
+        def sync_fwd_experts_buffer_DtoH(self, *, positions, num_scheduled_tokens):
+            raise AssertionError("D2H copy should be skipped without host cache")
+
+    class PoisonTensor:
+        def __getitem__(self, index):
+            raise AssertionError(f"tensor slice should not be read: {index}")
+
+    monkeypatch.setattr(rec_mod, "get_global_experts_capturer", lambda: DummyCapturer())
+
+    rec_mod.issue_routing_d2h_copy(
+        input_batch_req_ids=["req-0"],
+        num_scheduled_tokens={"req-0": 1},
+        positions=PoisonTensor(),
+        positions_cpu=PoisonTensor(),
+    )
+
+
 # =========================================================================
 # Tests for device-cache routing replay architecture
 # =========================================================================

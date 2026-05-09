@@ -439,6 +439,41 @@ class TestCUDAGraphWrapper:
         assert not wrapper.concrete_cudagraph_entries
 
 
+@create_new_process_for_each_test("spawn")
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
+def test_cudagraph_copy_inputs_handles_replay_with_different_input_address():
+    class Scale(nn.Module):
+        def forward(self, x):
+            return x * 3
+
+    vllm_config = _create_vllm_config(CompilationConfig(cudagraph_copy_inputs=True))
+    model = Scale().to(DEVICE_TYPE)
+    wrapper = CUDAGraphWrapper(model, vllm_config, runtime_mode=CUDAGraphMode.FULL)
+    batch_descriptor = BatchDescriptor(num_tokens=1)
+    capture_input = torch.zeros(1, 10, device=DEVICE_TYPE)
+    replay_input = torch.ones(1, 10, device=DEVICE_TYPE)
+
+    assert capture_input.data_ptr() != replay_input.data_ptr()
+
+    with set_forward_context(
+        attn_metadata=None,
+        vllm_config=vllm_config,
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        batch_descriptor=batch_descriptor,
+    ):
+        wrapper(capture_input)
+
+    with set_forward_context(
+        attn_metadata=None,
+        vllm_config=vllm_config,
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        batch_descriptor=batch_descriptor,
+    ):
+        output = wrapper(replay_input)
+
+    torch.testing.assert_close(output, model(replay_input))
+
+
 def _run_and_monitor_call(
     wrapper, input_tensor, runtime_mode, batch_descriptor, vllm_config
 ):

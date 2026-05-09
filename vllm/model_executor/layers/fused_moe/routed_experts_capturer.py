@@ -649,6 +649,8 @@ def issue_routing_d2h_copy(
     capturer = get_global_experts_capturer()
     if capturer is None:
         return
+    if capturer.get_host_cache() is None:
+        return
 
     ordered = {
         req_id: num_scheduled_tokens[req_id]

@@ -93,8 +93,7 @@ def generate_execution_code_with_name(
             if node.target is operator.getitem:
                 source = ref(node.args[0])
                 index = node.args[1]
-                assert isinstance(index, int)
-                lines.append(f"    {node.name} = {source}[{index}]")
+                lines.append(f"    {node.name} = {source}[{ref(index)}]")
             else:
                 args_str = ", ".join(ref(a) for a in node.args)
                 kwargs_str = ", ".join(f"{k}={ref(v)}" for k, v in node.kwargs.items())

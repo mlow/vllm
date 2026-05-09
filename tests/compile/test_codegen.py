@@ -8,6 +8,7 @@ to split it into the stitching layer + submodules, and then
 ``generate_execution_code``/``compile_execution_fn`` for codegen.
 """
 
+import operator
 from collections.abc import Callable
 
 import pytest
@@ -293,6 +294,27 @@ def test_getitem_in_stitching_graph(x: torch.Tensor) -> None:
     assert re.search(r"\b\w+ = \w+\[\d+\]\n", code), (
         "Stitching graph should emit `name = source[N]` for getitem nodes"
     )
+
+
+def test_getitem_supports_non_integer_indices(x: torch.Tensor) -> None:
+    """Stitching codegen can see getitem nodes whose index is not an int
+    after more aggressive graph splitting. The index should be emitted through
+    the same const-safe argument path as other node arguments."""
+    g = fx.Graph()
+    payload = g.placeholder("payload")
+    dict_value = g.call_function(operator.getitem, args=(payload, "value"))
+    slice_value = g.call_function(operator.getitem, args=(dict_value, slice(0, 1)))
+    g.output(slice_value)
+    gm = fx.GraphModule(torch.nn.Module(), g)
+
+    code, submod_names, consts = generate_execution_code(gm)
+
+    assert "payload['value']" in code
+    assert "__vllm_consts__[0]" in code
+    assert consts == [slice(0, 1)]
+
+    fn = compile_execution_fn(code, {}, submod_names, consts)
+    assert torch.equal(fn({"value": x}), x[:1])
 
 
 def test_del_emitted_for_intermediate_values(x: torch.Tensor) -> None:

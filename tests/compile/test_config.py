@@ -289,6 +289,23 @@ def test_splitting_ops_dynamic():
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE
 
 
+def test_sm12x_default_piecewise_splits_enable_input_copy():
+    with patch.object(
+        current_platform,
+        "is_device_capability_family",
+        side_effect=lambda family: family == 120,
+    ):
+        config = VllmConfig(
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            )
+        )
+
+    assert "vllm::all_reduce" in config.compilation_config.splitting_ops
+    assert config.compilation_config.cudagraph_copy_inputs
+
+
 def test_moe_splitting_ops_deepep_ht_inductor_partition():
     # Inductor partition case: user-provided splitting_ops should be
     # preserved and MoE ops should be appended for DeepEP HT with dp>1.
