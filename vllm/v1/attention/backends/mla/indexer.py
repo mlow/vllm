@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -33,15 +34,13 @@ logger = init_logger(__name__)
 
 
 def sparse_indexer_max_logits_bytes(is_sm12x: bool | None = None) -> int:
-    configured_mb = os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB")
-    if configured_mb is not None:
-        return int(configured_mb) * 1024 * 1024
-
     if is_sm12x is None:
         is_sm12x = (
             current_platform.is_cuda()
             and current_platform.is_device_capability_family(120)
         )
+    if "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB" in os.environ:
+        return envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
     default_mb = 256 if is_sm12x else 512
     return default_mb * 1024 * 1024
 
