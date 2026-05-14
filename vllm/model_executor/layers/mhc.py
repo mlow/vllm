@@ -160,16 +160,6 @@ class HCHeadOp(CustomOp):
     def enabled(cls) -> bool:
         return True
 
-    # ``@torch.compile`` is necessary for accuracy as well as performance on
-    # NVIDIA hardware (including SM12x consumer Blackwell). Upstream
-    # a8887c208 ("[Bugfix] [ROCm] [DSV4] [Perf] Add aiter mhc support",
-    # #41946) refactored ``hc_head`` from a free function into this
-    # :class:`CustomOp` and dropped the decorator from the CUDA path while
-    # keeping it on ``forward_hip`` (with the same comment below). The drop
-    # caused a measured ~7 pp regression in DSv4-Flash MTP=2 spec
-    # acceptance on SM12x (mt-bench c=1: 67.6% → 59.8%); restoring the
-    # decorator recovers acceptance (66.5%) without affecting ROCm.
-    @torch.compile(backend=current_platform.simple_compile_backend)
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
