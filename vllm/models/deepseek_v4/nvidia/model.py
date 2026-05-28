@@ -33,6 +33,7 @@ from vllm.model_executor.layers.mhc import (
     MHCFusedPostPreOp,
     MHCPostOp,
     MHCPreOp,
+    warm_up_cuda_tilelang_mhc,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -989,6 +990,13 @@ class DeepseekV4Model(nn.Module):
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
         # kv_score). fused_wqa_wkv stays on the default stream.
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
+
+        warm_up_cuda_tilelang_mhc(
+            config.hidden_size,
+            self.hc_mult,
+            vllm_config.model_config.dtype,
+            torch.device("cuda", torch.cuda.current_device()),
+        )
 
         # Reserved topk indices buffer for all Indexer layers to reuse.
         self.topk_indices_buffer = torch.empty(

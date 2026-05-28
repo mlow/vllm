@@ -5,11 +5,215 @@ import torch
 # this import will also register the custom ops
 # import vllm.model_executor.kernels.mhc  # noqa: F401
 import vllm.model_executor.kernels.mhc as mhc_kernels
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
 HAS_TILELANG = has_tilelang()
+logger = init_logger(__name__)
+
+_CUDA_TILELANG_OP = tuple[str, int, int]
+_FAILED_CUDA_TILELANG_OPS: set[_CUDA_TILELANG_OP] = set()
+_VERIFIED_CUDA_TILELANG_OPS: set[_CUDA_TILELANG_OP] = set()
+_WARMED_CUDA_TILELANG_CONFIGS: set[tuple[int, int, torch.dtype, str]] = set()
+
+
+def _cuda_tilelang_op_key(
+    op_name: str,
+    hidden_size: int,
+    hc_mult: int,
+) -> _CUDA_TILELANG_OP:
+    return op_name, hidden_size, hc_mult
+
+
+def _summarize_tilelang_exception(exc: Exception) -> str:
+    lines = [line.strip() for line in str(exc).splitlines()]
+    if "Compilation error:" in lines:
+        lines = lines[lines.index("Compilation error:") + 1 :]
+    summary = next((line for line in lines if line), repr(exc))
+    if len(summary) > 240:
+        summary = f"{summary[:237]}..."
+    return f"{type(exc).__name__}: {summary}"
+
+
+def _should_try_cuda_tilelang(op_key: _CUDA_TILELANG_OP) -> bool:
+    if not HAS_TILELANG or op_key in _FAILED_CUDA_TILELANG_OPS:
+        return False
+    return (
+        not torch.compiler.is_compiling()
+        or op_key in _VERIFIED_CUDA_TILELANG_OPS
+    )
+
+
+def _mark_cuda_tilelang_verified(op_key: _CUDA_TILELANG_OP) -> None:
+    _VERIFIED_CUDA_TILELANG_OPS.add(op_key)
+
+
+def _disable_cuda_tilelang(op_key: _CUDA_TILELANG_OP, exc: Exception) -> None:
+    _FAILED_CUDA_TILELANG_OPS.add(op_key)
+    op_name, hidden_size, hc_mult = op_key
+    logger.warning_once(
+        "CUDA TileLang op %s failed for hidden_size=%s hc_mult=%s; "
+        "falling back for this process. Failure: %s",
+        op_name,
+        hidden_size,
+        hc_mult,
+        _summarize_tilelang_exception(exc),
+    )
+    logger.debug(
+        "CUDA TileLang op %s failure details",
+        op_name,
+        exc_info=exc,
+    )
+
+
+def _probe_cuda_tilelang_op(op_key: _CUDA_TILELANG_OP, call) -> bool:
+    if not HAS_TILELANG or op_key in _FAILED_CUDA_TILELANG_OPS:
+        return False
+    try:
+        call()
+        torch.cuda.synchronize()
+    except Exception as exc:
+        _disable_cuda_tilelang(op_key, exc)
+        return False
+    else:
+        return True
+
+
+def warm_up_cuda_tilelang_mhc(
+    hidden_size: int,
+    hc_mult: int,
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> None:
+    """Probe CUDA TileLang MHC kernels outside torch.compile.
+
+    The CUDA TileLang kernels are faster on some SM120 systems but currently
+    fail to compile on others. DeepSeek V4 calls this once at model
+    construction time so CUDA graph capture and any compiled callers see a
+    stable verified-or-fallback decision.
+    """
+    device = torch.device(device)
+    if (
+        not HAS_TILELANG
+        or not current_platform.is_cuda()
+        or device.type != "cuda"
+        or torch.compiler.is_compiling()
+    ):
+        return
+
+    warm_key = (hidden_size, hc_mult, dtype, str(device))
+    if warm_key in _WARMED_CUDA_TILELANG_CONFIGS:
+        return
+    _WARMED_CUDA_TILELANG_CONFIGS.add(warm_key)
+
+    num_tokens = 1
+    hc_mult3 = 2 * hc_mult + hc_mult * hc_mult
+    with torch.inference_mode():
+        residual = torch.zeros(
+            (num_tokens, hc_mult, hidden_size), dtype=dtype, device=device
+        )
+        x = torch.zeros((num_tokens, hidden_size), dtype=dtype, device=device)
+        post_mix = torch.zeros(
+            (num_tokens, hc_mult, 1), dtype=torch.float32, device=device
+        )
+        comb_mix = torch.zeros(
+            (num_tokens, hc_mult, hc_mult), dtype=torch.float32, device=device
+        )
+        fn = torch.zeros(
+            (hc_mult3, hc_mult * hidden_size), dtype=torch.float32, device=device
+        )
+        hc_scale = torch.zeros((3,), dtype=torch.float32, device=device)
+        hc_base = torch.zeros((hc_mult3,), dtype=torch.float32, device=device)
+        hc_head_fn = torch.zeros(
+            (hc_mult, hc_mult * hidden_size), dtype=torch.float32, device=device
+        )
+        hc_head_scale = torch.zeros((1,), dtype=torch.float32, device=device)
+        hc_head_base = torch.zeros((hc_mult,), dtype=torch.float32, device=device)
+        hc_head_out = torch.empty((num_tokens, hidden_size), dtype=dtype, device=device)
+
+        probes = [
+            (
+                _cuda_tilelang_op_key("mhc_pre", hidden_size, hc_mult),
+                lambda: torch.ops.vllm.mhc_pre_tilelang(
+                    residual,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    1e-6,
+                    1e-6,
+                    1e-6,
+                    1.0,
+                    20,
+                    1,
+                    None,
+                    0.0,
+                ),
+            ),
+            (
+                _cuda_tilelang_op_key("mhc_post", hidden_size, hc_mult),
+                lambda: torch.ops.vllm.mhc_post_tilelang(
+                    x, residual, post_mix, comb_mix
+                ),
+            ),
+            (
+                _cuda_tilelang_op_key("mhc_fused_post_pre", hidden_size, hc_mult),
+                lambda: torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                    x,
+                    residual,
+                    post_mix,
+                    comb_mix,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    1e-6,
+                    1e-6,
+                    1e-6,
+                    1.0,
+                    20,
+                    1,
+                    1,
+                    None,
+                    0.0,
+                ),
+            ),
+            (
+                _cuda_tilelang_op_key("hc_head", hidden_size, hc_mult),
+                lambda: torch.ops.vllm.hc_head_fused_kernel_tilelang(
+                    residual,
+                    hc_head_fn,
+                    hc_head_scale,
+                    hc_head_base,
+                    hc_head_out,
+                    hidden_size,
+                    1e-6,
+                    1e-6,
+                    hc_mult,
+                ),
+            ),
+        ]
+        probe_results = [
+            (op_key, _probe_cuda_tilelang_op(op_key, call))
+            for op_key, call in probes
+        ]
+
+        if all(succeeded for _, succeeded in probe_results):
+            for op_key, _ in probe_results:
+                _mark_cuda_tilelang_verified(op_key)
+            return
+
+        for op_key, _ in probe_results:
+            _FAILED_CUDA_TILELANG_OPS.add(op_key)
+            _VERIFIED_CUDA_TILELANG_OPS.discard(op_key)
+
+        logger.warning_once(
+            "CUDA TileLang MHC warmup did not verify all kernels for "
+            "hidden_size=%s hc_mult=%s; using the CUDA fallback group for "
+            "this process.",
+            hidden_size,
+            hc_mult,
+        )
 
 
 def _apply_optional_rms_norm(
@@ -54,9 +258,34 @@ class MHCPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Keep CUDA on the pre-#43679 fallback path. Tilelang MHC kernels
-        # currently fail NVCC compilation on SM120 under CUDA 13/Python 3.13
-        # because CUDA and system math headers disagree on rsqrt/rsqrtf.
+        op_key = _cuda_tilelang_op_key(
+            "mhc_pre", residual.shape[-1], residual.shape[-2]
+        )
+
+        def tilelang_call():
+            return torch.ops.vllm.mhc_pre_tilelang(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                norm_weight,
+                norm_eps,
+            )
+
+        if _should_try_cuda_tilelang(op_key):
+            try:
+                result = tilelang_call()
+                _mark_cuda_tilelang_verified(op_key)
+                return result
+            except Exception as exc:
+                _disable_cuda_tilelang(op_key, exc)
+
         post_mix, comb_mix, layer_input = self.forward_native(
             residual,
             fn,
@@ -187,6 +416,23 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        op_key = _cuda_tilelang_op_key(
+            "mhc_post", residual.shape[-1], residual.shape[-2]
+        )
+
+        def tilelang_call():
+            return torch.ops.vllm.mhc_post_tilelang(
+                x, residual, post_layer_mix, comb_res_mix
+            )
+
+        if _should_try_cuda_tilelang(op_key):
+            try:
+                result = tilelang_call()
+                _mark_cuda_tilelang_verified(op_key)
+                return result
+            except Exception as exc:
+                _disable_cuda_tilelang(op_key, exc)
+
         return self.forward_native(x, residual, post_layer_mix, comb_res_mix)
 
     def forward_hip(
@@ -231,28 +477,11 @@ class MHCPostOp(CustomOp):
         )
 
 
-# ``@torch.compile`` on the CUDA HC head reduction is necessary for accuracy
-# as well as performance — upstream a8887c208 ("[Bugfix] [ROCm] [DSV4] [Perf]
-# Add aiter mhc support", #41946) refactored ``hc_head`` from a free
-# function into ``HCHeadOp(CustomOp)`` and dropped the decorator from the
-# CUDA path while keeping it on ``forward_hip``. The drop caused a measured
-# ~7 pp regression in DSv4-Flash MTP=2 spec acceptance on SM12x (mt-bench
-# c=1, 67.6 % → 59.8 %).
-#
-# Decorating the ``forward_cuda`` method directly trips
-# ``torch._dynamo.exc.Unsupported: failed to bind arguments when attempting
-# to inline forward_cuda`` whenever the outer model is wrapped by
-# ``@support_torch_compile`` (which is the no-MTP path on SM12x): dynamo
-# tries to inline the bound method through ``CustomOp._forward_method`` and
-# can't reconcile the ``self`` parameter. Keeping the body as a free
-# function — the layout that existed pre-#41946 — sidesteps the bind
-# failure while preserving the spec-acceptance recovery.
-#
-# Keep CUDA on the Triton HC-head kernel even when Tilelang is installed. As
-# above, the Tilelang HC-head kernel fails to compile for the DSv4
-# hidden_size=7168 shape under the current SM120 CUDA 13/Python 3.13 runtime.
-# The Triton kernel covers the same CUDA path and avoids making model startup
-# depend on that Tilelang compile.
+# Keep the Triton HC-head body as the CUDA fallback. Some SM120 CUDA 13
+# environments have observed TileLang compile failures for the DSv4
+# hidden_size=7168 shape; other SM120 setups compile the fused TileLang kernel
+# and should keep using it for latency. The dispatch path tries TileLang first
+# and lands here only after a runtime failure.
 @torch.compile(backend=current_platform.simple_compile_backend)
 def _hc_head_cuda_impl(
     hidden_states: torch.Tensor,
@@ -271,6 +500,36 @@ def _hc_head_cuda_impl(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
     )
     torch.ops.vllm.hc_head_triton(
+        hs_flat,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        out,
+        hidden_size,
+        rms_norm_eps,
+        hc_eps,
+        hc_mult,
+    )
+    return out.view(*outer_shape, hidden_size)
+
+
+def _hc_head_cuda_tilelang_impl(
+    hidden_states: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_norm_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    hc_mult, hidden_size = hidden_states.shape[-2:]
+    outer_shape = hidden_states.shape[:-2]
+    hs_flat = hidden_states.view(-1, hc_mult, hidden_size)
+    num_tokens = hs_flat.shape[0]
+
+    out = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=hidden_states.device
+    )
+    torch.ops.vllm.hc_head_fused_kernel_tilelang(
         hs_flat,
         hc_fn,
         hc_scale,
@@ -308,6 +567,28 @@ class HCHeadOp(CustomOp):
         rms_norm_eps: float,
         hc_eps: float,
     ) -> torch.Tensor:
+        op_key = _cuda_tilelang_op_key(
+            "hc_head", hidden_states.shape[-1], hidden_states.shape[-2]
+        )
+
+        def tilelang_call():
+            return _hc_head_cuda_tilelang_impl(
+                hidden_states,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                rms_norm_eps,
+                hc_eps,
+            )
+
+        if _should_try_cuda_tilelang(op_key):
+            try:
+                result = tilelang_call()
+                _mark_cuda_tilelang_verified(op_key)
+                return result
+            except Exception as exc:
+                _disable_cuda_tilelang(op_key, exc)
+
         return _hc_head_cuda_impl(
             hidden_states,
             hc_fn,
@@ -400,6 +681,38 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        op_key = _cuda_tilelang_op_key(
+            "mhc_fused_post_pre", residual.shape[-1], residual.shape[-2]
+        )
+
+        def tilelang_call():
+            return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+                norm_weight,
+                norm_eps,
+            )
+
+        if _should_try_cuda_tilelang(op_key):
+            try:
+                result = tilelang_call()
+                _mark_cuda_tilelang_verified(op_key)
+                return result
+            except Exception as exc:
+                _disable_cuda_tilelang(op_key, exc)
+
         residual_cur = mhc_kernels.mhc_post_torch(
             x,
             residual,
