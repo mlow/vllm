@@ -7,6 +7,7 @@ import vllm.model_executor.kernels.mhc  # noqa: F401
 from vllm.model_executor.kernels.mhc.tilelang import (
     _tilelang_hc_prenorm_gemm,
     _torch_hc_prenorm_gemm,
+    _use_tf32_hc_prenorm_gemm,
 )
 from vllm.model_executor.layers.mhc import (
     MHCFusedPostPreOp,
@@ -104,6 +105,20 @@ def hc_head_ref(
 def rms_norm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     variance = x.float().pow(2).mean(dim=-1, keepdim=True)
     return (x.float() * torch.rsqrt(variance + eps) * weight.float()).to(x.dtype)
+
+
+def test_sm120_uses_tf32_hc_prenorm_gemm_without_deepgemm(monkeypatch):
+    monkeypatch.setattr(
+        current_platform,
+        "is_device_capability_family",
+        lambda family: family == 120,
+    )
+    monkeypatch.setattr(
+        "vllm.utils.deep_gemm.is_deep_gemm_supported",
+        lambda: False,
+    )
+
+    assert _use_tf32_hc_prenorm_gemm()
 
 
 @pytest.mark.skipif(
@@ -350,7 +365,7 @@ def test_hc_head_cuda_impl_uses_triton_fallback():
     rms_eps = hc_eps = 1e-6
 
     out = _hc_head_cuda_impl(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     out_ref = hc_head_ref(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=1e-2)
