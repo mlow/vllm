@@ -98,10 +98,14 @@ def _build_b12x_virtual_tp_plan(
     is_deepseek_v4 = _is_deepseek_v4_config(model_config)
 
     original_attention_heads = _require_int_attr(text_config, "num_attention_heads")
+    # DeepSeek V4 carries output-group constraints tied to padded head count.
+    # GLM/DSA sparse MLA only needs divisibility by TP; backend kernels handle
+    # their own local tiling, so avoid inflating KV/cache shapes there.
+    attention_head_alignment = _ATTENTION_HEAD_LOCAL_ALIGNMENT if is_deepseek_v4 else 1
     attention_axis = _make_virtual_axis(
         original_attention_heads,
         attention_tp_size,
-        _ATTENTION_HEAD_LOCAL_ALIGNMENT,
+        attention_head_alignment,
     )
     if is_deepseek_v4:
         original_output_groups = _require_int_attr(text_config, "o_groups")

@@ -283,21 +283,21 @@ def test_b12x_virtual_tp_padding_glm_dsa_tp6():
     maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
 
     text_config = vllm_config.model_config.hf_text_config
-    assert text_config.num_attention_heads == 96
+    assert text_config.num_attention_heads == 66
     assert text_config.moe_intermediate_size == 2112
     assert text_config.vocab_size == 129280
     assert text_config.original_num_attention_heads == 64
     assert text_config.original_moe_intermediate_size == 2048
-    assert vllm_config.model_config.model_arch_config.total_num_attention_heads == 96
+    assert vllm_config.model_config.model_arch_config.total_num_attention_heads == 66
 
     plan = getattr(text_config, VIRTUAL_TP_PLAN_ATTR)
     assert "output_groups" not in plan
     assert "shared_expert_intermediate_size" not in plan
     assert plan["attention_heads"] == {
         "original_size": 64,
-        "padded_size": 96,
+        "padded_size": 66,
         "tp_size": 6,
-        "local_size": 16,
+        "local_size": 11,
     }
     assert plan["moe_intermediate_size"] == {
         "original_size": 2048,
@@ -329,9 +329,9 @@ def test_b12x_virtual_tp_padding_glm_dsa_draft_tp6():
     SpeculativeConfig._maybe_apply_virtual_tp_to_draft(cast(Any, spec_config))
 
     text_config = draft_model_config.hf_text_config
-    assert text_config.num_attention_heads == 96
+    assert text_config.num_attention_heads == 66
     assert text_config.moe_intermediate_size == 2112
-    assert draft_model_config.model_arch_config.total_num_attention_heads == 96
+    assert draft_model_config.model_arch_config.total_num_attention_heads == 66
 
 
 def test_b12x_virtual_tp_padding_minimax_m3_tp3_only():
@@ -424,7 +424,7 @@ def test_b12x_virtual_tp_padding_updates_distinct_hf_configs():
     text_config = vllm_config.model_config.hf_text_config
     plan = getattr(text_config, VIRTUAL_TP_PLAN_ATTR)
 
-    assert root_config.num_attention_heads == 96
+    assert root_config.num_attention_heads == 66
     assert root_config.moe_intermediate_size == 2112
     assert root_config.vocab_size == 129280
     assert getattr(root_config, VIRTUAL_TP_PLAN_ATTR) is plan
