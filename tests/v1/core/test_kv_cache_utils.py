@@ -188,6 +188,38 @@ def new_mamba_spec(
     )
 
 
+def test_unify_kv_cache_spec_page_size_uses_lcm_for_non_divisible_pages():
+    mimo_spec = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=2,
+        head_size=192,
+        head_size_v=128,
+        dtype=torch.float32,
+    )
+    dflash_spec = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.float32,
+    )
+
+    assert mimo_spec.page_size_bytes == 163840
+    assert dflash_spec.page_size_bytes == 65536
+    assert mimo_spec.page_size_bytes % dflash_spec.page_size_bytes != 0
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {
+            "model.layers.0.self_attn": mimo_spec,
+            "draft_model.layers.0.self_attn": dflash_spec,
+        }
+    )
+
+    assert {spec.page_size_bytes for spec in unified.values()} == {327680}
+    assert unified["model.layers.0.self_attn"].block_size == 128
+    assert unified["draft_model.layers.0.self_attn"].block_size == 320
+
+
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
 def test_none_hash(monkeypatch, hash_fn):
     import vllm.v1.core.kv_cache_utils
@@ -1985,8 +2017,9 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # different hidden size that cannot be aligned by using different block size,
-    # but can be aligned by padding the smaller physical page.
+    # Different hidden size and different type that cannot be aligned by using
+    # different block size, but can be aligned by padding the smaller physical
+    # page.
     swa_spec = new_sliding_window_spec(head_size=96, indexes_kv_by_block_stride=True)
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64, indexes_kv_by_block_stride=True),

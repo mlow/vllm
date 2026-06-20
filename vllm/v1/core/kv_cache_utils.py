@@ -1078,14 +1078,14 @@ def unify_kv_cache_spec_page_size(
 ) -> dict[str, KVCacheSpec]:
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
-    are the same, return the original KVCacheSpec. If not same, first try to
-    unify page size by increasing the block size of layers with smaller page
-    size. If a smaller attention page does not evenly divide the maximum page
-    size, keep its logical block size and pad its physical page instead --- but
-    only for attention layers whose backend opts in via
-    ``AttentionSpec.indexes_kv_by_block_stride`` (the padded page is read through
-    a strided view, which not every backend handles). Raise NotImplementedError
-    if failed to unify the page size.
+    are the same, return the original KVCacheSpec. If all specs are the same KV
+    cache type, use the least common multiple as a common page size and scale
+    block sizes. For heterogeneous groups, target the maximum page size; if a
+    smaller attention page does not evenly divide it, keep its logical block
+    size and pad its physical page instead --- but only for attention layers
+    whose backend opts in via ``AttentionSpec.indexes_kv_by_block_stride`` (the
+    padded page is read through a strided view, which not every backend handles).
+    Raise NotImplementedError if failed to unify the page size.
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
@@ -1098,31 +1098,34 @@ def unify_kv_cache_spec_page_size(
         # All layers have the same page size, no need to unify.
         return kv_cache_spec
 
-    max_page_size = max(page_sizes)
+    if UniformTypeKVCacheSpecs.is_uniform_type(kv_cache_spec):
+        target_page_size = math.lcm(*page_sizes)
+    else:
+        target_page_size = max(page_sizes)
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
+        if layer_spec.page_size_bytes == target_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size == 0:
-                ratio = max_page_size // layer_page_size
+            if target_page_size % layer_page_size == 0:
+                ratio = target_page_size // layer_page_size
                 new_block_size = layer_spec.block_size * ratio
                 new_spec = replace(layer_spec, block_size=new_block_size)
             elif (
                 isinstance(layer_spec, AttentionSpec)
                 and layer_spec.indexes_kv_by_block_stride
             ):
-                new_spec = replace(layer_spec, page_size_padded=max_page_size)
+                new_spec = replace(layer_spec, page_size_padded=target_page_size)
             else:
                 raise NotImplementedError(
                     f"Layer {layer_name}: page size is not divisible by the "
-                    "maximum page size and cannot be padded. Padding is only "
+                    "target page size and cannot be padded. Padding is only "
                     "supported for attention layers whose backend indexes KV "
                     "pages by the block stride (indexes_kv_by_block_stride is "
                     "True)."
                 )
-            assert new_spec.page_size_bytes == max_page_size
+            assert new_spec.page_size_bytes == target_page_size
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 
