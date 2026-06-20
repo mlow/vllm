@@ -284,6 +284,26 @@ logger = init_logger(__name__)
 _FP8_DTYPE = current_platform.fp8_dtype()
 
 
+def _match_merge_strides(
+    prefix_output: torch.Tensor, suffix_output: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Give both partial-attention outputs identical strides.
+
+    The merge_attn_states CUDA kernel computes one source offset from the
+    prefix strides and reads BOTH prefix and suffix with it. The FA prefill
+    backend returns padded-V views (head stride > head_size) while merged
+    chunk outputs are contiguous, so once the chunked-context loop runs more
+    than one iteration (context > workspace, i.e. > 64k tokens) the two
+    sides disagree and the kernel reads the suffix at wrong offsets.
+    """
+    if prefix_output.stride() != suffix_output.stride():
+        if not prefix_output.is_contiguous():
+            prefix_output = prefix_output.contiguous()
+        if not suffix_output.is_contiguous():
+            suffix_output = suffix_output.contiguous()
+    return prefix_output, suffix_output
+
+
 def _detect_output_quant_key(
     output: torch.Tensor,
     output_scale: torch.Tensor | None,
@@ -1326,6 +1346,7 @@ class MLACommonPrefillMetadata:
         padded_local_chunk_seq_lens: list[list[int]] | None = None
         local_context_lens_allranks: list[list[int]] | None = None
         padded_local_cu_seq_lens: torch.Tensor | None = None
+        padded_local_token_to_seq: torch.Tensor | None = None
         cu_seq_lens_lst: list[list[int]] | None = None
         chunk_size: int | None = None
         prefill_tokens_with_context: int | None = None
@@ -1850,6 +1871,19 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         out=padded_local_cu_chunk_seq_lens_cpu[:, 1:],
                         dtype=torch.int32,
                     )
+                    max_padded_local_tokens = (
+                        padded_local_chunk_seq_lens.sum(dim=1).max().item()
+                    )
+                    padded_local_token_to_seq_tensor_cpu = torch.zeros(
+                        [num_chunks, max_padded_local_tokens], dtype=torch.int32
+                    )
+                    for i in range(num_chunks):
+                        padded_local_token_to_seq = torch.repeat_interleave(
+                            range_idx, padded_local_chunk_seq_lens[i]
+                        )
+                        padded_local_token_to_seq_tensor_cpu[
+                            i, : padded_local_token_to_seq.shape[0]
+                        ] = padded_local_token_to_seq
 
                 prefill_tokens_with_context = None
                 if num_prefills_with_context_cpu > 0:
@@ -1873,6 +1907,11 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         local_context_lens_allranks=local_context_lens_allranks.tolist(),
                         padded_local_cu_seq_lens=padded_local_cu_chunk_seq_lens_cpu.to(
                             device, non_blocking=True
+                        ),
+                        padded_local_token_to_seq=(
+                            padded_local_token_to_seq_tensor_cpu.to(
+                                device, non_blocking=True
+                            )
                         ),
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
                         chunk_size=padded_local_max_context_chunk_across_ranks,
@@ -2221,11 +2260,11 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     v=v,
                 )
             )
-
             if output is None:
                 output = attn_output
                 output_lse = attn_softmax_lse
             else:
+                output, attn_output = _match_merge_strides(output, attn_output)
                 if merge_output is None:
                     merge_output = torch.empty_like(output)
                     merge_output_lse = torch.empty_like(output_lse)
@@ -2250,7 +2289,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         k_scale: torch.Tensor,
         dcp_world_size: int,
     ):
-        assert k_scale is None, "DCP not support scaled kvcache now."
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.prefill_backend is not None
@@ -2266,18 +2304,48 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         iters = len(prefill_metadata.chunked_context.seq_tot)
         workspace = prefill_metadata.chunked_context.workspace
 
+        # Quantized KV caches store bytes while the gather workspace is in the
+        # model dtype; route through the dequantizing gather in that case.
+        needs_dequant_gather = kv_c_and_k_pe_cache.dtype != workspace.dtype
+        if needs_dequant_gather:
+            assert is_quantized_kv_cache(self.kv_cache_dtype), (
+                "DCP context prefill only supports dtype-mismatched KV cache "
+                "when the KV cache is quantized."
+            )
+            assert k_scale is not None
+            assert (
+                prefill_metadata.chunked_context.padded_local_token_to_seq is not None
+            )
+
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            ops.cp_gather_cache(
-                src_cache=kv_c_and_k_pe_cache,
-                dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
-                    i
-                ],
-                batch_size=attn_metadata.num_prefills,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
-            )
+            if needs_dequant_gather:
+                ops.gather_and_maybe_dequant_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    token_to_seq=(
+                        prefill_metadata.chunked_context.padded_local_token_to_seq[i]
+                    ),
+                    num_tokens=toks,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=k_scale,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
+            else:
+                ops.cp_gather_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    batch_size=attn_metadata.num_prefills,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
             # workspace
             # |------- N tokens --------|--------- N*dcp_size tokens ----------|
             # |<- use for local_gather ->|<--------- use for allgather -------->|
@@ -2334,6 +2402,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 output = attn_output
                 output_lse = attn_softmax_lse
             else:
+                output, attn_output = _match_merge_strides(output, attn_output)
                 if merge_output is None:
                     merge_output = torch.empty_like(output)
                     merge_output_lse = torch.empty_like(output_lse)
@@ -2409,7 +2478,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                         q,
                         kv_c_and_k_pe_cache,
                         attn_metadata,
-                        k_scale=None,
+                        k_scale=k_scale,
                         dcp_world_size=self.dcp_world_size,
                     )
                 )
@@ -2419,6 +2488,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 )
 
             output = output.view(-1, self.num_heads, self.v_head_dim)
+            context_output, suffix_output = _match_merge_strides(
+                context_output, suffix_output
+            )
             merge_attn_states(
                 output=output,
                 prefix_output=context_output,
