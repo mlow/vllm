@@ -109,11 +109,42 @@ class FakeAlignedGlmDsaModelConfig(FakeGlmDsaModelConfig):
         self.model_arch_config = self.get_model_arch_config()
 
 
+class FakeMiniMaxM3ModelConfig:
+    def __init__(self):
+        self.hf_text_config = SimpleNamespace(
+            model_type="minimax_m3_text",
+            architectures=["MiniMaxM3SparseForCausalLM"],
+            vocab_size=200064,
+            hidden_size=6144,
+            intermediate_size=3072,
+            dense_intermediate_size=12288,
+            shared_intermediate_size=3072,
+            n_shared_experts=1,
+            num_attention_heads=64,
+            num_key_value_heads=4,
+            sparse_attention_config={
+                "sparse_num_index_heads": 4,
+                "sparse_index_dim": 128,
+            },
+        )
+        self.hf_config = SimpleNamespace(
+            model_type="minimax_m3_vl",
+            text_config=self.hf_text_config,
+        )
+        self.model_arch_config = self.get_model_arch_config()
+
+    def get_model_arch_config(self):
+        return SimpleNamespace(
+            total_num_attention_heads=self.hf_text_config.num_attention_heads,
+        )
+
+
 def _fake_vllm_config(
     *,
     model_config: Any | None = None,
     moe_backend: str = "b12x",
     tensor_parallel_size: int = 10,
+    attention_backend: AttentionBackendEnum = AttentionBackendEnum.B12X_MLA_SPARSE,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         model_config=model_config or FakeModelConfig(),
@@ -122,7 +153,7 @@ def _fake_vllm_config(
         ),
         kernel_config=SimpleNamespace(moe_backend=moe_backend),
         attention_config=SimpleNamespace(
-            backend=AttentionBackendEnum.B12X_MLA_SPARSE,
+            backend=attention_backend,
         ),
     )
 
@@ -301,6 +332,84 @@ def test_b12x_virtual_tp_padding_glm_dsa_draft_tp6():
     assert text_config.num_attention_heads == 96
     assert text_config.moe_intermediate_size == 2112
     assert draft_model_config.model_arch_config.total_num_attention_heads == 96
+
+
+def test_b12x_virtual_tp_padding_minimax_m3_tp3_only():
+    vllm_config = _fake_vllm_config(
+        model_config=FakeMiniMaxM3ModelConfig(),
+        tensor_parallel_size=3,
+        attention_backend=AttentionBackendEnum.B12X_ATTN,
+    )
+
+    maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
+
+    text_config = vllm_config.model_config.hf_text_config
+    assert text_config.num_attention_heads == 96
+    assert text_config.num_key_value_heads == 4
+    assert text_config.intermediate_size == 3072
+    assert text_config.dense_intermediate_size == 12288
+    assert vllm_config.model_config.model_arch_config.total_num_attention_heads == 96
+
+    plan = getattr(text_config, VIRTUAL_TP_PLAN_ATTR)
+    assert getattr(vllm_config.model_config.hf_config, VIRTUAL_TP_PLAN_ATTR) is plan
+    assert plan["model_type"] == "minimax_m3"
+    assert plan["attention_heads"] == {
+        "original_size": 64,
+        "padded_size": 96,
+        "tp_size": 3,
+        "local_size": 32,
+    }
+    assert plan["kv_heads"] == {
+        "original_size": 4,
+        "padded_size": 6,
+        "tp_size": 3,
+        "local_size": 2,
+        "q_heads_per_kv": 16,
+    }
+    assert plan["index_heads"] == {
+        "original_size": 4,
+        "padded_size": 6,
+        "tp_size": 3,
+        "local_size": 2,
+    }
+    assert plan["moe_intermediate_size"] == {
+        "original_size": 3072,
+        "padded_size": 3072,
+        "tp_size": 3,
+        "local_size": 1024,
+    }
+    assert plan["dense_intermediate_size"] == {
+        "original_size": 12288,
+        "padded_size": 12288,
+        "tp_size": 3,
+        "local_size": 4096,
+    }
+    assert plan["vocab_size"] == {
+        "original_size": 200064,
+        "padded_size": 200064,
+        "tp_size": 3,
+        "local_size": 66688,
+        "padding_size": 192,
+    }
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+def test_b12x_virtual_tp_padding_minimax_m3_skips_working_tp(tp_size: int):
+    vllm_config = _fake_vllm_config(
+        model_config=FakeMiniMaxM3ModelConfig(),
+        tensor_parallel_size=tp_size,
+        attention_backend=AttentionBackendEnum.B12X_ATTN,
+    )
+
+    maybe_apply_b12x_virtual_tp_padding(cast(Any, vllm_config))
+
+    text_config = vllm_config.model_config.hf_text_config
+    assert not hasattr(text_config, VIRTUAL_TP_PLAN_ATTR)
+    assert text_config.num_attention_heads == 64
+    assert text_config.num_key_value_heads == 4
+    assert text_config.intermediate_size == 3072
+    assert text_config.dense_intermediate_size == 12288
+    assert vllm_config.model_config.model_arch_config.total_num_attention_heads == 64
 
 
 def test_b12x_virtual_tp_padding_updates_distinct_hf_configs():

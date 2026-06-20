@@ -25,6 +25,8 @@ _ATTENTION_HEAD_LOCAL_ALIGNMENT = 8
 _MOE_INTERMEDIATE_LOCAL_ALIGNMENT = 32
 _SHARED_EXPERT_FP8_LOCAL_ALIGNMENT = 128
 _VOCAB_GLOBAL_ALIGNMENT = 64
+_MINIMAX_M3_VIRTUAL_TP_SIZE = 3
+_MINIMAX_M3_QK_PER_KV = 16
 
 
 def maybe_apply_b12x_virtual_tp_padding(vllm_config: VllmConfig) -> None:
@@ -82,6 +84,9 @@ def _build_b12x_virtual_tp_plan(
     model_config: ModelConfig,
     parallel_config: ParallelConfig,
 ) -> dict[str, dict[str, int] | str]:
+    if _is_minimax_m3_config(model_config):
+        return _build_minimax_m3_virtual_tp_plan(model_config, parallel_config)
+
     attention_tp_size = parallel_config.tensor_parallel_size
     moe_tp_size = (
         parallel_config.tensor_parallel_size
@@ -141,6 +146,113 @@ def _build_b12x_virtual_tp_plan(
     return plan
 
 
+def _build_minimax_m3_virtual_tp_plan(
+    model_config: ModelConfig,
+    parallel_config: ParallelConfig,
+) -> dict[str, dict[str, int] | str]:
+    text_config = model_config.hf_text_config
+    tp_size = parallel_config.tensor_parallel_size
+
+    original_attention_heads = _require_int_attr(text_config, "num_attention_heads")
+    original_kv_heads = _require_int_attr(text_config, "num_key_value_heads")
+    sparse_config = getattr(text_config, "sparse_attention_config", None) or {}
+    original_index_heads = int(
+        sparse_config.get("sparse_num_index_heads", original_kv_heads)
+    )
+    intermediate_size = _require_int_attr(text_config, "intermediate_size")
+    dense_intermediate_size = _require_int_attr(text_config, "dense_intermediate_size")
+    n_shared_experts = int(getattr(text_config, "n_shared_experts", 1) or 1)
+    vocab_size = _require_int_attr(text_config, "vocab_size")
+
+    if tp_size != _MINIMAX_M3_VIRTUAL_TP_SIZE:
+        q_heads_per_kv = (
+            original_attention_heads // original_kv_heads
+            if original_kv_heads > 0
+            and original_attention_heads % original_kv_heads == 0
+            else 0
+        )
+        return {
+            "sharding": _VIRTUAL_TP_PLAN_KIND_B12X_PADDED,
+            "model_type": "minimax_m3",
+            "attention_heads": _make_noop_axis(original_attention_heads, tp_size),
+            "kv_heads": {
+                **_make_noop_axis(original_kv_heads, tp_size),
+                "q_heads_per_kv": q_heads_per_kv,
+            },
+            "index_heads": _make_noop_axis(original_index_heads, tp_size),
+            "moe_intermediate_size": _make_noop_axis(intermediate_size, tp_size),
+            "dense_intermediate_size": _make_noop_axis(
+                dense_intermediate_size, tp_size
+            ),
+            "shared_expert_intermediate_size": _make_noop_axis(
+                intermediate_size * n_shared_experts, tp_size
+            ),
+            "vocab_size": _make_noop_vocab_axis(vocab_size, tp_size),
+        }
+
+    if original_attention_heads % original_kv_heads != 0:
+        raise ValueError(
+            "MiniMax M3 virtual TP padding requires num_attention_heads to "
+            "be divisible by num_key_value_heads."
+        )
+    q_heads_per_kv = original_attention_heads // original_kv_heads
+    if q_heads_per_kv != _MINIMAX_M3_QK_PER_KV:
+        raise ValueError(
+            "MiniMax M3 virtual TP padding currently expects 16 query heads "
+            f"per KV head, got {q_heads_per_kv}."
+        )
+
+    attention_axis = _make_minimax_m3_attention_axis(
+        original_attention_heads, original_kv_heads, tp_size
+    )
+    kv_axis = _make_minimax_m3_kv_axis(
+        original_kv_heads, attention_axis["local_size"], q_heads_per_kv, tp_size
+    )
+    index_axis = {
+        "original_size": original_index_heads,
+        "padded_size": kv_axis["padded_size"],
+        "tp_size": tp_size,
+        "local_size": kv_axis["local_size"],
+    }
+
+    moe_tp_size = (
+        parallel_config.tensor_parallel_size
+        * parallel_config.data_parallel_size
+        * parallel_config.prefill_context_parallel_size
+    )
+    moe_axis = _make_virtual_axis(
+        intermediate_size,
+        moe_tp_size,
+        _MOE_INTERMEDIATE_LOCAL_ALIGNMENT,
+    )
+    dense_axis = _make_virtual_axis(
+        dense_intermediate_size,
+        tp_size,
+        _SHARED_EXPERT_FP8_LOCAL_ALIGNMENT,
+    )
+    shared_expert_axis = _make_virtual_axis(
+        intermediate_size * n_shared_experts,
+        tp_size,
+        _SHARED_EXPERT_FP8_LOCAL_ALIGNMENT,
+    )
+    vocab_axis = _make_virtual_vocab_axis(
+        vocab_size,
+        tp_size,
+    )
+
+    return {
+        "sharding": _VIRTUAL_TP_PLAN_KIND_B12X_PADDED,
+        "model_type": "minimax_m3",
+        "attention_heads": attention_axis,
+        "kv_heads": kv_axis,
+        "index_heads": index_axis,
+        "moe_intermediate_size": moe_axis,
+        "dense_intermediate_size": dense_axis,
+        "shared_expert_intermediate_size": shared_expert_axis,
+        "vocab_size": vocab_axis,
+    }
+
+
 def _plan_requires_padding(plan: dict[str, dict[str, int] | str]) -> bool:
     for axis in plan.values():
         if not isinstance(axis, dict):
@@ -160,6 +272,10 @@ def _apply_b12x_virtual_tp_plan(
     model_config: ModelConfig,
     plan: dict[str, dict[str, int] | str],
 ) -> None:
+    if plan.get("model_type") == "minimax_m3":
+        _apply_minimax_m3_virtual_tp_plan(model_config, plan)
+        return
+
     configs = tuple(_iter_virtual_tp_configs(model_config))
     attention_axis = _require_axis(plan, "attention_heads")
     moe_axis = _require_axis(plan, "moe_intermediate_size")
@@ -224,6 +340,68 @@ def _apply_b12x_virtual_tp_plan(
         )
 
 
+def _apply_minimax_m3_virtual_tp_plan(
+    model_config: ModelConfig,
+    plan: dict[str, dict[str, int] | str],
+) -> None:
+    configs = tuple(_iter_virtual_tp_configs(model_config))
+    attention_axis = _require_axis(plan, "attention_heads")
+    kv_axis = _require_axis(plan, "kv_heads")
+    moe_axis = _require_axis(plan, "moe_intermediate_size")
+    dense_axis = _require_axis(plan, "dense_intermediate_size")
+    vocab_axis = _require_axis(plan, "vocab_size")
+    shared_expert_axis = _optional_axis(plan, "shared_expert_intermediate_size")
+
+    _set_all_config_attr(
+        configs, "original_num_attention_heads", attention_axis["original_size"]
+    )
+    _set_existing_config_attr(
+        configs, "num_attention_heads", attention_axis["padded_size"]
+    )
+    _set_all_config_attr(
+        configs, "original_num_key_value_heads", kv_axis["original_size"]
+    )
+    _set_all_config_attr(
+        configs, "original_intermediate_size", moe_axis["original_size"]
+    )
+    _set_existing_config_attr(configs, "intermediate_size", moe_axis["padded_size"])
+    _set_all_config_attr(
+        configs, "original_dense_intermediate_size", dense_axis["original_size"]
+    )
+    _set_existing_config_attr(
+        configs, "dense_intermediate_size", dense_axis["padded_size"]
+    )
+
+    for config in configs:
+        setattr(config, VIRTUAL_TP_PLAN_ATTR, plan)
+
+    model_config.model_arch_config = model_config.get_model_arch_config()
+
+    logger.warning(
+        "Automatically enabled B12X virtual TP padding for MiniMax M3 TP=3: "
+        "attention heads %d -> %d, logical KV heads %d -> %d, MoE "
+        "intermediate size %d -> %d, dense intermediate size %d -> %d, "
+        "vocab size %d -> %d.",
+        attention_axis["original_size"],
+        attention_axis["padded_size"],
+        kv_axis["original_size"],
+        kv_axis["padded_size"],
+        moe_axis["original_size"],
+        moe_axis["padded_size"],
+        dense_axis["original_size"],
+        dense_axis["padded_size"],
+        vocab_axis["original_size"],
+        vocab_axis["padded_size"],
+    )
+    if shared_expert_axis is not None:
+        logger.warning(
+            "Automatically enabled B12X virtual TP padding for MiniMax M3 "
+            "shared experts: intermediate size %d -> %d.",
+            shared_expert_axis["original_size"],
+            shared_expert_axis["padded_size"],
+        )
+
+
 def _require_axis(plan: dict[str, dict[str, int] | str], name: str) -> dict[str, int]:
     axis = plan.get(name)
     if not isinstance(axis, dict):
@@ -250,7 +428,7 @@ def _validate_b12x_virtual_tp_config(vllm_config: VllmConfig) -> None:
     if not _is_supported_b12x_virtual_tp_config(model_config):
         raise ValueError(
             "B12X virtual TP padding is currently supported only for "
-            "DeepSeek V4 and sparse MLA/DSA models."
+            "DeepSeek V4, sparse MLA/DSA models, and MiniMax M3 TP=3."
         )
 
     if parallel_config.enable_expert_parallel:
@@ -269,6 +447,15 @@ def _validate_b12x_virtual_tp_config(vllm_config: VllmConfig) -> None:
             "B12X virtual TP padding requires the native B12X MoE "
             "backend. Pass --moe-backend b12x or set VLLM_USE_B12X_MOE=1."
         )
+
+    if _is_minimax_m3_config(model_config):
+        if not _uses_minimax_m3_b12x_attention(vllm_config):
+            raise ValueError(
+                "MiniMax M3 virtual TP padding requires the B12X MiniMax M3 "
+                "attention path. Pass --attention-backend B12X_ATTN or set "
+                "VLLM_USE_B12X_MINIMAX_M3_MSA=1."
+            )
+        return
 
     if not _uses_b12x_attention(vllm_config):
         raise ValueError(
@@ -307,8 +494,31 @@ def _is_sparse_mla_config(model_config: ModelConfig) -> bool:
     return False
 
 
+def _is_minimax_m3_config(model_config: ModelConfig) -> bool:
+    for config in _iter_virtual_tp_configs(model_config):
+        model_type = getattr(config, "model_type", None)
+        if model_type in {"minimax_m3_text", "minimax_m3_vl", "minimax_m3_mtp"}:
+            return True
+        architectures = getattr(config, "architectures", None) or ()
+        if any(
+            architecture
+            in {
+                "MiniMaxM3SparseForCausalLM",
+                "MiniMaxM3SparseForConditionalGeneration",
+                "MiniMaxM3MTP",
+            }
+            for architecture in architectures
+        ):
+            return True
+    return False
+
+
 def _is_supported_b12x_virtual_tp_config(model_config: ModelConfig) -> bool:
-    return _is_deepseek_v4_config(model_config) or _is_sparse_mla_config(model_config)
+    return (
+        _is_deepseek_v4_config(model_config)
+        or _is_sparse_mla_config(model_config)
+        or _is_minimax_m3_config(model_config)
+    )
 
 
 def _uses_native_b12x_moe(vllm_config: VllmConfig) -> bool:
@@ -322,11 +532,26 @@ def _uses_b12x_attention(vllm_config: VllmConfig) -> bool:
         return True
 
     model_config = vllm_config.model_config
+    if model_config is not None and _is_minimax_m3_config(model_config):
+        return (
+            backend == AttentionBackendEnum.B12X_ATTN
+            or envs.VLLM_USE_B12X_MINIMAX_M3_MSA
+        )
+
     return (
         model_config is not None
         and _is_supported_b12x_virtual_tp_config(model_config)
         and current_platform.is_cuda()
         and current_platform.has_device_capability(120)
+    )
+
+
+def _uses_minimax_m3_b12x_attention(vllm_config: VllmConfig) -> bool:
+    backend = getattr(vllm_config.attention_config, "backend", None)
+    return backend == AttentionBackendEnum.B12X_ATTN or (
+        vllm_config.model_config is not None
+        and _is_minimax_m3_config(vllm_config.model_config)
+        and envs.VLLM_USE_B12X_MINIMAX_M3_MSA
     )
 
 
@@ -345,6 +570,24 @@ def _make_virtual_axis(
     }
 
 
+def _make_noop_axis(original_size: int, tp_size: int) -> dict[str, int]:
+    return {
+        "original_size": original_size,
+        "padded_size": original_size,
+        "tp_size": tp_size,
+        "local_size": (
+            original_size // tp_size if tp_size > 0 and original_size % tp_size == 0
+            else 0
+        ),
+    }
+
+
+def _make_noop_vocab_axis(original_size: int, tp_size: int) -> dict[str, int]:
+    axis = _make_noop_axis(original_size, tp_size)
+    axis["padding_size"] = math.lcm(_VOCAB_GLOBAL_ALIGNMENT, tp_size)
+    return axis
+
+
 def _make_virtual_vocab_axis(
     original_size: int,
     tp_size: int,
@@ -358,6 +601,48 @@ def _make_virtual_vocab_axis(
         "tp_size": tp_size,
         "local_size": padded_size // tp_size,
         "padding_size": padding_size,
+    }
+
+
+def _make_minimax_m3_attention_axis(
+    original_size: int,
+    original_kv_heads: int,
+    tp_size: int,
+) -> dict[str, int]:
+    q_heads_per_kv = original_size // original_kv_heads
+    local_size = math.ceil(original_size / tp_size)
+    local_size = (
+        math.ceil(local_size / _ATTENTION_HEAD_LOCAL_ALIGNMENT)
+        * _ATTENTION_HEAD_LOCAL_ALIGNMENT
+    )
+    while local_size % q_heads_per_kv != 0:
+        local_size += _ATTENTION_HEAD_LOCAL_ALIGNMENT
+    return {
+        "original_size": original_size,
+        "padded_size": local_size * tp_size,
+        "tp_size": tp_size,
+        "local_size": local_size,
+    }
+
+
+def _make_minimax_m3_kv_axis(
+    original_size: int,
+    local_attention_heads: int,
+    q_heads_per_kv: int,
+    tp_size: int,
+) -> dict[str, int]:
+    if local_attention_heads % q_heads_per_kv != 0:
+        raise ValueError(
+            "MiniMax M3 virtual TP padding produced a local query-head count "
+            "that does not preserve the original GQA group size."
+        )
+    local_size = local_attention_heads // q_heads_per_kv
+    return {
+        "original_size": original_size,
+        "padded_size": local_size * tp_size,
+        "tp_size": tp_size,
+        "local_size": local_size,
+        "q_heads_per_kv": q_heads_per_kv,
     }
 
 

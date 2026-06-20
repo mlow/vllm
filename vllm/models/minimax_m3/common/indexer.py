@@ -20,9 +20,11 @@ from typing import ClassVar
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.attention import IndexerKVDType
 from vllm.config.cache import CacheDType
+from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -198,6 +200,50 @@ class MiniMaxM3IndexerMetadata(AttentionMetadata):
     decode: MiniMaxM3IndexerDecodeMetadata | None = None
 
 
+def _get_minimax_m3_virtual_tp_index_heads(
+    vllm_config: VllmConfig,
+    tp_size: int,
+) -> int | None:
+    model_config = vllm_config.model_config
+    if model_config is None:
+        return None
+
+    hf_config = getattr(model_config, "hf_config", None)
+    for config in (
+        getattr(model_config, "hf_text_config", None),
+        hf_config,
+        getattr(hf_config, "text_config", None),
+    ):
+        plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
+        if not isinstance(plan, dict) or plan.get("model_type") != "minimax_m3":
+            continue
+        axis = plan.get("index_heads")
+        if not isinstance(axis, dict):
+            raise ValueError("MiniMax M3 virtual TP plan missing 'index_heads'.")
+        if int(axis.get("tp_size", -1)) != tp_size:
+            continue
+        return int(axis["local_size"])
+    return None
+
+
+def _get_minimax_m3_indexer_num_heads(
+    vllm_config: VllmConfig,
+    total_index_heads: int,
+    tp_size: int,
+) -> int:
+    virtual_tp_index_heads = _get_minimax_m3_virtual_tp_index_heads(
+        vllm_config, tp_size
+    )
+    if virtual_tp_index_heads is not None:
+        return virtual_tp_index_heads
+
+    if total_index_heads >= tp_size:
+        assert total_index_heads % tp_size == 0
+    else:
+        assert tp_size % total_index_heads == 0
+    return max(1, total_index_heads // tp_size)
+
+
 class MiniMaxM3IndexerMetadataBuilder(
     AttentionMetadataBuilder[MiniMaxM3IndexerMetadata]
 ):
@@ -224,11 +270,9 @@ class MiniMaxM3IndexerMetadataBuilder(
         # Index-query head count from model config (cache spec has 1 vec/token).
         total_index_heads = sparse_cfg["sparse_num_index_heads"]
         tp_size = get_tensor_model_parallel_world_size()
-        if total_index_heads >= tp_size:
-            assert total_index_heads % tp_size == 0
-        else:
-            assert tp_size % total_index_heads == 0
-        self.num_index_heads = max(1, total_index_heads // tp_size)
+        self.num_index_heads = _get_minimax_m3_indexer_num_heads(
+            vllm_config, total_index_heads, tp_size
+        )
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
         assert self.reorder_batch_threshold is not None
         self.max_decode_query_len = self.reorder_batch_threshold
@@ -346,6 +390,7 @@ class MiniMaxM3IndexerImpl(nn.Module):
         indexer_kv_dtype: IndexerKVDType = "bf16",
     ) -> None:
         super().__init__()
+        vllm_config = get_current_vllm_config()
         self.num_kv_heads = num_kv_heads
         self.scale = scale
         self.topk_blocks = topk_blocks
@@ -356,6 +401,29 @@ class MiniMaxM3IndexerImpl(nn.Module):
         self.num_index_heads = num_index_heads
         self.index_head_dim = index_head_dim
         self.indexer_kv_dtype = indexer_kv_dtype
+        if envs.VLLM_USE_B12X_MINIMAX_M3_MSA:
+            max_topk_rows = vllm_config.scheduler_config.max_num_batched_tokens
+            self.register_buffer(
+                "_decode_topk_buffer",
+                torch.empty(
+                    (num_index_heads, max_topk_rows, topk_blocks),
+                    dtype=torch.int32,
+                    device=vllm_config.device_config.device,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_prefill_topk_buffer",
+                torch.empty(
+                    (num_index_heads, max_topk_rows, topk_blocks),
+                    dtype=torch.int32,
+                    device=vllm_config.device_config.device,
+                ),
+                persistent=False,
+            )
+        else:
+            self._decode_topk_buffer = None
+            self._prefill_topk_buffer = None
         # Owns the side cache (registers itself in the static forward context).
         self.index_cache = MiniMaxM3IndexerCache(
             head_dim=index_head_dim,
@@ -372,6 +440,31 @@ class MiniMaxM3IndexerImpl(nn.Module):
         """Return ``(decode_topk, prefill_topk)``; implemented per kernel impl."""
         raise NotImplementedError
 
+    def forward_with_cache(
+        self,
+        index_query: torch.Tensor,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return top-k indices using an explicit index KV cache."""
+        raise NotImplementedError
+
+    def _topk_out_buffer(
+        self,
+        kind: str,
+        total_q: int,
+    ) -> torch.Tensor | None:
+        buffer = (
+            self._decode_topk_buffer if kind == "decode" else self._prefill_topk_buffer
+        )
+        if buffer is None:
+            return None
+        if int(buffer.shape[1]) < total_q:
+            raise RuntimeError(
+                "MiniMax M3 persistent top-k buffer is too small: "
+                f"need {total_q}, have {int(buffer.shape[1])}."
+            )
+        return buffer
+
 
 class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
     """Triton indexer score + top-k for both prefill and decode."""
@@ -379,6 +472,13 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
     def forward(
         self,
         index_query: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.forward_with_cache(index_query, self.index_cache.kv_cache)
+
+    def forward_with_cache(
+        self,
+        index_query: torch.Tensor,
+        kv_cache: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
@@ -390,7 +490,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
         iq = index_query[:num_tokens].view(
             -1, self.num_index_heads, self.index_head_dim
         )
-        kv = self.index_cache.kv_cache
+        kv = kv_cache
 
         decode_topk: torch.Tensor | None = None
         prefill_topk: torch.Tensor | None = None
@@ -410,6 +510,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.scale,
                 d.decode_query_len,
                 d.max_decode_query_len,
+                out=self._topk_out_buffer("decode", nd),
             )
         if index_md.num_prefills > 0:
             p = index_md.prefill
@@ -434,6 +535,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.topk_blocks,
                 self.init_blocks,
                 self.local_blocks,
+                out=self._topk_out_buffer("prefill", num_tokens - nd),
             )
         return decode_topk, prefill_topk
 
@@ -515,3 +617,10 @@ class MiniMaxM3Indexer(nn.Module):
         index_query: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         return self.impl(index_query)
+
+    def forward_with_cache(
+        self,
+        index_query: torch.Tensor,
+        kv_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        return self.impl.forward_with_cache(index_query, kv_cache)

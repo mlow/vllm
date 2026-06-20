@@ -64,6 +64,8 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
+    VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
+    VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1030,6 +1032,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # native/modelopt-layout W4A16 prep path.
     "VLLM_B12X_MOE_FORCE_MODELOPT_PREP": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FORCE_MODELOPT_PREP", "0"))
+    ),
+    # Use b12x for MiniMax M3's block-sparse MSA attention.
+    # This is opt-in while page-128 MSA support is integrated.
+    "VLLM_USE_B12X_MINIMAX_M3_MSA": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_MINIMAX_M3_MSA", "0"))
+    ),
+    # Diagnostic flag retained for local experiments. MiniMax M3 compile is
+    # disabled by default while mixed-quant and sparse-attention paths settle.
+    "VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE", "0"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
