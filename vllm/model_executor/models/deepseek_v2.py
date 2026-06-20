@@ -424,6 +424,7 @@ class DeepseekV2Attention(nn.Module):
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -443,6 +444,9 @@ class DeepseekV2Attention(nn.Module):
         assert topk_indices_buffer is None, (
             "topk_indices_buffer is not \
         supported for DeepseekV2Attention"
+        )
+        assert topk_scores_buffer is None, (
+            "topk_scores_buffer is not supported for DeepseekV2Attention"
         )
 
         if self.q_lora_rank is not None:
@@ -589,11 +593,29 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         compilation_config.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        layer_id = extract_layer_index(self.prefix)
+        num_hidden_layers = getattr(
+            vllm_config.model_config.hf_config, "num_hidden_layers", None
+        )
+        import os as _os
+
+        shard_draft = _os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        dcp_replicated = (
+            not shard_draft
+            and layer_id is not None
+            and num_hidden_layers is not None
+            and int(layer_id) >= int(num_hidden_layers)
+        )
         return MLAAttentionSpec(  # Only has one vector instead of K + V
             block_size=self.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            dcp_replicated=dcp_replicated,
         )
 
     def forward(self): ...
@@ -614,6 +636,7 @@ class Indexer(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
+        topk_scores_buffer: torch.Tensor | None = None,
         prefix: str = "",
         is_inplace_rope: bool = False,
     ):
@@ -651,6 +674,7 @@ class Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
+        self.topk_scores_buffer = topk_scores_buffer
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -675,6 +699,7 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            topk_scores_buffer=self.topk_scores_buffer,
         )
 
         self.is_inplace_rope = is_inplace_rope
@@ -951,6 +976,7 @@ class DeepseekV2MLAAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
         layer_idx: int | None = None,
     ) -> None:
@@ -1085,6 +1111,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config,
                 cache_config,
                 topk_indices_buffer,
+                topk_scores_buffer,
                 f"{prefix}.indexer",
                 is_inplace_rope=self.indexer_rope_emb.enabled(),
             )
@@ -1144,6 +1171,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        topk_scores_buffer: torch.Tensor | None = None,
         quant_config: QuantizationConfig | None = None,
         layer_idx_override: int | None = None,
         is_nextn: bool = False,
@@ -1204,6 +1232,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             topk_indices_buffer=topk_indices_buffer,
+            topk_scores_buffer=topk_scores_buffer,
         )
         if attn_cls is DeepseekV2MLAAttention:
             attn_kwargs["layer_idx"] = layer_idx
@@ -1302,8 +1331,20 @@ class DeepseekV2Model(nn.Module):
                 dtype=torch.int32,
                 device=self.device,
             )
+            topk_scores_buffer = None
+            if (
+                vllm_config.parallel_config.decode_context_parallel_size > 1
+                and use_b12x_sparse_indexer()
+            ):
+                topk_scores_buffer = torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    topk_tokens,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
         else:
             topk_indices_buffer = None
+            topk_scores_buffer = None
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -1320,6 +1361,7 @@ class DeepseekV2Model(nn.Module):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                topk_scores_buffer=topk_scores_buffer,
             ),
             prefix=f"{prefix}.layers",
         )

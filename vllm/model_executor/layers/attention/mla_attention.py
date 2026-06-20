@@ -188,6 +188,7 @@ return curr_o @ W_O
 """
 
 import functools
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -282,6 +283,11 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def _extract_single_layer_index(layer_name: str) -> int | None:
+    int_vals = [int(part) for part in layer_name.split(".") if part.isdecimal()]
+    return int_vals[0] if len(int_vals) == 1 else None
 
 
 def _match_merge_strides(
@@ -1073,12 +1079,28 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, vllm_config.model_config
         )
+        layer_id = _extract_single_layer_index(self.layer_name)
+        num_hidden_layers = getattr(
+            vllm_config.model_config.hf_config, "num_hidden_layers", None
+        )
+        shard_draft = os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        dcp_replicated = (
+            not shard_draft
+            and layer_id is not None
+            and num_hidden_layers is not None
+            and layer_id >= int(num_hidden_layers)
+        )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
+            dcp_replicated=dcp_replicated,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):

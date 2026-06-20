@@ -649,7 +649,7 @@ def resolve_kv_cache_block_sizes(
                 for g in groups
             ]
             scheduler_block_size = math.lcm(*effective_block_sizes)
-            return scheduler_block_size, scheduler_block_size
+            return scheduler_block_size, math.gcd(*effective_block_sizes)
         raise ValueError(
             "Hybrid KV cache groups with multiple block sizes do not "
             "support context parallelism (dcp_world_size/pcp_world_size > 1)."

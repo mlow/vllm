@@ -51,6 +51,7 @@ from vllm.v1.attention.backend import (
     SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
+    triton_convert_dcp_global_index_to_local_index,
     triton_convert_req_index_to_global_index,
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
@@ -551,6 +552,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             from vllm.distributed.parallel_state import get_dcp_group
 
             self.dcp_rank = get_dcp_group().rank_in_group
+        self.cp_kv_cache_interleave_size = (
+            parallel_config.cp_kv_cache_interleave_size
+        )
         self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         self.need_to_return_lse_for_decode = (
@@ -720,17 +724,31 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             :num_actual_toks, : topk_indices.shape[1]
         ]
         nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[:num_actual_toks]
-        triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token[:num_actual_toks],
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-            return_valid_counts=True,
-            out=page_table_1,
-            valid_counts=nsa_cache_seqlens,
-        )
-        _compact_page_table_valid_prefix(page_table_1, nsa_cache_seqlens)
+        if self.dcp_world_size > 1:
+            triton_convert_dcp_global_index_to_local_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                dcp_world_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                out=page_table_1,
+                valid_counts=nsa_cache_seqlens,
+            )
+        else:
+            triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token[:num_actual_toks],
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_indices.shape[1],
+                return_valid_counts=True,
+                out=page_table_1,
+                valid_counts=nsa_cache_seqlens,
+            )
+            _compact_page_table_valid_prefix(page_table_1, nsa_cache_seqlens)
         per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
         torch.minimum(
             nsa_cache_seqlens,

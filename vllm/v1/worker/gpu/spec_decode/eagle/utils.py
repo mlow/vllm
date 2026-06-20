@@ -13,10 +13,25 @@ def _create_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
 
+    import os as _os
+
+    draft_parallel_config = speculative_config.draft_parallel_config
+    if _os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        draft_parallel_config = replace(
+            draft_parallel_config,
+            decode_context_parallel_size=(
+                vllm_config.parallel_config.decode_context_parallel_size
+            ),
+        )
+
     draft_vllm_config = replace(
         vllm_config,
         parallel_config=replace(
-            speculative_config.draft_parallel_config,
+            draft_parallel_config,
             rank=vllm_config.parallel_config.rank,
         ),
         model_config=speculative_config.draft_model_config,

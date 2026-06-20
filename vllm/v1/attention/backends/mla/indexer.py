@@ -33,10 +33,7 @@ _B12X_PAGED_INDEX_TILE_BLOCK_K = 512
 
 def _get_b12x_paged_indexer_supertile_k() -> int:
     raw = os.environ.get("B12X_PAGED_INDEX_SUPERTILE_K")
-    if raw is None:
-        tokens = _B12X_PAGED_INDEX_SUPERTILE_K_DEFAULT
-    else:
-        tokens = int(raw)
+    tokens = _B12X_PAGED_INDEX_SUPERTILE_K_DEFAULT if raw is None else int(raw)
     tokens = max(tokens, _B12X_PAGED_INDEX_TILE_BLOCK_K)
     return (
         (tokens + _B12X_PAGED_INDEX_TILE_BLOCK_K - 1)
@@ -216,6 +213,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     #   - native MTP path: 2D (B, next_n) where [b,j] = L_b - next_n + j + 1
     # Both fp8_fp4_paged_mqa_logits and the topk kernels accept both shapes.
     seq_lens: torch.Tensor
+    max_seq_len: int
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor | None
@@ -244,6 +242,9 @@ class DeepseekV32IndexerMetadata:
 
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
+    dcp_world_size: int = 1
+    dcp_rank: int = 0
+    cp_interleave_size: int = 1
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
@@ -638,6 +639,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         seq_lens = common_attn_metadata.seq_lens
         slot_mapping = common_attn_metadata.slot_mapping
         block_table = common_attn_metadata.block_table_tensor
+        use_dcp_local_kv = (
+            self.dcp_world_size > 1
+            and common_attn_metadata.dcp_local_seq_lens is not None
+        )
+        effective_dcp_world_size = self.dcp_world_size if use_dcp_local_kv else 1
+        effective_dcp_rank = self.dcp_rank if use_dcp_local_kv else 0
 
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             common_attn_metadata.split_decodes_and_prefills(
@@ -652,7 +659,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         compressed_slot_mapping = slot_mapping
         logical_compressed_seq_lens = seq_lens
         compressed_seq_lens = seq_lens
-        if self.compress_ratio > 1 or self.dcp_world_size > 1:
+        if self.compress_ratio > 1 or use_dcp_local_kv:
             compressed_slot_mapping = get_compressed_slot_mapping(
                 num_tokens,
                 query_start_loc,
@@ -661,13 +668,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.storage_block_size,
                 self.compress_ratio,
                 out=self.compressed_slot_mapping_buffer,
-                dcp_world_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
+                dcp_world_size=effective_dcp_world_size,
+                dcp_rank=effective_dcp_rank,
                 cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             )
             logical_compressed_seq_lens = seq_lens // self.compress_ratio
             compressed_seq_lens = logical_compressed_seq_lens
-        if self.dcp_world_size > 1:
+        if use_dcp_local_kv:
             compressed_seq_lens = get_dcp_local_seq_lens(
                 logical_compressed_seq_lens,
                 self.dcp_world_size,
@@ -688,7 +695,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 else seq_lens_cpu
             )
             compressed_seq_lens_cpu = logical_compressed_seq_lens_cpu
-            if self.dcp_world_size > 1:
+            if use_dcp_local_kv:
                 compressed_seq_lens_cpu = get_dcp_local_seq_lens(
                     logical_compressed_seq_lens_cpu,
                     self.dcp_world_size,
@@ -744,8 +751,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     query_start_loc_np=query_start_loc_np,
                     compressed_seq_lens_np=compressed_seq_lens_cpu_np,
                     skip_kv_gather=query_slice.start > 0,
-                    dcp_world_size=self.dcp_world_size,
-                    dcp_rank=self.dcp_rank,
+                    dcp_world_size=effective_dcp_world_size,
+                    dcp_rank=effective_dcp_rank,
                     cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
                 )
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
@@ -766,7 +773,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dcp_local_seq_lens = (
                 common_attn_metadata.dcp_local_seq_lens[:num_decodes]
                 if self.compress_ratio == 1
-                and self.dcp_world_size > 1
+                and use_dcp_local_kv
                 and common_attn_metadata.dcp_local_seq_lens is not None
                 else None
             )
@@ -809,7 +816,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 )
                 if seq_lens_is_local_view:
                     seq_lens //= self.compress_ratio
-                    if self.dcp_world_size > 1:
+                    if use_dcp_local_kv:
                         if seq_lens.dim() == 1:
                             dcp_seq_lens = get_dcp_local_seq_lens(
                                 seq_lens,
@@ -828,7 +835,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 else:
                     # Copy to avoid mutating shared state; keeps CG address stable.
                     compressed_decode_seq_lens = seq_lens // self.compress_ratio
-                    if self.dcp_world_size > 1:
+                    if use_dcp_local_kv:
                         compressed_decode_seq_lens = get_dcp_local_seq_lens(
                             compressed_decode_seq_lens,
                             self.dcp_world_size,
@@ -840,7 +847,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     )
                     self.expanded_seq_lens_buffer[num_decodes:num_decode_tokens] = 0
                     seq_lens = self.expanded_seq_lens_buffer[:num_decode_tokens]
-            elif self.dcp_world_size > 1 and dcp_local_seq_lens is None:
+            elif use_dcp_local_kv and dcp_local_seq_lens is None:
                 if seq_lens.dim() == 1:
                     seq_lens = get_dcp_local_seq_lens(
                         seq_lens,
@@ -862,6 +869,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # kernels see the same (B, next_n) layout as the MTP path.
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
+            decode_topk_max_seq_len = int(seq_lens.max().item())
 
             if envs.VLLM_USE_B12X_SPARSE_INDEXER:
                 schedule_metadata = self._maybe_build_b12x_schedule_metadata(
@@ -893,6 +901,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             decode_metadata = DeepSeekV32IndexerDecodeMetadata(
                 block_table=block_table,
                 seq_lens=seq_lens,
+                max_seq_len=decode_topk_max_seq_len,
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=schedule_metadata,
@@ -910,6 +919,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             num_prefill_tokens=num_prefill_tokens,
             prefill=prefill_metadata,
             decode=decode_metadata,
+            dcp_world_size=effective_dcp_world_size,
+            dcp_rank=effective_dcp_rank,
+            cp_interleave_size=self.cp_kv_cache_interleave_size,
         )
 
         return attn_metadata

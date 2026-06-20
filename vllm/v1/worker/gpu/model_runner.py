@@ -726,6 +726,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             if self.speculator is not None:
                 self.speculator.capture(attn_states)
+            self._zero_cudagraph_capture_kv_blocks()
 
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
@@ -739,6 +740,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    def _zero_cudagraph_capture_kv_blocks(self) -> None:
+        if self.kv_block_zeroer is None:
+            self._init_kv_zero_meta()
+        assert self.kv_block_zeroer is not None
+        self.kv_block_zeroer.zero_block_ids([0])
+        torch.cuda.synchronize()
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request

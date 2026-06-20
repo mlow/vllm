@@ -85,6 +85,7 @@ class DraftModelSpeculator(BaseSpeculator):
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = vllm_config.model_config.max_model_len
         self.draft_max_seq_len = self.max_model_len
+        self.rebuild_prefill_attn_metadata = False
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
@@ -175,6 +176,14 @@ class DraftModelSpeculator(BaseSpeculator):
             active_layer_names=self.draft_attn_layer_names,
         )
         self.block_tables = block_tables
+        self.rebuild_prefill_attn_metadata = block_tables.cp_size > 1 and any(
+            getattr(group.kv_cache_spec, "dcp_replicated", False)
+            and any(
+                layer_name in self.draft_attn_layer_names
+                for layer_name in group.layer_names
+            )
+            for group in kv_cache_config.kv_cache_groups
+        )
 
     def _build_draft_attn_metadata(
         self,
@@ -183,14 +192,47 @@ class DraftModelSpeculator(BaseSpeculator):
         num_tokens_padded: int,
         num_query_per_req: int = 1,
         causal: bool = True,
+        seq_lens_cpu_upper_bound: torch.Tensor | None = None,
+        max_seq_len_upper_bound: int | None = None,
+        query_start_loc_cpu: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
-        # Uniform query: query_start_loc[i] = min(i, num_reqs) * num_query_per_req.
-        # Clamp keeps the series non-decreasing past num_reqs, which some
-        # attention backends require.
-        query_start_loc_cpu = (
-            torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs)
-            * num_query_per_req
-        )
+        if query_start_loc_cpu is None:
+            # Uniform query: query_start_loc[i] =
+            # min(i, num_reqs) * num_query_per_req. Clamp keeps the series
+            # non-decreasing past num_reqs, which some attention backends require.
+            query_start_loc_cpu = (
+                torch.clamp(self.arange[: num_reqs_padded + 1], max=num_reqs)
+                * num_query_per_req
+            )
+            max_query_len = num_query_per_req
+        else:
+            if query_start_loc_cpu.device.type != "cpu":
+                query_start_loc_cpu = query_start_loc_cpu.cpu()
+            required_len = num_reqs_padded + 1
+            if query_start_loc_cpu.numel() < required_len:
+                padded_query_start_loc_cpu = query_start_loc_cpu.new_empty(
+                    required_len
+                )
+                padded_query_start_loc_cpu[: query_start_loc_cpu.numel()] = (
+                    query_start_loc_cpu
+                )
+                padded_query_start_loc_cpu[query_start_loc_cpu.numel() :] = (
+                    query_start_loc_cpu[-1]
+                )
+                query_start_loc_cpu = padded_query_start_loc_cpu
+            else:
+                query_start_loc_cpu = query_start_loc_cpu[:required_len]
+            if num_reqs > 0:
+                max_query_len = int(
+                    (
+                        query_start_loc_cpu[1 : num_reqs + 1]
+                        - query_start_loc_cpu[:num_reqs]
+                    )
+                    .max()
+                    .item()
+                )
+            else:
+                max_query_len = num_query_per_req
         block_tables = [
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
@@ -220,7 +262,7 @@ class DraftModelSpeculator(BaseSpeculator):
                     : num_reqs_padded + 1
                 ],
                 query_start_loc_cpu=query_start_loc_cpu,
-                max_query_len=num_query_per_req,
+                max_query_len=max_query_len,
                 seq_lens=seq_lens,
                 max_seq_len=self.draft_max_seq_len,
                 block_tables=block_tables,
@@ -228,6 +270,8 @@ class DraftModelSpeculator(BaseSpeculator):
                 kv_cache_config=self.kv_cache_config,
                 causal=causal,
                 dcp_local_seq_lens=dcp_local_seq_lens,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                max_seq_len_upper_bound=max_seq_len_upper_bound,
             )
         return attn_metadata
 

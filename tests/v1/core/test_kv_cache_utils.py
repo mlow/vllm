@@ -1627,6 +1627,49 @@ def test_dsv4_max_concurrency_uses_uniform_group_pool_math():
         ) == pytest.approx(3054 / expected_request_blocks)
 
 
+def test_resolve_kv_cache_block_sizes_mixed_dcp_replicated_groups():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.float32,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+
+    scheduler_block_size, hash_block_size = kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+
+    assert scheduler_block_size == 256
+    assert hash_block_size == 64
+
+
 def test_dsv4_engine_capacity_uses_worker_kv_cache_config():
     from vllm.v1.engine.core import EngineCore
 

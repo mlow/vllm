@@ -105,9 +105,12 @@ def _install_fake_b12x_indexer(
                 tuple(kwargs["index_k_cache"].stride()),
                 kwargs["page_size"],
                 kwargs["expected_num_q_heads"],
+                kwargs["out_scores"] is not None,
             )
         )
         kwargs["out_indices"].fill_(123)
+        if kwargs["out_scores"] is not None:
+            kwargs["out_scores"].fill_(456)
         return kwargs["out_indices"]
 
     def uses_paged_mqa_schedule(*, q_rows: int, max_pages: int) -> bool:
@@ -223,6 +226,7 @@ def test_b12x_decode_indexer_is_non_shared_for_fused_route(
             (page_stride0, 1),
             64,
             num_heads,
+            False,
         ),
     ]
 
@@ -292,6 +296,7 @@ def test_b12x_prefill_indexer_marks_shared_page_table(monkeypatch):
             (64 * 132, 1),
             64,
             num_heads,
+            False,
         ),
     ]
 
@@ -399,6 +404,7 @@ def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
         decode=DeepSeekV32IndexerDecodeMetadata(
             block_table=block_table,
             seq_lens=seq_lens,
+            max_seq_len=640,
             decode_lens=seq_lens,
             requires_padding=False,
             schedule_metadata=None,
@@ -472,8 +478,204 @@ def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
             (page_stride0, 1),
             64,
             num_heads,
+            False,
         ),
     ]
+
+
+def test_b12x_dcp_decode_requests_score_output(monkeypatch):
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepSeekV32IndexerDecodeMetadata,
+        DeepseekV32IndexerMetadata,
+    )
+
+    calls: list[tuple] = []
+    merge_calls: list[tuple] = []
+    _install_fake_b12x_indexer(monkeypatch, calls)
+    workspace_manager = _FakeWorkspaceManager()
+    monkeypatch.setattr(
+        indexer_mod, "current_workspace_manager", lambda: workspace_manager
+    )
+    monkeypatch.setattr(
+        indexer_mod,
+        "_ensure_b12x_sparse_indexer_supported",
+        lambda: None,
+    )
+    def fake_merge(**kwargs):
+        merge_calls.append(
+            (
+                kwargs["topk_indices"].data_ptr(),
+                kwargs["topk_scores"].data_ptr(),
+                kwargs["topk_tokens"],
+                kwargs["dcp_world_size"],
+                kwargs["dcp_rank"],
+                kwargs["cp_kv_cache_interleave_size"],
+            )
+        )
+
+    monkeypatch.setattr(indexer_mod, "_merge_b12x_dcp_topk", fake_merge)
+    monkeypatch.setattr(
+        indexer_mod.current_platform,
+        "fp8_dtype",
+        lambda: torch.uint8,
+        raising=False,
+    )
+
+    q_rows = 2
+    num_heads = 1
+    topk = 4
+    page_table_width = 10
+    seq_lens = torch.tensor([600, 640], dtype=torch.int32)
+    block_table = torch.arange(
+        q_rows * page_table_width, dtype=torch.int32
+    ).reshape(q_rows, page_table_width)
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=seq_lens,
+        max_seq_len=640,
+        slot_mapping=torch.arange(q_rows, dtype=torch.int32),
+        num_decodes=q_rows,
+        num_decode_tokens=q_rows,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=DeepSeekV32IndexerDecodeMetadata(
+            block_table=block_table,
+            seq_lens=seq_lens,
+            max_seq_len=640,
+            decode_lens=seq_lens,
+            requires_padding=False,
+            schedule_metadata=None,
+            active_width=None,
+        ),
+        dcp_world_size=2,
+        dcp_rank=1,
+        cp_interleave_size=16,
+    )
+    layer_name = "layers.0.attn"
+    metadata_key = indexer_mod._resolve_layer_name(layer_name)
+    monkeypatch.setattr(
+        indexer_mod,
+        "get_forward_context",
+        lambda: types.SimpleNamespace(attn_metadata={metadata_key: metadata}),
+    )
+
+    hidden_states = torch.empty((q_rows, 128), dtype=torch.bfloat16)
+    kv_cache = torch.empty((page_table_width, 64, 132), dtype=torch.uint8)
+    q_quant = torch.empty((q_rows, num_heads, 128), dtype=torch.uint8)
+    k = torch.empty((q_rows, 128), dtype=torch.uint8)
+    weights = torch.empty((q_rows, num_heads), dtype=torch.float32)
+    topk_indices_buffer = torch.empty((q_rows, topk), dtype=torch.int32)
+    topk_scores_buffer = torch.empty((q_rows, topk), dtype=torch.float32)
+
+    result = indexer_mod.sparse_attn_indexer(
+        hidden_states,
+        layer_name,
+        kv_cache,
+        q_quant,
+        None,
+        k,
+        weights,
+        128,
+        None,
+        topk_tokens=topk,
+        head_dim=128,
+        max_model_len=4096,
+        total_seq_lens=1024,
+        topk_indices_buffer=topk_indices_buffer,
+        skip_k_cache_insert=True,
+        use_fp4_cache=False,
+        use_b12x_sparse_indexer=True,
+        topk_scores_buffer=topk_scores_buffer,
+    )
+
+    assert result is topk_indices_buffer
+    assert topk_scores_buffer.tolist() == [[456] * topk, [456] * topk]
+    assert calls[-1] == (
+        "paged_index_topk",
+        tuple(q_quant.shape),
+        (page_table_width, 64 * 132),
+        (64 * 132, 1),
+        64,
+        num_heads,
+        True,
+    )
+    assert merge_calls == [
+        (
+            topk_indices_buffer.data_ptr(),
+            topk_scores_buffer.data_ptr(),
+            topk,
+            2,
+            1,
+            16,
+        )
+    ]
+
+
+def test_b12x_dcp_merge_passes_contiguous_scores_to_topk(monkeypatch):
+    tiled_topk_mod = types.ModuleType("b12x.attention.indexer.tiled_topk")
+    run_row_topk_calls: list[tuple[bool, tuple[int, ...]]] = []
+
+    def run_row_topk(*, row_logits, lengths, topk, output_values, output_indices):
+        run_row_topk_calls.append((row_logits.is_contiguous(), tuple(row_logits.shape)))
+        assert row_logits.is_contiguous()
+        assert lengths.tolist() == [row_logits.shape[1]] * row_logits.shape[0]
+        positions = torch.arange(topk, dtype=output_indices.dtype).expand_as(
+            output_indices
+        )
+        output_indices.copy_(positions)
+        output_values.copy_(row_logits[:, :topk])
+
+    tiled_topk_mod.run_row_topk = run_row_topk
+    monkeypatch.setitem(
+        sys.modules,
+        "b12x.attention.indexer.tiled_topk",
+        tiled_topk_mod,
+    )
+
+    class FakeDCPGroup:
+        def all_gather(self, tensor, dim):
+            assert dim == 2
+            return torch.cat([tensor, tensor.clone()], dim=dim)
+
+    import vllm.distributed.parallel_state as parallel_state
+    import vllm.v1.attention.backends.mla.sparse_utils as sparse_utils
+
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: FakeDCPGroup())
+    monkeypatch.setattr(
+        sparse_utils,
+        "triton_convert_dcp_local_topk_to_global",
+        lambda *args, **kwargs: None,
+    )
+
+    def gather_topk_ids_by_position(candidate_ids, positions, out):
+        gathered = torch.gather(candidate_ids, 1, positions.to(torch.int64))
+        out.copy_(gathered.to(out.dtype))
+
+    monkeypatch.setattr(
+        sparse_utils,
+        "triton_gather_topk_ids_by_position",
+        gather_topk_ids_by_position,
+    )
+    workspace_manager = _FakeWorkspaceManager()
+    monkeypatch.setattr(
+        indexer_mod, "current_workspace_manager", lambda: workspace_manager
+    )
+
+    topk_indices = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=torch.int32)
+    topk_scores = torch.tensor(
+        [[0.1, 0.4, 0.3, 0.2], [0.8, 0.5, 0.7, 0.6]],
+        dtype=torch.float32,
+    )
+
+    indexer_mod._merge_b12x_dcp_topk(
+        topk_indices=topk_indices,
+        topk_scores=topk_scores,
+        topk_tokens=4,
+        dcp_world_size=2,
+        dcp_rank=0,
+        cp_kv_cache_interleave_size=16,
+    )
+
+    assert run_row_topk_calls == [(True, (2, 8))]
 
 
 def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
@@ -595,6 +797,7 @@ def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
             (64 * 132, 1),
             64,
             1,
+            False,
         ),
     ]
 
@@ -708,6 +911,7 @@ def test_b12x_profile_uses_max_model_len_for_paged_prefill_warm(monkeypatch):
             (64 * 132, 1),
             64,
             1,
+            False,
         ),
     ]
 

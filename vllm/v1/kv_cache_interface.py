@@ -421,6 +421,7 @@ class MLAAttentionSpec(FullAttentionSpec):
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
+        dcp_replicated_set = set(spec.dcp_replicated for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(dtype_set) == 1
@@ -428,10 +429,11 @@ class MLAAttentionSpec(FullAttentionSpec):
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(block_stride_set) == 1
+            and len(dcp_replicated_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "dtype, quantization method, compress ratio, model version, and "
-            "KV block stride indexing."
+            "KV block stride indexing, and DCP replication mode."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -444,6 +446,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            dcp_replicated=dcp_replicated_set.pop(),
         )
 
 
