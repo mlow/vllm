@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import sys
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -50,6 +51,7 @@ from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
@@ -115,6 +117,32 @@ from vllm.v1.worker.utils import KVBlockZeroer
 from vllm.v1.worker.workspace import lock_workspace
 
 logger = init_logger(__name__)
+
+
+def _maybe_save_b12x_moe_activation_amax() -> None:
+    b12x_moe = sys.modules.get("vllm.model_executor.layers.fused_moe.b12x_moe")
+    if b12x_moe is None:
+        return
+    maybe_save = getattr(b12x_moe, "maybe_save_b12x_moe_activation_amax", None)
+    if maybe_save is not None:
+        maybe_save()
+
+
+def _profile_cg_mode(cg_mode: CUDAGraphMode) -> str:
+    return cg_mode.name.lower()
+
+
+def _profile_batch_phase(input_batch: InputBatch, dummy_run: bool = False) -> str:
+    if dummy_run:
+        return "dummy"
+    if input_batch.num_draft_tokens > 0:
+        return "verify"
+    if (
+        input_batch.max_query_len <= 1
+        and input_batch.num_tokens == input_batch.num_reqs
+    ):
+        return "decode"
+    return "prefill"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1064,31 +1092,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
-        sample_hidden_states = hidden_states[input_batch.logits_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
+        phase = _profile_batch_phase(input_batch)
+        with record_function_or_nullcontext(f"vllm:v2/target/{phase}/logits"):
+            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
-            self.structured_outputs_worker.apply_grammar_bitmask(
-                logits,
-                input_batch,
-                grammar_output.structured_output_request_ids,
-                grammar_output.grammar_bitmask,
-            )
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/grammar"
+            ):
+                self.structured_outputs_worker.apply_grammar_bitmask(
+                    logits,
+                    input_batch,
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
+                )
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/sample"
+            ):
+                sampler_output = self.sampler(logits, input_batch)
         else:
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
             assert self.speculator is not None
-            sampler_output = self.rejection_sampler(
-                logits,
-                input_batch,
-                # Draft logits are needed for probabilistic rejection sampling.
-                self.speculator.draft_logits,
-            )
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/rejection_sample"
+            ):
+                sampler_output = self.rejection_sampler(
+                    logits,
+                    input_batch,
+                    # Draft logits are needed for probabilistic rejection sampling.
+                    self.speculator.draft_logits,
+                )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
@@ -1131,13 +1170,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
-            # Update the request states.
-            self.update_pp_decode_requests()
-            self.finish_requests(scheduler_output)
-            self.free_states(scheduler_output)
-            self.add_requests(scheduler_output)
-            self.update_requests(scheduler_output)
-            self.block_tables.apply_staged_writes()
+            with record_function_or_nullcontext("vllm:v2/target/update_batch"):
+                # Update the request states.
+                self.update_pp_decode_requests()
+                self.finish_requests(scheduler_output)
+                self.free_states(scheduler_output)
+                self.add_requests(scheduler_output)
+                self.update_requests(scheduler_output)
+                self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
@@ -1163,16 +1203,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
-            self.cudagraph_manager,
-            num_reqs,
-            num_toks,
-            uniform_tok_count,
-            self.dp_size,
-            self.dp_rank,
-            need_eager=is_profile or skip_compiled,
-            num_active_loras=num_active_loras,
-        )
+        with record_function_or_nullcontext("vllm:v2/target/dispatch"):
+            batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+                self.cudagraph_manager,
+                num_reqs,
+                num_toks,
+                uniform_tok_count,
+                self.dp_size,
+                self.dp_rank,
+                need_eager=is_profile or skip_compiled,
+                num_active_loras=num_active_loras,
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1182,19 +1223,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
-            input_batch = self.prepare_inputs(
-                scheduler_output, batch_desc, max_query_len
-            )
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            with record_function_or_nullcontext("vllm:v2/target/prepare_inputs"):
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_desc, max_query_len
+                )
+            phase = _profile_batch_phase(input_batch)
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/prepare_attn_tables"
+            ):
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
 
             if self.lora_config:
                 # Activate LoRA adapters.
-                lora_inputs = self.lora_state.make_lora_inputs(
-                    input_batch.req_ids,
-                    input_batch.idx_mapping_np,
-                    input_batch.num_scheduled_tokens,
-                )
-                self._set_active_loras(*lora_inputs)
+                with record_function_or_nullcontext(
+                    f"vllm:v2/target/{phase}/lora"
+                ):
+                    lora_inputs = self.lora_state.make_lora_inputs(
+                        input_batch.req_ids,
+                        input_batch.idx_mapping_np,
+                        input_batch.num_scheduled_tokens,
+                    )
+                    self._set_active_loras(*lora_inputs)
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             input_batch = InputBatch.make_dummy(
@@ -1202,8 +1251,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 batch_desc.num_tokens,
                 self.input_buffers,
             )
+            phase = _profile_batch_phase(input_batch, dummy_run=True)
             if not skip_attn_for_dummy_run:
-                block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
+                with record_function_or_nullcontext(
+                    f"vllm:v2/target/{phase}/prepare_attn_tables"
+                ):
+                    block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
             else:
                 assert batch_desc.cg_mode != CUDAGraphMode.FULL, (
                     "Attention metadata must be prepared for dummy runs when using "
@@ -1216,18 +1269,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         slot_mappings_by_layer = None
         if not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
-            slot_mappings_by_layer = build_slot_mappings_by_layer(
-                slot_mappings, self.kv_cache_config
-            )
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/slot_mappings_by_layer"
+            ):
+                slot_mappings_by_layer = build_slot_mappings_by_layer(
+                    slot_mappings, self.kv_cache_config
+                )
             assert block_tables is not None
-            attn_metadata = self.model_state.prepare_attn(
-                input_batch,
-                batch_desc.cg_mode,
-                block_tables,
-                slot_mappings,
-                self.attn_groups,
-                self.kv_cache_config,
-            )
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/build_attn_metadata"
+            ):
+                attn_metadata = self.model_state.prepare_attn(
+                    input_batch,
+                    batch_desc.cg_mode,
+                    block_tables,
+                    slot_mappings,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -1245,21 +1304,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     lora_state=self.lora_state,
                     scheduled_encoder_inputs=scheduler_output.scheduled_encoder_inputs,
                 )
-            inputs_embeds = self.model_state.get_mm_embeddings(
-                scheduler_output.scheduled_encoder_inputs, input_batch
-            )
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/mm_embeddings"
+            ):
+                inputs_embeds = self.model_state.get_mm_embeddings(
+                    scheduler_output.scheduled_encoder_inputs, input_batch
+                )
             if inputs_embeds is not None and not self.model.requires_raw_input_tokens:
                 input_ids = None
 
-        model_inputs = {
-            "input_ids": input_ids,
-            "positions": input_batch.positions,
-            "inputs_embeds": inputs_embeds,
-            "intermediate_tensors": None,
-            # NOTE: Values returned by `prepare_inputs` will override the default
-            # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
-        }
+        with record_function_or_nullcontext(
+            f"vllm:v2/target/{phase}/prepare_model_inputs"
+        ):
+            model_inputs = {
+                "input_ids": input_ids,
+                "positions": input_batch.positions,
+                "inputs_embeds": inputs_embeds,
+                "intermediate_tensors": None,
+                # NOTE: Values returned by `prepare_inputs` will override the default
+                # values above.
+                **self.model_state.prepare_inputs(input_batch, self.req_states),
+            }
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None
@@ -1279,13 +1344,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             del intermediate_tensors
 
         # Run model.
+        forward_scope = (
+            f"vllm:v2/target/{phase}/forward/{_profile_cg_mode(batch_desc.cg_mode)}"
+        )
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/full_graph_replay"
+            ):
+                self.kv_connector.pre_forward(scheduler_output)
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1294,15 +1365,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_active_loras=batch_desc.num_active_loras,
             )
 
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
-                batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    batch_descriptor=batch_descriptor,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                ),
+                record_function_or_nullcontext(forward_scope),
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
@@ -1380,31 +1454,40 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Post-step KV connector related operations.
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            _maybe_save_b12x_moe_activation_amax()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        phase = _profile_batch_phase(input_batch)
+        with record_function_or_nullcontext(f"vllm:v2/target/{phase}/sample_tokens"):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
-            self.pp_handler.broadcast(
-                sampler_output.sampled_token_ids,
-                num_sampled,
-                num_rejected,
-                input_batch,
-            )
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/pp_broadcast"
+            ):
+                self.pp_handler.broadcast(
+                    sampler_output.sampled_token_ids,
+                    num_sampled,
+                    num_rejected,
+                    input_batch,
+                )
 
         assert self.prompt_logprobs_worker is not None
-        prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
-            self.model.compute_logits,
-            hidden_states,
-            input_batch,
-            self.req_states.all_token_ids.gpu,
-            self.req_states.num_computed_tokens.gpu,
-            self.req_states.prompt_len.np,
-        )
+        with record_function_or_nullcontext(
+            f"vllm:v2/target/{phase}/prompt_logprobs"
+        ):
+            prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
+                self.model.compute_logits,
+                hidden_states,
+                input_batch,
+                self.req_states.all_token_ids.gpu,
+                self.req_states.num_computed_tokens.gpu,
+                self.req_states.prompt_len.np,
+            )
 
         # Prepare the model runner output.
         model_runner_output = ModelRunnerOutput(
@@ -1416,42 +1499,51 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
         # Start async output copy here so that it can overlap with speculator proposal.
-        async_output = AsyncOutput(
-            model_runner_output=model_runner_output,
-            sampler_output=sampler_output,
-            num_sampled_tokens=num_sampled,
-            main_stream=self.main_stream,
-            copy_stream=self.output_copy_stream,
-        )
+        with record_function_or_nullcontext(
+            f"vllm:v2/target/{phase}/async_output"
+        ):
+            async_output = AsyncOutput(
+                model_runner_output=model_runner_output,
+                sampler_output=sampler_output,
+                num_sampled_tokens=num_sampled,
+                main_stream=self.main_stream,
+                copy_stream=self.output_copy_stream,
+            )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if self.speculator is not None and self.speculator.supports_mm_inputs:
             # Get cached multimodal embeddings for draft forward.
             # NOTE: This is done here because postprocess updates
             # num_computed_prefill_tokens.
-            mm_inputs = self.model_state.encoder_runner.gather_mm_embeddings(
-                input_batch.req_ids,
-                input_batch.num_tokens,
-                input_batch.num_scheduled_tokens,
-                input_batch.query_start_loc_np,
-                input_batch.prefill_len_np,
-                input_batch.num_computed_prefill_tokens_np,
-                # The EAGLE/MTP drafter reads one position ahead of the target.
-                draft_lookahead=1,
-            )
+            with record_function_or_nullcontext(
+                f"vllm:v2/speculator/{phase}/mm_inputs"
+            ):
+                mm_inputs = self.model_state.encoder_runner.gather_mm_embeddings(
+                    input_batch.req_ids,
+                    input_batch.num_tokens,
+                    input_batch.num_scheduled_tokens,
+                    input_batch.query_start_loc_np,
+                    input_batch.prefill_len_np,
+                    input_batch.num_computed_prefill_tokens_np,
+                    # The EAGLE/MTP drafter reads one position ahead of the target.
+                    draft_lookahead=1,
+                )
 
         # Postprocess results and update request states.
         # NOTE: This is intentionally done after creating the AsyncOutput,
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        self.postprocess_sampled(
-            input_batch.idx_mapping,
-            sampler_output.sampled_token_ids,
-            num_sampled,
-            num_rejected,
-            input_batch.query_start_loc,
-        )
+        with record_function_or_nullcontext(
+            f"vllm:v2/target/{phase}/postprocess_sampled"
+        ):
+            self.postprocess_sampled(
+                input_batch.idx_mapping,
+                sampler_output.sampled_token_ids,
+                num_sampled,
+                num_rejected,
+                input_batch.query_start_loc,
+            )
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -1463,33 +1555,47 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            draft_tokens = self.speculator.propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings_by_layer,
-                spec_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                self.req_states.last_sampled_tokens,
-                self.req_states.next_prefill_tokens,
-                self.sampler.sampling_states.temperature.gpu,
-                self.sampler.sampling_states.seeds.gpu,
-                mm_inputs=mm_inputs,
-            )
-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            with record_function_or_nullcontext(
+                f"vllm:v2/speculator/{phase}/propose"
+            ):
+                draft_tokens = self.speculator.propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings_by_layer,
+                    spec_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    self.req_states.last_sampled_tokens,
+                    self.req_states.next_prefill_tokens,
+                    self.sampler.sampling_states.temperature.gpu,
+                    self.sampler.sampling_states.seeds.gpu,
+                    mm_inputs=mm_inputs,
+                )
+            with record_function_or_nullcontext(
+                f"vllm:v2/speculator/{phase}/store_draft_tokens"
+            ):
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
-            )
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/set_draft_tokens"
+            ):
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    self.req_states.draft_tokens[input_batch.idx_mapping],
+                )
 
         # Post-step KV connector related operations.
-        kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        with record_function_or_nullcontext(
+            f"vllm:v2/target/{phase}/kv_post_forward"
+        ):
+            kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+
+        _maybe_save_b12x_moe_activation_amax()
 
         return async_output
 
