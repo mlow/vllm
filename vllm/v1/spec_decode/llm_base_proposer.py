@@ -1264,14 +1264,28 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
+        if spec_cfg.draft_kv_cache_dtype is not None:
+            config = replace(
+                config,
+                cache_config=replace(
+                    config.cache_config,
+                    cache_dtype=spec_cfg.draft_kv_cache_dtype,
+                ),
+            )
+
         # Note (matt): Never inherit the attention backend from base, because there are
         # many opportunities for incompatibility, so we always independently autoselect
         # unless explicitly specified in the speculative config.
+        draft_backend = (
+            None
+            if spec_cfg.draft_attention_backend == "auto"
+            else spec_cfg.draft_attention_backend
+        )
         config = replace(
             config,
             attention_config=replace(
                 config.attention_config,
-                backend=spec_cfg.attention_backend,
+                backend=draft_backend,
             ),
         )
 
