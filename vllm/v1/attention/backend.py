@@ -690,6 +690,100 @@ class CommonAttentionMetadata:
         )
 
 
+def _tensor_view_cache_key(tensor: torch.Tensor | None) -> tuple[Any, ...] | None:
+    if tensor is None:
+        return None
+    return (
+        "tensor",
+        tensor.data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype),
+        str(tensor.device),
+    )
+
+
+def _array_view_cache_key(array: np.ndarray | None) -> tuple[Any, ...] | None:
+    if array is None:
+        return None
+    return (
+        "array",
+        array.__array_interface__["data"][0],
+        tuple(array.shape),
+        tuple(array.strides or ()),
+        str(array.dtype),
+    )
+
+
+def _static_range_cache_key(
+    ranges: dict[int, list[tuple[int, int]]] | None,
+) -> tuple[Any, ...] | None:
+    if ranges is None:
+        return None
+    return tuple(
+        (req_idx, tuple(tuple(range_) for range_ in req_ranges))
+        for req_idx, req_ranges in sorted(ranges.items())
+    )
+
+
+def _batch_topology_cache_key(
+    batch_topology: CommonAttentionBatchTopology | None,
+) -> tuple[Any, ...] | None:
+    if batch_topology is None:
+        return None
+    return (
+        _array_view_cache_key(batch_topology.query_start_loc_np),
+        batch_topology.num_reqs,
+        batch_topology.max_query_len,
+        batch_topology.max_seq_len_upper_bound,
+    )
+
+
+def exact_attention_metadata_cache_key(
+    kv_cache_spec: Any,
+    builder_type: type[Any],
+    common_prefix_len: int,
+    common_attn_metadata: CommonAttentionMetadata,
+) -> tuple[Any, ...]:
+    """Key facts that make a metadata object exactly reusable.
+
+    This is intentionally stricter than the block-table update cache. Builders
+    that opt into exact reuse may keep internal scratch buffers in their
+    metadata, so reuse is allowed only when the common metadata points at the
+    same tensor views and has the same scalar control facts.
+    """
+    cm = common_attn_metadata
+    return (
+        kv_cache_spec,
+        builder_type,
+        common_prefix_len,
+        cm.num_reqs,
+        cm.num_actual_tokens,
+        cm.max_query_len,
+        cm.max_seq_len,
+        _tensor_view_cache_key(cm.query_start_loc),
+        _tensor_view_cache_key(cm.query_start_loc_cpu),
+        _tensor_view_cache_key(cm.seq_lens),
+        _tensor_view_cache_key(cm.block_table_tensor),
+        _tensor_view_cache_key(cm.slot_mapping),
+        _tensor_view_cache_key(cm.seq_lens_cpu_upper_bound),
+        _tensor_view_cache_key(cm.dcp_local_seq_lens),
+        _tensor_view_cache_key(cm.positions),
+        _tensor_view_cache_key(cm.is_prefilling),
+        _tensor_view_cache_key(cm.logits_indices_padded),
+        cm.num_logits_indices,
+        _tensor_view_cache_key(cm.encoder_seq_lens),
+        _array_view_cache_key(cm.encoder_seq_lens_cpu),
+        _tensor_view_cache_key(cm.dcp_local_seq_lens_cpu),
+        _tensor_view_cache_key(cm.causal)
+        if isinstance(cm.causal, torch.Tensor)
+        else cm.causal,
+        _static_range_cache_key(cm.mm_req_doc_ranges),
+        _batch_topology_cache_key(cm.batch_topology),
+    )
+
+
 M = TypeVar("M")
 
 
@@ -721,6 +815,9 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
     # Does this backend/builder support updating the block table in existing
     # metadata
     supports_update_block_table: bool = False
+    # Can metadata built by one builder instance be reused directly for another
+    # same-type builder when all common metadata tensors are identical?
+    supports_exact_metadata_reuse: bool = False
 
     @abstractmethod
     def __init__(

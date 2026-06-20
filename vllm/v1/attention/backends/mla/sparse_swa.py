@@ -289,6 +289,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
     # Base threshold: query_len <= 1 is decode
     reorder_batch_threshold: int = 1
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_exact_metadata_reuse: bool = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -348,6 +349,11 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.token_to_req_indices = torch.zeros(
+            max_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.req_ids_arange = torch.arange(
             max_tokens,
             dtype=torch.int32,
             device=self.device,
@@ -415,15 +421,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
 
         # NOTE: Ensure all metadata tensors maintain fixed memory addresses
         # for CUDA graph compatibility.
-        if common_attn_metadata.batch_topology is not None:
+        if num_prefill_tokens == 0 and num_decode_tokens == num_reqs:
+            token_to_req_indices = self.req_ids_arange[:num_decode_tokens]
+        elif common_attn_metadata.batch_topology is not None:
             x = torch.from_numpy(
                 common_attn_metadata.batch_topology.req_id_per_token_np
             ).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
         else:
             query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
             x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
-        token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
-        token_to_req_indices.copy_(x, non_blocking=True)
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
 
         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
         if self.dcp_world_size > 1:

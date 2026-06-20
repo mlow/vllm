@@ -19,6 +19,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionBatchTopology,
     CommonAttentionMetadata,
+    exact_attention_metadata_cache_key,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -503,6 +504,7 @@ def build_attn_metadata(
             max_seq_len if max_seq_len_upper_bound is None else max_seq_len_upper_bound
         ),
     )
+    exact_cached_attn_metadata: dict[tuple[Any, ...], Any] = {}
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -538,10 +540,21 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(0)
+            exact_cache_key = exact_attention_metadata_cache_key(
+                attn_group.kv_cache_spec,
+                type(attn_metadata_builder),
+                0,
+                common_attn_metadata,
+            )
             if for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
+            elif (
+                attn_metadata_builder.supports_exact_metadata_reuse
+                and exact_cache_key in exact_cached_attn_metadata
+            ):
+                metadata = exact_cached_attn_metadata[exact_cache_key]
             else:
                 attn_metadata_extra_kwargs = (
                     model_specific_attn_metadata.get_extra_attn_kwargs(
@@ -556,6 +569,8 @@ def build_attn_metadata(
                     common_attn_metadata=common_attn_metadata,
                     **attn_metadata_extra_kwargs,
                 )
+                if attn_metadata_builder.supports_exact_metadata_reuse:
+                    exact_cached_attn_metadata[exact_cache_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
     return attn_metadata

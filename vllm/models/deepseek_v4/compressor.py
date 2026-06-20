@@ -85,6 +85,7 @@ class CompressorMetadata:
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    supports_exact_metadata_reuse: bool = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -97,6 +98,11 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self.req_ids_arange = torch.arange(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
 
     def build(
         self,
@@ -104,12 +110,22 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> CompressorMetadata:
-        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         num_reqs = common_attn_metadata.num_reqs
-        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
-        token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
-        token_to_req_indices.copy_(x, non_blocking=True)
+        num_tokens = common_attn_metadata.num_actual_tokens
+        if common_attn_metadata.max_query_len <= 1 and num_tokens == num_reqs:
+            token_to_req_indices = self.req_ids_arange[:num_tokens]
+        elif common_attn_metadata.batch_topology is not None:
+            x = torch.from_numpy(
+                common_attn_metadata.batch_topology.req_id_per_token_np
+            ).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
+        else:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
         return CompressorMetadata(
             block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
             slot_mapping=common_attn_metadata.slot_mapping,
