@@ -3,10 +3,58 @@
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.lora.layers.base import BaseLayerWithLoRA
 from vllm.model_executor.model_loader import get_model
+
+
+def _create_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+
+    draft_vllm_config = replace(
+        vllm_config,
+        parallel_config=replace(
+            speculative_config.draft_parallel_config,
+            rank=vllm_config.parallel_config.rank,
+        ),
+        model_config=speculative_config.draft_model_config,
+    )
+
+    if speculative_config.moe_backend is not None:
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            kernel_config=replace(
+                draft_vllm_config.kernel_config,
+                moe_backend=speculative_config.moe_backend,
+            ),
+        )
+
+    if speculative_config.draft_kv_cache_dtype is not None:
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            cache_config=replace(
+                draft_vllm_config.cache_config,
+                cache_dtype=speculative_config.draft_kv_cache_dtype,
+            ),
+        )
+
+    if speculative_config.draft_attention_backend is not None:
+        draft_backend = (
+            None
+            if speculative_config.draft_attention_backend == "auto"
+            else speculative_config.draft_attention_backend
+        )
+        draft_vllm_config = replace(
+            draft_vllm_config,
+            attention_config=replace(
+                draft_vllm_config.attention_config,
+                backend=draft_backend,
+            ),
+        )
+
+    return draft_vllm_config
 
 
 def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
@@ -31,9 +79,12 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
+    draft_vllm_config = _create_draft_vllm_config(vllm_config)
     with set_model_tag("eagle_head"):
         eagle_model = get_model(
-            vllm_config=vllm_config, model_config=draft_model_config
+            vllm_config=draft_vllm_config,
+            model_config=draft_model_config,
+            load_config=speculative_config.draft_load_config,
         )
 
     target_language_model = (

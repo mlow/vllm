@@ -498,7 +498,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         logits_soft_cap: float | None,
         attn_type: str,
         kv_sharing_target_layer_name: str | None,
-        topk_indice_buffer: torch.Tensor | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
         indexer: "Indexer | None" = None,
         **mla_args,
     ) -> None:
@@ -529,12 +529,16 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.force_contiguous_mla_bmm_weight = True
         self.force_contiguous_mla_bmm_output = True
 
-        assert indexer is not None, (
-            "B12X_MLA_SPARSE requires a sparse-MLA indexer (model with "
-            "index_topk in its config)."
+        # The indexer carries the shared buffer for normal layers and tests;
+        # the explicitly-passed buffer covers backbone skip layers, whose
+        # indexer is not constructed (see deepseek_v2.py).
+        self.topk_indices_buffer: torch.Tensor | None = (
+            indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
         )
-        self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
-        assert self.topk_indices_buffer is not None
+        assert self.topk_indices_buffer is not None, (
+            "B12X_MLA_SPARSE requires sparse-MLA top-k indices "
+            "(model with index_topk in its config)."
+        )
         self.topk_tokens = int(self.topk_indices_buffer.shape[-1])
 
         from vllm.config import get_current_vllm_config

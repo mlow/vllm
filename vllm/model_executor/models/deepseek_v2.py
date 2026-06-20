@@ -1052,22 +1052,23 @@ class DeepseekV2MLAAttention(nn.Module):
 
         # IndexCache config
         # Refer: https://arxiv.org/abs/2603.12201 for more details.
-        layer_id = layer_idx if layer_idx is not None else extract_layer_index(prefix)
         _skip_topk = False
+        layer_id = layer_idx if layer_idx is not None else extract_layer_index(prefix)
         # Honor an explicit index_topk_pattern whenever provided (GLM/Kimi
-        # set it via HF overrides); otherwise preserve main's
-        # use_index_cache opt-in for the frequency-based skip.
-        if (
+        # set it via HF overrides); otherwise preserve main's use_index_cache
+        # opt-in for the frequency-based skip. MTP/nextn layers are excluded
+        # by _should_skip_index_topk so they always build a full indexer.
+        if self.is_v32 and (
             getattr(config, "index_topk_pattern", None) is not None
             or getattr(config, "use_index_cache", False)
         ):
             _skip_topk = _should_skip_index_topk(config, layer_id)
-        if _skip_topk:
-            logger.info_once(
-                "Using index_topk_pattern/index_topk_freq to skip sparse MLA "
-                "indexer computation on layer %s.",
-                layer_id,
-            )
+            if _skip_topk:
+                logger.info_once(
+                    "Using index_topk_pattern/index_topk_freq to skip sparse MLA "
+                    "indexer computation on layer %s.",
+                    layer_id,
+                )
 
         if self.is_v32 and not _skip_topk:
             self.indexer_rope_emb = get_rope(
