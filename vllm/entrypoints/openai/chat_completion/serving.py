@@ -349,7 +349,11 @@ class OpenAIServingChat(OpenAIServing):
                     # non-reasoning outputs.
                     reasoning_ended = True
                 elif parser is not None and parser.reasoning_parser is not None:
-                    reasoning_ended = parser.is_reasoning_end(prompt_token_ids or [])
+                    reasoning_ended = (
+                        parser.reasoning_parser.is_reasoning_end_for_prompt(
+                            prompt_token_ids or []
+                        )
+                    )
                 else:
                     reasoning_ended = None
 
