@@ -43,6 +43,10 @@ install(FILES
 install(DIRECTORY "${FMHA_SM100_PY_ROOT}/cute/"
   DESTINATION vllm/third_party/fmha_sm100/cute
   COMPONENT fmha_sm100
-  PATTERN "__pycache__" EXCLUDE
-  PATTERN "*.pyc" EXCLUDE
-  PATTERN ".git*" EXCLUDE)
+  FILES_MATCHING
+    REGEX "/__pycache__(/.*)?$" EXCLUDE
+    REGEX ".*\\.pyc$" EXCLUDE
+    PATTERN "example.py" EXCLUDE
+    PATTERN "test_*.py" EXCLUDE
+    PATTERN "*.py"
+    PATTERN "build_k2q_csr.cu")
