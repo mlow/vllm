@@ -53,7 +53,7 @@ from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.utils.torch_utils import current_stream, direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
@@ -463,6 +463,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             heads_per_group=self.n_local_heads // self.n_local_groups,
             nope_dim=self.nope_head_dim,
             rope_dim=self.rope_head_dim,
+            stream=current_stream().cuda_stream,
         )
         if self.wo_b.reduce_results and self.wo_b.tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)

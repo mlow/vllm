@@ -610,7 +610,7 @@ def _mhc_post_tilelang_fake(
     return torch.empty_like(residual)
 
 
-def hc_head_fused_kernel_tilelang(
+def _hc_head_fused_kernel_tilelang(
     hs_flat: torch.Tensor,
     fn: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -639,6 +639,25 @@ def hc_head_fused_kernel_tilelang(
         hc_mult,
     )
     return out
+
+
+def hc_head_fused_kernel_tilelang(
+    hs_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    """Apply hc_head through the TileLang custom op."""
+    return torch.ops.vllm.hc_head_fused_kernel_tilelang(
+        hs_flat,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_eps,
+    )
 
 
 def _hc_head_fused_kernel_tilelang_fake(
@@ -677,7 +696,7 @@ direct_register_custom_op(
 
 direct_register_custom_op(
     op_name="hc_head_fused_kernel_tilelang",
-    op_func=hc_head_fused_kernel_tilelang,
+    op_func=_hc_head_fused_kernel_tilelang,
     mutates_args=[],
     fake_impl=_hc_head_fused_kernel_tilelang_fake,
 )
