@@ -134,6 +134,7 @@ def _reference_index_topk(
     topk: int,
     init_blocks: int,
     local_blocks: int,
+    sm_scale: float,
 ) -> torch.Tensor:
     total_q, num_idx_heads, _ = idx_q.shape
     out = torch.full(
@@ -149,7 +150,7 @@ def _reference_index_topk(
         num_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         pages = block_table[req_id, :num_blocks]
         k = index_kv_cache[pages].reshape(num_blocks * BLOCK_SIZE, -1)
-        score = torch.einsum("qhd,kd->hqk", q.float(), k.float())
+        score = torch.einsum("qhd,kd->hqk", q.float(), k.float()) * sm_scale
 
         q_pos = prefix_len + torch.arange(q_len, device=idx_q.device)
         k_pos = torch.arange(k.shape[0], device=idx_q.device)
@@ -220,6 +221,7 @@ def test_prefill_index_topk_correctness():
         max_query_len=q_lens.max().item(),
         max_seq_len=max_seq_len,
         num_kv_heads=num_idx_heads,
+        sm_scale=head_dim**-0.5,
     )
     actual = minimax_m3_index_topk(
         score,
@@ -240,6 +242,7 @@ def test_prefill_index_topk_correctness():
         topk,
         init_blocks,
         local_blocks,
+        head_dim**-0.5,
     )
     _assert_topk_indices_equal_unordered(actual, expected)
 
@@ -298,6 +301,7 @@ def test_decode_index_topk_correctness(
         init_blocks=init_blocks,
         local_blocks=local_blocks,
         num_kv_heads=num_idx_heads,
+        sm_scale=head_dim**-0.5,
         decode_query_len=decode_query_len,
         max_decode_query_len=max_decode_query_len,
     )
@@ -313,6 +317,7 @@ def test_decode_index_topk_correctness(
         topk,
         init_blocks,
         local_blocks,
+        head_dim**-0.5,
     )
     _assert_topk_indices_equal_unordered(actual, expected)
 

@@ -89,6 +89,7 @@ def _index_block_score_kernel(
     prefix_lens,  # [batch] context length before this chunk's queries
     num_idx_heads,
     head_dim: tl.constexpr,
+    sm_scale,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -102,6 +103,7 @@ def _index_block_score_kernel(
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
 ):
+    sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
     pid_bh = tl.program_id(1)
     pid_b = pid_bh // num_idx_heads
@@ -146,7 +148,7 @@ def _index_block_score_kernel(
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
         )
-        qk = tl.dot(q, k)
+        qk = tl.dot(q, k) * sm_scale_log2e
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
             qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
@@ -288,8 +290,8 @@ def _topk_index_kernel(
 # Decode index-score kernel (split-K over seq blocks). Decode batches are
 # flattened request-major, with a runtime query length used to map each query
 # token back to its request metadata. Chunk counts depend only on shape
-# constants so the grid is fixed within a cuda graph. The score scale is omitted
-# because decode only consumes block ordering.
+# constants so the grid is fixed within a cuda graph. Base-2 (exp2/log2)
+# softmax matches prefill.
 # ---------------------------------------------------------------------------
 @triton.jit(do_not_specialize=["num_kv_chunks", "decode_query_len"])
 def _decode_index_score_kernel(
@@ -302,6 +304,7 @@ def _decode_index_score_kernel(
     head_dim: tl.constexpr,
     init_blocks,
     local_blocks,
+    sm_scale,
     decode_query_len,
     stride_q_n,
     stride_q_h,
@@ -318,6 +321,7 @@ def _decode_index_score_kernel(
     num_kv_chunks,
     USE_PDL: tl.constexpr,
 ):
+    sm_scale_log2e = sm_scale * 1.4426950409
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
     pid_c = tl.program_id(1)
@@ -373,7 +377,7 @@ def _decode_index_score_kernel(
             + off_k[:, None] * stride_ik_pos
             + off_d * stride_ik_d,
         )  # [N,D]
-        kq = tl.dot(k, q)  # [N,HQ]
+        kq = tl.dot(k, q) * sm_scale_log2e  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
         is_visible_block = blk < num_blocks_q
@@ -652,6 +656,7 @@ def minimax_m3_index_score(
     max_query_len: int,
     max_seq_len: int,
     num_kv_heads: int,
+    sm_scale: float,
 ) -> torch.Tensor:
     """Compute per-token index scores for each visible sparse block.
 
@@ -684,6 +689,7 @@ def minimax_m3_index_score(
         prefix_lens,
         num_idx_heads,
         head_dim,
+        sm_scale,
         idx_q.stride(0),
         idx_q.stride(1),
         idx_q.stride(2),
@@ -755,6 +761,7 @@ def minimax_m3_index_decode(
     init_blocks: int,
     local_blocks: int,
     num_kv_heads: int,
+    sm_scale: float,
     decode_query_len: int,
     max_decode_query_len: int,
 ) -> torch.Tensor:
@@ -816,6 +823,7 @@ def minimax_m3_index_decode(
         head_dim,
         init_blocks,
         local_blocks,
+        sm_scale,
         decode_query_len,
         idx_q.stride(0),
         idx_q.stride(1),

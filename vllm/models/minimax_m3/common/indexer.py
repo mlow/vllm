@@ -407,6 +407,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 self.init_blocks,
                 self.local_blocks,
                 self.num_kv_heads,
+                self.scale,
                 d.decode_query_len,
                 d.max_decode_query_len,
             )
@@ -423,6 +424,7 @@ class MiniMaxM3IndexerTritonImpl(MiniMaxM3IndexerImpl):
                 p.max_query_len,
                 p.max_seq_len,
                 self.num_kv_heads,
+                self.scale,
             )
             prefill_topk = minimax_m3_index_topk(
                 score,
