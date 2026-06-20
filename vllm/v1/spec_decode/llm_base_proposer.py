@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from importlib.util import find_spec
 from inspect import signature
 from typing import Any, cast
@@ -33,7 +34,11 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
-from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    KVCacheSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import (
     empty_exponential_noise_like,
@@ -152,6 +157,8 @@ class SpecDecodeBaseProposer:
 
         self.draft_attn_groups: list[AttentionGroup] = []
         self.kv_cache_gid: int = -1
+        self._draft_layer_to_kv_cache_gid: dict[str, int] = {}
+        self._draft_kv_cache_group_ids: list[int] = []
         self.eagle3_use_aux_hidden_state: bool = (
             self._get_eagle3_use_aux_hidden_state_from_config()
         )
@@ -513,6 +520,7 @@ class SpecDecodeBaseProposer:
         self.num_speculative_tokens = num_speculative_tokens
         self._last_draft_probs = None
         batch_size = common_attn_metadata.batch_size()
+        raw_target_hidden_states_for_dump = target_hidden_states
 
         if self.method in ("eagle3", "dflash"):
             model = self.model
@@ -595,6 +603,68 @@ class SpecDecodeBaseProposer:
                 device=sample_hidden_states.device,
                 dtype=torch.int64,
             )
+
+        dump_path = os.environ.get("VLLM_DFLASH_DUMP_ONCE")
+        if not dump_path and os.path.exists("/cache/dump_dflash_once"):
+            dump_path = "/cache/dflash_diag_once.pt"
+        if self.method == "dflash" and dump_path and not os.path.exists(dump_path):
+            try:
+                dump_this_rank = (
+                    not torch.distributed.is_available()
+                    or not torch.distributed.is_initialized()
+                    or torch.distributed.get_rank() == 0
+                )
+                if dump_this_rank:
+                    os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+                    draft_logits = self._model_compute_logits(
+                        sample_hidden_states, spec_step_idx=0
+                    )
+                    topk = min(16, draft_logits.shape[-1])
+                    topk_values, topk_indices = torch.topk(draft_logits, k=topk, dim=-1)
+                    torch.save(
+                        {
+                            "method": self.method,
+                            "num_speculative_tokens": self.num_speculative_tokens,
+                            "batch_size": batch_size,
+                            "target_token_ids": target_token_ids.detach().cpu(),
+                            "target_positions": target_positions.detach().cpu(),
+                            "raw_target_hidden_states_shape": tuple(
+                                raw_target_hidden_states_for_dump.shape
+                            ),
+                            "raw_target_hidden_states": (
+                                raw_target_hidden_states_for_dump.detach()
+                                .to(torch.float32)
+                                .cpu()
+                            ),
+                            "combined_target_hidden_states_shape": tuple(
+                                target_hidden_states.shape
+                            ),
+                            "combined_target_hidden_states": (
+                                target_hidden_states.detach().to(torch.float32).cpu()
+                            ),
+                            "next_token_ids": next_token_ids.detach().cpu(),
+                            "input_ids": self.input_ids[:num_input_tokens]
+                            .detach()
+                            .cpu(),
+                            "positions": self._get_positions(num_input_tokens)
+                            .detach()
+                            .cpu(),
+                            "token_indices_to_sample": token_indices_to_sample.detach()
+                            .cpu(),
+                            "sample_hidden_states": (
+                                sample_hidden_states.detach().to(torch.float32).cpu()
+                            ),
+                            "draft_logits": draft_logits.detach().to(torch.float32).cpu(),
+                            "draft_topk_indices": topk_indices.detach().cpu(),
+                            "draft_topk_values": (
+                                topk_values.detach().to(torch.float32).cpu()
+                            ),
+                        },
+                        dump_path,
+                    )
+                    logger.warning("Saved DFlash diagnostic dump to %s", dump_path)
+            except Exception:
+                logger.exception("Failed to save DFlash diagnostic dump")
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
@@ -1392,6 +1462,7 @@ class SpecDecodeBaseProposer:
 
         self._maybe_share_embeddings(target_language_model)
         self._maybe_share_lm_head(target_language_model)
+        self._maybe_load_parallel_drafting_mask_embedding()
 
         if (
             self.parallel_drafting
@@ -1407,6 +1478,73 @@ class SpecDecodeBaseProposer:
                 )
             else:
                 self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
+
+    def _maybe_load_parallel_drafting_mask_embedding(self) -> None:
+        """Load a checkpoint-provided mask token embedding into the embed table.
+
+        DFlash FP4 exports ship the trained mask embedding as
+        ``mask_embedding.pt`` next to the draft weights because the target
+        checkpoint's embedding row for ``mask_token_id`` is zeroed/untrained.
+        Without it, every masked draft slot is embedded as ~zero and the
+        drafter's per-position acceptance collapses after the first position.
+        """
+        if not self.parallel_drafting:
+            return
+        mask_path = os.path.join(self.draft_model_config.model, "mask_embedding.pt")
+        if not os.path.exists(mask_path):
+            return
+        data = torch.load(mask_path, map_location="cpu", weights_only=True)
+        if isinstance(data, dict):
+            file_token_id = data.get("mask_token_id")
+            embedding = data.get("embedding")
+        else:
+            file_token_id = None
+            embedding = data
+        if embedding is None:
+            logger.warning(
+                "Ignoring %s: no 'embedding' entry found.", mask_path
+            )
+            return
+        if file_token_id is not None and int(file_token_id) != int(
+            self.parallel_drafting_token_id
+        ):
+            logger.warning(
+                "mask_embedding.pt token id %s differs from configured "
+                "mask_token_id %s; using the file's token id.",
+                file_token_id,
+                self.parallel_drafting_token_id,
+            )
+        token_id = int(
+            file_token_id
+            if file_token_id is not None
+            else self.parallel_drafting_token_id
+        )
+        embedding = embedding.reshape(-1)
+
+        embed_tokens = self.model.model.embed_tokens
+        weight = embed_tokens.weight
+        shard_indices = getattr(embed_tokens, "shard_indices", None)
+        if shard_indices is not None:
+            start = shard_indices.org_vocab_start_index
+            end = shard_indices.org_vocab_end_index
+        else:
+            start, end = 0, weight.shape[0]
+        if start <= token_id < end:
+            row = weight.data[token_id - start]
+            embedding = embedding.to(device=row.device, dtype=row.dtype)
+            if embedding.shape != row.shape:
+                raise ValueError(
+                    "mask_embedding.pt shape "
+                    f"{tuple(embedding.shape)} does not match embedding row "
+                    f"shape {tuple(row.shape)}."
+                )
+            row.copy_(embedding)
+        logger.info_once(
+            "Loaded parallel-drafting mask embedding for token %d from %s.",
+            token_id,
+            mask_path,
+            scope="local",
+        )
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -1681,6 +1819,9 @@ class SpecDecodeBaseProposer:
             == 1
         ), "All drafting layers should belong to the same kv cache group"
 
+    def allow_multiple_draft_kv_cache_groups(self) -> bool:
+        return False
+
     def initialize_attn_backend(
         self,
         kv_cache_config: KVCacheConfig,
@@ -1695,47 +1836,63 @@ class SpecDecodeBaseProposer:
             AttentionLayerBase,  # type: ignore[type-abstract]
         )
 
-        # Find which kv_cache_group the draft layers belong to
-        self.validate_same_kv_cache_group(kv_cache_config)
-        kv_cache_spec = None
-        for gid, group in enumerate(kv_cache_config.kv_cache_groups):
-            if self._draft_attn_layer_names & set(group.layer_names):
-                self.kv_cache_gid = gid
-                kv_cache_spec = group.kv_cache_spec
-                break
+        self._draft_layer_to_kv_cache_gid = {
+            layer_name: gid
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+            for layer_name in group.layer_names
+            if layer_name in self._draft_attn_layer_names
+        }
+        missing_layers = self._draft_attn_layer_names - set(
+            self._draft_layer_to_kv_cache_gid
+        )
+        assert not missing_layers, (
+            "Draft attention layers are missing from KV cache groups: "
+            f"{sorted(missing_layers)}"
+        )
+        self._draft_kv_cache_group_ids = sorted(
+            set(self._draft_layer_to_kv_cache_gid.values())
+        )
+        if not self.allow_multiple_draft_kv_cache_groups():
+            assert len(self._draft_kv_cache_group_ids) == 1, (
+                "All drafting layers should belong to the same kv cache group"
+            )
+        self.kv_cache_gid = self._draft_kv_cache_group_ids[0]
 
-        attention_groups: dict[tuple[str, str], AttentionGroup] = {}
-        if kv_cache_spec is not None:
-            for layer_name in self._draft_attn_layer_names:
-                attn_backend = all_attn_layers[layer_name].get_attn_backend()
-                backend_key = attn_backend.full_cls_name()
-                if backend_key not in attention_groups:
-                    layer_kv_cache_spec = kv_cache_spec
-                    if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                        layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[
-                            layer_name
-                        ]
+        attention_groups: dict[
+            tuple[int, tuple[str, str], KVCacheSpec, tuple[Any, ...]], AttentionGroup
+        ] = {}
+        for layer_name in self._draft_attn_layer_names:
+            gid = self._draft_layer_to_kv_cache_gid[layer_name]
+            kv_cache_spec = kv_cache_config.kv_cache_groups[gid].kv_cache_spec
+            layer_kv_cache_spec = kv_cache_spec
+            if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
 
-                    kernel_block_size = (
-                        kernel_block_sizes[self.kv_cache_gid]
-                        if kernel_block_sizes is not None
-                        and self.kv_cache_gid < len(kernel_block_sizes)
-                        else None
-                    )
-                    attn_group = AttentionGroup(
-                        backend=attn_backend,
-                        layer_names=[layer_name],
-                        kv_cache_spec=layer_kv_cache_spec,
-                        kv_cache_group_id=self.kv_cache_gid,
-                    )
-                    attn_group.create_metadata_builders(
-                        self.vllm_config,
-                        self.device,
-                        kernel_block_size=kernel_block_size,
-                    )
-                    attention_groups[backend_key] = attn_group
-                else:
-                    attention_groups[backend_key].layer_names.append(layer_name)
+            attn_layer = all_attn_layers[layer_name]
+            attn_backend = attn_layer.get_attn_backend()
+            backend_key = attn_backend.full_cls_name()
+            metadata_group_key = attn_backend.get_metadata_group_key(attn_layer)
+            group_key = (gid, backend_key, layer_kv_cache_spec, metadata_group_key)
+            if group_key not in attention_groups:
+                kernel_block_size = (
+                    kernel_block_sizes[gid]
+                    if kernel_block_sizes is not None and gid < len(kernel_block_sizes)
+                    else None
+                )
+                attn_group = AttentionGroup(
+                    backend=attn_backend,
+                    layer_names=[layer_name],
+                    kv_cache_spec=layer_kv_cache_spec,
+                    kv_cache_group_id=gid,
+                )
+                attn_group.create_metadata_builders(
+                    self.vllm_config,
+                    self.device,
+                    kernel_block_size=kernel_block_size,
+                )
+                attention_groups[group_key] = attn_group
+            else:
+                attention_groups[group_key].layer_names.append(layer_name)
 
         self.draft_attn_groups = list(attention_groups.values())
         self.block_size = (

@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -364,6 +364,17 @@ class FlashInferBackend(AttentionBackend):
     def supports_non_causal(cls) -> bool:
         return True
 
+    @classmethod
+    def get_metadata_group_key(cls, attn_layer: Any) -> tuple[Any, ...]:
+        impl = attn_layer.impl
+        scale = getattr(impl, "scale", None)
+        return (
+            getattr(impl, "window_left", None),
+            getattr(impl, "logits_soft_cap", None),
+            float(scale) if scale is not None else None,
+            getattr(impl, "sinks", None) is not None,
+        )
+
     @staticmethod
     def get_impl_cls() -> type["FlashInferImpl"]:
         return FlashInferImpl
@@ -600,9 +611,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._prefill_wrapper: (
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
-        self._noncausal_prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = (
-            None  # Wrapper for non-causal prefill (DFlash)
-        )
+        self._noncausal_prefill_wrapper: (
+            BatchPrefillWithPagedKVCacheWrapper | None
+        ) = None  # Wrapper for non-causal prefill (DFlash)
         self._decode_wrapper = None  # Wrapper for decode (general shape)
 
         if envs.VLLM_BATCH_INVARIANT:
@@ -832,10 +843,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     "NVFP4 KV cache."
                 )
             if self._noncausal_prefill_wrapper is None:
-                self._noncausal_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                    self._get_workspace_buffer(),
-                    get_kv_cache_layout(),
-                    backend="auto",
+                self._noncausal_prefill_wrapper = (
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self._get_workspace_buffer(),
+                        get_kv_cache_layout(),
+                        backend="auto",
+                    )
                 )
             return self._noncausal_prefill_wrapper
 
@@ -1003,26 +1016,39 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         prefill_force_trtllm = (
             True if page_size >= 128 else self.attention_config.use_trtllm_attention
         )
-        prefill_use_trtllm = causal and use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
+        prefill_use_trtllm = (
+            causal
+            and use_trtllm_attention(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                num_prefill_tokens,
+                max_seq_len,
+                self.dcp_world_size,
+                self.cache_dtype,
+                self.q_data_type,
+                is_prefill=True,
+                force_use_trtllm=prefill_force_trtllm,
+                has_sinks=self.has_sinks,
+                has_spec=uses_spec_reorder,
+            )
         )
         decode_use_trtllm = (
-            causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+            causal
+            and self.use_trtllm_decode_attention
+            and self.dcp_world_size <= 1
         )
 
         if not causal and self.use_dcp:
             raise NotImplementedError(
                 "FlashInfer non-causal prefill is not supported with DCP yet."
+            )
+        uses_trtllm = (num_prefills > 0 and prefill_use_trtllm) or (
+            num_decodes > 0 and decode_use_trtllm
+        )
+        if not causal and uses_trtllm:
+            raise NotImplementedError(
+                "FlashInfer non-causal attention is not supported with TRTLLM "
+                "kernels yet."
             )
         if not causal and self.use_trtllm_decode_attention:
             logger.warning_once(
