@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from enum import Enum
 
 import torch
@@ -8,6 +9,7 @@ import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
 )
@@ -19,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+    prepare_nvfp4_moe_layer_for_b12x,
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
 )
@@ -54,6 +57,13 @@ FLASHINFER_NVFP4_MOE_BACKENDS = [
     NvFp4MoeBackend.FLASHINFER_CUTEDSL_BATCHED,
     NvFp4MoeBackend.FLASHINFER_B12X,
 ]
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def is_global_sf_supported_for_nvfp4_backend(backend: NvFp4MoeBackend) -> bool:
@@ -186,7 +196,10 @@ def select_nvfp4_moe_backend(
     def _backend_supports_clamp(backend: NvFp4MoeBackend) -> bool:
         if backend in NVFP4_BACKENDS_WITH_CLAMP:
             return True
-        return backend == NvFp4MoeBackend.B12X and activation_key is None
+        return backend == NvFp4MoeBackend.B12X and (
+            activation_key is None
+            or config.activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE
+        )
 
     if config.swiglu_limit is not None:
         AVAILABLE_BACKENDS = [
@@ -202,6 +215,8 @@ def select_nvfp4_moe_backend(
 
     def _make_log_backend(backend: NvFp4MoeBackend):
         available_backend_strs = [b.value for b in AVAILABLE_BACKENDS]
+        if backend not in AVAILABLE_BACKENDS:
+            available_backend_strs.append(backend.value)
         return (
             f"Using '{backend.value}' NvFp4 MoE backend out "
             f"of potential backends: {available_backend_strs}."
@@ -261,6 +276,15 @@ def select_nvfp4_moe_backend(
         )
 
     if envs.VLLM_USE_B12X_MOE:
+        if (
+            config.swiglu_limit is not None
+            and not _backend_supports_clamp(NvFp4MoeBackend.B12X)
+        ):
+            raise ValueError(
+                f"Model sets swiglu_limit={config.swiglu_limit}, but "
+                "VLLM_USE_B12X_MOE=1 requested B12X for a native NVFP4 "
+                "activation form that does not apply the SwiGLU clamp."
+            )
         return _return_or_raise(
             NvFp4MoeBackend.B12X,
             config,
@@ -308,6 +332,7 @@ def convert_to_nvfp4_moe_kernel_format(
     w2_scale_2: torch.Tensor,
     a2_scale: torch.Tensor | None,
     is_act_and_mul: bool,
+    use_a16: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -319,28 +344,50 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
 ]:
     if nvfp4_backend == NvFp4MoeBackend.B12X:
-        (
-            w13,
-            w13_scale,
-            w13_scale_2,
-            a13_scale,
-            w2,
-            w2_scale,
-            w2_scale_2,
-            a2_scale,
-        ) = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
-            backend=NvFp4MoeBackend.FLASHINFER_B12X,
-            layer=layer,
-            w13=w13,
-            w13_scale=w13_scale,
-            w13_scale_2=w13_scale_2,
-            a13_scale=a13_scale,
-            w2=w2,
-            w2_scale=w2_scale,
-            w2_scale_2=w2_scale_2,
-            a2_scale=a2_scale,
-            is_act_and_mul=is_act_and_mul,
-        )
+        if use_a16 or _env_flag("B12X_MOE_FORCE_A16"):
+            (
+                w13,
+                w13_scale,
+                w13_scale_2,
+                a13_scale,
+                w2,
+                w2_scale,
+                w2_scale_2,
+                a2_scale,
+            ) = prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+                backend=NvFp4MoeBackend.FLASHINFER_B12X,
+                layer=layer,
+                w13=w13,
+                w13_scale=w13_scale,
+                w13_scale_2=w13_scale_2,
+                a13_scale=a13_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                w2_scale_2=w2_scale_2,
+                a2_scale=a2_scale,
+                is_act_and_mul=is_act_and_mul,
+            )
+        else:
+            (
+                w13,
+                w13_scale,
+                w13_scale_2,
+                a13_scale,
+                w2,
+                w2_scale,
+                w2_scale_2,
+                a2_scale,
+            ) = prepare_nvfp4_moe_layer_for_b12x(
+                w13=w13,
+                w13_scale=w13_scale,
+                w13_scale_2=w13_scale_2,
+                a13_scale=a13_scale,
+                w2=w2,
+                w2_scale=w2_scale,
+                w2_scale_2=w2_scale_2,
+                a2_scale=a2_scale,
+                is_act_and_mul=is_act_and_mul,
+            )
     elif nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTEDSL:
         (
             w13,
@@ -460,6 +507,8 @@ def make_nvfp4_moe_quant_config(
     a13_scale: torch.Tensor,
     a2_scale: torch.Tensor,
     swiglu_limit: float | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
     use_a16: bool = False,
 ) -> FusedMoEQuantConfig:
     if backend == NvFp4MoeBackend.MARLIN or (
@@ -470,6 +519,9 @@ def make_nvfp4_moe_quant_config(
             g2_alphas=w2_scale_2,
             w1_scale=w13_scale,
             w2_scale=w2_scale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=swiglu_limit,
         )
     if backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(
@@ -479,6 +531,8 @@ def make_nvfp4_moe_quant_config(
             a2_gscale=a2_scale,
             w1_scale=w13_scale,
             w2_scale=w2_scale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=swiglu_limit,
         )
 
@@ -503,6 +557,8 @@ def make_nvfp4_moe_quant_config(
                 NvFp4MoeBackend.FLASHINFER_CUTEDSL,
             )
         ),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=swiglu_limit,
     )
 

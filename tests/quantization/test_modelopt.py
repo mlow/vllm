@@ -490,6 +490,149 @@ def test_modelopt_mixed_precision_dispatches_layer_quant_algo(
     )
 
 
+def test_modelopt_mixed_precision_resolves_minimax_qkv_from_shards() -> None:
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.3.self_attn.q_proj": {
+                "quant_algo": "MXFP8"
+            },
+            "model.language_model.layers.3.self_attn.k_proj": {
+                "quant_algo": "MXFP8"
+            },
+            "model.language_model.layers.3.self_attn.v_proj": {
+                "quant_algo": "MXFP8"
+            },
+        }
+    )
+
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.3.self_attn.qkv_proj"
+        )
+        == "MXFP8"
+    )
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.3.self_attn.indexer.q_proj"
+        )
+        is None
+    )
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.3.self_attn.indexer.k_proj"
+        )
+        is None
+    )
+
+
+def test_modelopt_mixed_precision_drives_minimax_indexer_split() -> None:
+    from vllm.models.minimax_m3.nvidia.model import (
+        _should_split_mxfp8_indexer_projection,
+    )
+
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.3.self_attn.q_proj": {
+                "quant_algo": "MXFP8"
+            },
+            "model.language_model.layers.3.self_attn.k_proj": {
+                "quant_algo": "MXFP8"
+            },
+            "model.language_model.layers.3.self_attn.v_proj": {
+                "quant_algo": "MXFP8"
+            },
+        }
+    )
+
+    assert _should_split_mxfp8_indexer_projection(
+        config, "language_model.model.layers.3.self_attn"
+    )
+
+
+def test_modelopt_mixed_precision_resolves_minimax_dense_gate_up_shards() -> None:
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.0.mlp.gate_proj": {
+                "quant_algo": "MXFP8"
+            },
+            "model.language_model.layers.0.mlp.up_proj": {
+                "quant_algo": "MXFP8"
+            },
+        }
+    )
+
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.0.mlp.gate_up_proj"
+        )
+        == "MXFP8"
+    )
+
+
+def test_modelopt_mixed_precision_resolves_minimax_block_sparse_mlp_alias() -> None:
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.10.mlp.experts.0.gate_proj": {
+                "quant_algo": "NVFP4"
+            },
+            "model.language_model.layers.10.mlp.experts.0.up_proj": {
+                "quant_algo": "NVFP4"
+            },
+            "model.language_model.layers.10.mlp.experts.0.down_proj": {
+                "quant_algo": "NVFP4"
+            },
+            "model.language_model.layers.10.mlp.shared_experts.gate_up_proj": {
+                "quant_algo": "MXFP8"
+            },
+            "model.language_model.layers.10.mlp.shared_experts.down_proj": {
+                "quant_algo": "MXFP8"
+            },
+        }
+    )
+
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.10.block_sparse_moe.experts"
+        )
+        == "NVFP4"
+    )
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.10."
+            "block_sparse_moe.shared_experts.gate_up_proj"
+        )
+        == "MXFP8"
+    )
+    assert (
+        config._resolve_quant_algo(
+            "language_model.model.layers.10."
+            "block_sparse_moe.shared_experts.down_proj"
+        )
+        == "MXFP8"
+    )
+
+
+def test_modelopt_mixed_precision_rejects_mixed_fused_shards() -> None:
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.3.self_attn.q_proj": {
+                "quant_algo": "MXFP8"
+            },
+            "model.language_model.layers.3.self_attn.k_proj": {
+                "quant_algo": "NVFP4"
+            },
+            "model.language_model.layers.3.self_attn.v_proj": {
+                "quant_algo": "MXFP8"
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="Mixed quant_algo within fused layer"):
+        config._resolve_quant_algo(
+            "language_model.model.layers.3.self_attn.qkv_proj"
+        )
+
+
 def test_modelopt_mixed_precision_builds_w4a16_sibling_config():
     """Sanity: ``ModelOptMixedPrecisionConfig._from_config`` builds **two**
     NVFP4 sub-configs — one for W4A4 (default) and one tagged

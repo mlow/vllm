@@ -1582,6 +1582,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             w2_scale_2=layer.w2_weight_scale_2,
             a2_scale=layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
+            use_a16=self.use_a16,
         )
 
         replace_parameter(layer, "w13_weight", w13)
@@ -1614,6 +1615,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
+            gemm1_alpha=getattr(layer, "swiglu_alpha", None),
+            gemm1_beta=getattr(layer, "swiglu_beta", None),
             use_a16=self.use_a16,
         )
 
@@ -2274,6 +2277,11 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     legacy ``hf_quant_config.json``.
     """
 
+    _fallback_packed_modules_mapping: dict[str, tuple[str, ...]] = {
+        "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+        "gate_up_proj": ("gate_proj", "up_proj"),
+    }
+
     def __init__(
         self,
         kv_cache_quant_method: str | None,
@@ -2416,24 +2424,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return self.quantized_layers[candidate]["quant_algo"].upper()
 
         # 2. Packed / fused layer lookup
-        proj_name = prefix.rsplit(".", 1)[-1]
-        if self.packed_modules_mapping and proj_name in self.packed_modules_mapping:
-            algos: set[str] = set()
-            base = prefix.rsplit(".", 1)[0]
-            for base_candidate in self._quantized_layer_prefix_candidates(base):
-                for shard_name in self.packed_modules_mapping[proj_name]:
-                    shard_prefix = f"{base_candidate}.{shard_name}"
-                    if shard_prefix in self.quantized_layers:
-                        algos.add(
-                            self.quantized_layers[shard_prefix]["quant_algo"].upper()
-                        )
-            if len(algos) == 1:
-                return algos.pop()
-            if len(algos) > 1:
-                raise ValueError(
-                    f"Mixed quant_algo within fused layer {prefix}: "
-                    f"{algos}. All shards must use the same quantization."
-                )
+        if quant_algo := self._resolve_fused_quant_algo(prefix):
+            return quant_algo
 
         # 3. Prefix-based lookup (for RoutedExperts / parent modules)
         for candidate in self._quantized_layer_prefix_candidates(prefix):
@@ -2445,11 +2437,40 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         # FusedMoE expert prefix is e.g. "...moe.experts", while ModelOpt's
         # quantized_layers entries use "...moe.gate_proj" / "...moe.up_proj".
         if prefix.endswith(".experts"):
-            parent_dot = prefix.rsplit(".experts", 1)[0] + "."
-            for key, info in self.quantized_layers.items():
-                if key.startswith(parent_dot):
-                    return info["quant_algo"].upper()
+            parent = prefix.rsplit(".experts", 1)[0]
+            for candidate in self._quantized_layer_prefix_candidates(parent):
+                parent_dot = candidate + "."
+                for key, info in self.quantized_layers.items():
+                    if key.startswith(parent_dot):
+                        return info["quant_algo"].upper()
 
+        return None
+
+    def _resolve_fused_quant_algo(self, prefix: str) -> str | None:
+        proj_name = prefix.rsplit(".", 1)[-1]
+        shard_names = self.packed_modules_mapping.get(proj_name)
+        if shard_names is None:
+            shard_names = self._fallback_packed_modules_mapping.get(proj_name)
+        if not shard_names:
+            return None
+
+        algos: set[str] = set()
+        base = prefix.rsplit(".", 1)[0]
+        for shard_name in shard_names:
+            shard_prefix = f"{base}.{shard_name}"
+            for candidate in self._quantized_layer_prefix_candidates(shard_prefix):
+                if candidate in self.quantized_layers:
+                    algos.add(
+                        self.quantized_layers[candidate]["quant_algo"].upper()
+                    )
+
+        if len(algos) == 1:
+            return algos.pop()
+        if len(algos) > 1:
+            raise ValueError(
+                f"Mixed quant_algo within fused layer {prefix}: "
+                f"{sorted(algos)}. All shards must use the same quantization."
+            )
         return None
 
     @staticmethod
@@ -2467,6 +2488,18 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             candidates.append(
                 "language_model.model." + prefix[len("model.language_model.") :]
             )
+
+        for candidate in tuple(candidates):
+            if ".block_sparse_moe." in candidate:
+                candidates.append(candidate.replace(".block_sparse_moe.", ".mlp."))
+            elif candidate.endswith(".block_sparse_moe"):
+                candidates.append(
+                    candidate[: -len(".block_sparse_moe")] + ".mlp"
+                )
+            if ".mlp." in candidate:
+                candidates.append(candidate.replace(".mlp.", ".block_sparse_moe."))
+            elif candidate.endswith(".mlp"):
+                candidates.append(candidate[: -len(".mlp")] + ".block_sparse_moe")
 
         return tuple(dict.fromkeys(candidates))
 
