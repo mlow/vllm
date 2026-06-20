@@ -310,7 +310,7 @@ class EngineCore:
                 g.kv_cache_spec.block_size for g in kv_cache_groups
             )
             num_tokens, max_concurrency = get_kv_cache_capacity(
-                vllm_config, scheduler_kv_cache_config
+                vllm_config, kv_cache_configs[0]
             )
             vllm_config.cache_config.kv_cache_size_tokens = num_tokens
             vllm_config.cache_config.kv_cache_max_concurrency = max_concurrency
