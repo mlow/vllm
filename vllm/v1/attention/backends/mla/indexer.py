@@ -385,6 +385,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if isinstance(self.kv_cache_spec, MLAAttentionSpec):
             self.compress_ratio = self.kv_cache_spec.compress_ratio
 
+        _prewarm_prefill_chunk_metadata_kernel(
+            device=self.device,
+            dcp_world_size=self.dcp_world_size,
+            dcp_rank=self.dcp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
+            compress_ratio=self.compress_ratio,
+        )
+
         # DCP writes the indexer KV cache through rank-local pages even when
         # compress_ratio == 1 (GLM/Kimi). Keep the mapped slots graph-stable.
         if self.compress_ratio > 1 or self.dcp_world_size > 1:
@@ -1030,7 +1038,7 @@ def build_prefill_chunk_metadata(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["query_slice_start", "query_slice_stop"])
 def _build_prefill_chunk_metadata_kernel(
     # Inputs
     query_start_loc_ptr,
@@ -1103,3 +1111,38 @@ def _build_prefill_chunk_metadata_kernel(
         offset = i + tl.arange(0, BLOCK_SIZE)
         mask = offset < compressed_seq_len
         tl.store(token_to_seq_ptr + seq_start + offset, batch_idx, mask=mask)
+
+
+def _prewarm_prefill_chunk_metadata_kernel(
+    *,
+    device: torch.device,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+    compress_ratio: int,
+) -> None:
+    if not current_platform.is_cuda():
+        return
+
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    uncompressed_seq_lens = torch.tensor([1], dtype=torch.int32, device=device)
+    cu_seq_lens = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    token_to_seq = torch.empty((1,), dtype=torch.int32, device=device)
+    cu_seq_len_ks = torch.empty((1,), dtype=torch.int32, device=device)
+    cu_seq_len_ke = torch.empty((1,), dtype=torch.int32, device=device)
+
+    _build_prefill_chunk_metadata_kernel[(1,)](
+        query_start_loc,
+        uncompressed_seq_lens,
+        cu_seq_lens,
+        token_to_seq,
+        cu_seq_len_ks,
+        cu_seq_len_ke,
+        0,
+        1,
+        DCP_WORLD_SIZE=int(dcp_world_size),
+        DCP_RANK=int(dcp_rank),
+        CP_KV_CACHE_INTERLEAVE_SIZE=int(cp_kv_cache_interleave_size),
+        BLOCK_SIZE=1024,
+        COMPRESS_RATIO=int(compress_ratio),
+    )

@@ -9,6 +9,7 @@ import torch
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import CustomOp
 from vllm.platforms import current_platform
@@ -183,6 +184,37 @@ def _dcp_finalize_topk_remap_kernel(
     )
 
 
+@triton.jit
+def _b12x_dcp_unpack_gathered_candidates_kernel(
+    gathered_ptr,
+    candidate_indices_ptr,
+    candidate_score_bits_ptr,
+    ROWS,
+    TOPK_TOKENS: tl.constexpr,
+    CANDIDATE_WIDTH: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offsets = tile * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask = offsets < CANDIDATE_WIDTH
+
+    rank = offsets // TOPK_TOKENS
+    local_offset = offsets - rank * TOPK_TOKENS
+    raw_row = rank * ROWS + row
+    raw_base = (raw_row * 2) * TOPK_TOKENS + local_offset
+
+    candidate_ids = tl.load(gathered_ptr + raw_base, mask=mask, other=-1)
+    candidate_scores = tl.load(
+        gathered_ptr + raw_base + TOPK_TOKENS,
+        mask=mask,
+        other=0,
+    )
+    out_base = row * CANDIDATE_WIDTH + offsets
+    tl.store(candidate_indices_ptr + out_base, candidate_ids, mask=mask)
+    tl.store(candidate_score_bits_ptr + out_base, candidate_scores, mask=mask)
+
+
 def _use_triton_dcp_remap(topk_indices: torch.Tensor) -> bool:
     return HAS_TRITON and current_platform.is_cuda() and topk_indices.is_cuda
 
@@ -305,6 +337,177 @@ def _dcp_finalize_topk_remap(
     topk_indices.copy_(final.to(topk_indices.dtype))
 
 
+def _dcp_all_gather_first_dim_into(
+    group,
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+) -> None:
+    """All-gather into caller-owned output, concatenating along dim 0."""
+    assert input_tensor.is_contiguous()
+    assert output_tensor.is_contiguous()
+    assert output_tensor.shape[0] == input_tensor.shape[0] * group.world_size
+    assert output_tensor.shape[1:] == input_tensor.shape[1:]
+
+    communicator = getattr(group, "device_communicator", None)
+    pynccl_comm = getattr(communicator, "pynccl_comm", None)
+    if pynccl_comm is not None and not getattr(pynccl_comm, "disabled", False):
+        pynccl_comm.all_gather(output_tensor, input_tensor)
+        return
+
+    device_group = getattr(communicator, "device_group", None)
+    if device_group is not None:
+        import torch.distributed as dist
+
+        dist.all_gather_into_tensor(output_tensor, input_tensor, group=device_group)
+        return
+
+    gathered = group.all_gather(input_tensor, dim=0)
+    output_tensor.copy_(gathered)
+
+
+def _unpack_b12x_dcp_gathered_candidates(
+    gathered_candidates: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    candidate_score_bits: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    topk_tokens: int,
+) -> None:
+    rows = int(candidate_indices.shape[0])
+    candidate_width = int(candidate_indices.shape[1])
+    if _use_triton_dcp_remap(candidate_indices):
+        block_k = 1024
+        grid = (rows, triton.cdiv(candidate_width, block_k))
+        _b12x_dcp_unpack_gathered_candidates_kernel[grid](
+            gathered_candidates,
+            candidate_indices,
+            candidate_score_bits,
+            rows,
+            topk_tokens,
+            candidate_width,
+            BLOCK_K=block_k,
+        )
+        return
+
+    gathered_view = gathered_candidates.view(dcp_world_size, rows, 2, topk_tokens)
+    for rank in range(dcp_world_size):
+        start = rank * topk_tokens
+        end = start + topk_tokens
+        candidate_indices[:, start:end].copy_(gathered_view[rank, :, 0, :])
+        candidate_score_bits[:, start:end].copy_(gathered_view[rank, :, 1, :])
+
+
+def _get_dcp_warmup_params() -> tuple[int, int, int]:
+    dcp_world_size = 1
+    dcp_rank = 0
+    cp_kv_cache_interleave_size = 1
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is not None:
+            parallel_config = vllm_config.parallel_config
+            dcp_world_size = int(parallel_config.decode_context_parallel_size)
+            cp_kv_cache_interleave_size = int(
+                parallel_config.cp_kv_cache_interleave_size
+            )
+    except Exception:
+        pass
+
+    try:
+        from vllm.distributed.parallel_state import get_dcp_group
+
+        dcp_group = get_dcp_group()
+        if int(dcp_group.world_size) > 1:
+            dcp_world_size = int(dcp_group.world_size)
+            dcp_rank = int(dcp_group.rank_in_group)
+    except Exception:
+        pass
+
+    return dcp_world_size, dcp_rank, cp_kv_cache_interleave_size
+
+
+def _prewarm_b12x_dcp_topk_merge(
+    *,
+    q_rows: int,
+    topk_tokens: int,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+    device: torch.device,
+) -> None:
+    if dcp_world_size <= 1 or topk_tokens <= 0:
+        return
+
+    rows = max(1, int(q_rows))
+    topk = int(topk_tokens)
+    world_size = int(dcp_world_size)
+    candidate_width = world_size * topk
+    (
+        candidates,
+        gathered_candidates,
+        candidate_indices,
+        candidate_score_bits,
+        candidate_lengths,
+    ) = current_workspace_manager().get_simultaneous(
+        ((rows, 2, topk), torch.int32),
+        ((rows * world_size, 2, topk), torch.int32),
+        ((rows, candidate_width), torch.int32),
+        ((rows, candidate_width), torch.int32),
+        ((rows,), torch.int32),
+    )
+    if not _use_triton_dcp_remap(candidate_indices):
+        return
+
+    from b12x.attention.indexer.tiled_topk import run_row_topk
+
+    from vllm.v1.attention.backends.mla.sparse_utils import (
+        triton_convert_dcp_local_topk_to_global,
+        triton_gather_topk_ids_by_position,
+    )
+
+    topk_indices = torch.empty((rows, topk), dtype=torch.int32, device=device)
+    topk_scores = torch.empty((rows, topk), dtype=torch.float32, device=device)
+    topk_indices.copy_(
+        torch.arange(topk, dtype=torch.int32, device=device).expand(rows, topk)
+    )
+    topk_scores.zero_()
+    triton_convert_dcp_local_topk_to_global(
+        topk_indices,
+        topk_scores,
+        dcp_world_size=world_size,
+        dcp_rank=int(dcp_rank),
+        cp_kv_cache_interleave_size=int(cp_kv_cache_interleave_size),
+    )
+
+    candidates[:, 0, :].copy_(topk_indices)
+    candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
+    gathered_view = gathered_candidates.view(world_size, rows, 2, topk)
+    for rank in range(world_size):
+        gathered_view[rank].copy_(candidates)
+    _unpack_b12x_dcp_gathered_candidates(
+        gathered_candidates,
+        candidate_indices,
+        candidate_score_bits,
+        dcp_world_size=world_size,
+        topk_tokens=topk,
+    )
+
+    candidate_lengths.fill_(candidate_width)
+    run_row_topk(
+        row_logits=candidate_score_bits.view(torch.float32),
+        lengths=candidate_lengths,
+        topk=topk,
+        output_values=topk_scores,
+        output_indices=topk_indices,
+    )
+    triton_gather_topk_ids_by_position(
+        candidate_indices,
+        topk_indices,
+        topk_indices,
+    )
+
+
 def _dcp_global_topk_remap(
     topk_indices: torch.Tensor,
     logits: torch.Tensor | None,
@@ -381,6 +584,35 @@ def _get_b12x_paged_indexer_profile_k_rows(
     if known_k_rows > 0:
         return known_k_rows
     return _get_b12x_indexer_paged_supertile_k()
+
+
+def _get_b12x_paged_indexer_profile_warmup_k_rows(profile_k_rows: int) -> int:
+    raw = os.environ.get("B12X_PAGED_INDEX_PROFILE_WARMUP_K")
+    cap = _get_b12x_indexer_paged_supertile_k() if raw is None else int(raw)
+    cap = max(cap, _B12X_PAGED_INDEX_TILE_BLOCK_K)
+    cap = (
+        (cap + _B12X_PAGED_INDEX_TILE_BLOCK_K - 1)
+        // _B12X_PAGED_INDEX_TILE_BLOCK_K
+        * _B12X_PAGED_INDEX_TILE_BLOCK_K
+    )
+    return min(max(1, int(profile_k_rows)), cap)
+
+
+def _get_dcp_local_k_rows(
+    k_rows: int,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+) -> int:
+    if dcp_world_size <= 1:
+        return int(k_rows)
+    interleave = max(1, int(cp_kv_cache_interleave_size))
+    world_size = int(dcp_world_size)
+    rank = int(dcp_rank)
+    base = int(k_rows) // interleave // world_size * interleave
+    remainder = int(k_rows) - base * world_size
+    rank_remainder = min(max(remainder - rank * interleave, 0), interleave)
+    return base + rank_remainder
 
 
 def _b12x_profile_rows_or_empty(tensor: torch.Tensor, rows: int) -> torch.Tensor:
@@ -641,23 +873,41 @@ def _merge_b12x_dcp_topk(
         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
     )
 
-    candidates = torch.empty(
-        (topk_indices.shape[0], 2, topk_tokens),
-        dtype=torch.int32,
-        device=topk_indices.device,
+    if not topk_scores.is_contiguous():
+        raise RuntimeError("B12X sparse indexer DCP requires contiguous topk scores.")
+
+    rows = int(topk_indices.shape[0])
+    candidate_width = int(dcp_world_size * topk_tokens)
+    (
+        candidates,
+        gathered_candidates,
+        candidate_indices,
+        candidate_score_bits,
+        candidate_lengths,
+    ) = current_workspace_manager().get_simultaneous(
+        ((rows, 2, int(topk_tokens)), torch.int32),
+        ((rows * int(dcp_world_size), 2, int(topk_tokens)), torch.int32),
+        ((rows, candidate_width), torch.int32),
+        ((rows, candidate_width), torch.int32),
+        ((rows,), torch.int32),
     )
     candidates[:, 0, :].copy_(topk_indices)
-    candidates[:, 1, :].copy_(topk_scores.contiguous().view(torch.int32))
+    candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
 
     dcp_group = get_dcp_group()
-    all_candidates = dcp_group.all_gather(candidates.contiguous(), dim=2).contiguous()
-    candidate_scores = all_candidates[:, 1, :].contiguous().view(torch.float32)
-    candidate_indices = all_candidates[:, 0, :]
-    candidate_width = int(candidate_scores.shape[1])
-
-    (candidate_lengths,) = current_workspace_manager().get_simultaneous(
-        ((int(topk_indices.shape[0]),), torch.int32),
+    _dcp_all_gather_first_dim_into(
+        dcp_group,
+        candidates,
+        gathered_candidates,
     )
+    _unpack_b12x_dcp_gathered_candidates(
+        gathered_candidates,
+        candidate_indices,
+        candidate_score_bits,
+        dcp_world_size=dcp_world_size,
+        topk_tokens=int(topk_tokens),
+    )
+    candidate_scores = candidate_score_bits.view(torch.float32)
     candidate_lengths.fill_(candidate_width)
     run_row_topk(
         row_logits=candidate_scores,
@@ -681,16 +931,17 @@ def _prewarm_b12x_paged_indexer_prefill(
     topk_tokens: int,
     profile_q_rows: int,
     profile_k_rows: int,
+    page_table_k_rows: int | None = None,
 ) -> None:
-    if int(kv_cache.shape[0]) <= 0:
-        return
-
     q_rows = max(1, int(profile_q_rows))
     k_rows = max(1, int(profile_k_rows))
+    page_table_rows = (
+        k_rows if page_table_k_rows is None else max(1, int(page_table_k_rows))
+    )
     num_q_heads = int(q_quant.shape[1])
     page_table_width = max(
         1,
-        (k_rows + _B12X_PAGED_INDEX_PAGE_SIZE - 1)
+        (page_table_rows + _B12X_PAGED_INDEX_PAGE_SIZE - 1)
         // _B12X_PAGED_INDEX_PAGE_SIZE,
     )
     q_warm = _b12x_profile_rows_or_empty(q_quant, q_rows)
@@ -711,6 +962,17 @@ def _prewarm_b12x_paged_indexer_prefill(
         dtype=torch.int32,
         device=q_quant.device,
     ).expand(q_rows, page_table_width)
+    kv_cache_warm = kv_cache
+    if int(kv_cache_warm.shape[0]) <= 0:
+        kv_cache_warm = torch.empty(
+            (
+                1,
+                _B12X_PAGED_INDEX_PAGE_SIZE,
+                _B12X_PAGED_INDEX_HEAD_DIM + _B12X_PAGED_INDEX_SCALE_BYTES,
+            ),
+            dtype=torch.uint8,
+            device=q_quant.device,
+        )
     topk_indices = torch.empty(
         (q_rows, int(topk_tokens)),
         dtype=torch.int32,
@@ -719,7 +981,7 @@ def _prewarm_b12x_paged_indexer_prefill(
     _run_b12x_paged_topk(
         q_fp8=q_warm,
         weights=weights_warm,
-        kv_cache=kv_cache,
+        kv_cache=kv_cache_warm,
         seq_lens=seq_lens,
         block_table=block_table,
         schedule_metadata=None,
@@ -903,12 +1165,38 @@ def sparse_attn_indexer(
     topk_scores_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
-    attn_metadata = get_forward_context().attn_metadata
+    forward_context = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
     fp8_dtype = current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
+        run_profile_work = (
+            forward_context.cudagraph_runtime_mode == CUDAGraphMode.NONE
+            and forward_context.batch_descriptor is not None
+        )
+        if not run_profile_work:
+            return sparse_attn_indexer_fake(
+                hidden_states,
+                k_cache_prefix,
+                kv_cache,
+                q_quant,
+                q_scale,
+                k,
+                weights,
+                quant_block_size,
+                scale_fmt,
+                topk_tokens,
+                head_dim,
+                max_model_len,
+                total_seq_lens,
+                topk_indices_buffer,
+                skip_k_cache_insert,
+                use_fp4_cache,
+                use_b12x_sparse_indexer,
+            )
+
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
@@ -920,6 +1208,9 @@ def sparse_attn_indexer(
             profile_k_rows = _get_b12x_paged_indexer_profile_k_rows(
                 max_model_len=max_model_len,
                 total_seq_lens=total_seq_lens,
+            )
+            warmup_k_rows = _get_b12x_paged_indexer_profile_warmup_k_rows(
+                profile_k_rows
             )
             _reserve_b12x_paged_indexer_scratch(
                 q_rows=profile_q_rows,
@@ -937,13 +1228,47 @@ def sparse_attn_indexer(
                 device=q_quant.device,
                 shared_page_table=True,
             )
+            (
+                dcp_world_size,
+                dcp_rank,
+                cp_kv_cache_interleave_size,
+            ) = _get_dcp_warmup_params()
             _prewarm_b12x_paged_indexer_prefill(
                 q_quant=q_quant,
                 weights=weights,
                 kv_cache=kv_cache,
                 topk_tokens=int(topk_tokens),
                 profile_q_rows=profile_q_rows,
-                profile_k_rows=profile_k_rows,
+                profile_k_rows=warmup_k_rows,
+                page_table_k_rows=profile_k_rows,
+            )
+            if dcp_world_size > 1:
+                dcp_profile_k_rows = _get_dcp_local_k_rows(
+                    profile_k_rows,
+                    dcp_world_size,
+                    dcp_rank,
+                    cp_kv_cache_interleave_size,
+                )
+                dcp_warmup_k_rows = _get_b12x_paged_indexer_profile_warmup_k_rows(
+                    dcp_profile_k_rows
+                )
+                if dcp_warmup_k_rows != warmup_k_rows:
+                    _prewarm_b12x_paged_indexer_prefill(
+                        q_quant=q_quant,
+                        weights=weights,
+                        kv_cache=kv_cache,
+                        topk_tokens=int(topk_tokens),
+                        profile_q_rows=profile_q_rows,
+                        profile_k_rows=dcp_warmup_k_rows,
+                        page_table_k_rows=dcp_profile_k_rows,
+                    )
+            _prewarm_b12x_dcp_topk_merge(
+                q_rows=profile_q_rows,
+                topk_tokens=int(topk_tokens),
+                dcp_world_size=dcp_world_size,
+                dcp_rank=dcp_rank,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                device=q_quant.device,
             )
             _prewarm_b12x_contiguous_prefill_variants(
                 q_quant=q_quant,
