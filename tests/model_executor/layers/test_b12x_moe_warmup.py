@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 import vllm.model_executor.layers.fused_moe.b12x_moe as b12x_moe
@@ -60,6 +61,9 @@ def _make_fake_b12x_experts() -> b12x_moe.B12xExperts:
     }
     experts._source_params_compacted = False
     experts._unit_scale_by_device = {}
+    experts._activation_amax_base_num_layers = None
+    experts._activation_amax_state_key = None
+    experts._activation_amax_layer_idx = None
     return experts
 
 
@@ -169,6 +173,162 @@ def test_b12x_force_a16_nvfp4_selects_w4a16(monkeypatch) -> None:
     experts = _make_fake_b12x_experts()
 
     assert experts._quant_mode() == "w4a16"
+
+
+def test_b12x_activation_amax_registers_stable_vllm_owned_tensor(
+    monkeypatch,
+) -> None:
+    b12x_moe._reset_b12x_moe_activation_amax_for_tests()
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setenv("VLLM_B12X_MOE_ACTIVATION_AMAX", "1")
+
+    experts = _make_fake_b12x_experts()
+    experts._register_activation_amax(
+        layer=SimpleNamespace(layer_name="model.layers.3.mlp.experts"),
+        device=torch.device("cpu"),
+        num_experts=8,
+    )
+
+    activation_amax, layer_idx = experts._activation_amax_args(
+        device=torch.device("cpu"),
+        num_experts=8,
+    )
+
+    assert activation_amax is not None
+    assert activation_amax.shape == (4, 8, 2)
+    assert activation_amax.dtype == torch.float32
+    assert layer_idx == 3
+    data_ptr = activation_amax.data_ptr()
+
+    late_experts = _make_fake_b12x_experts()
+    with pytest.raises(RuntimeError, match="would reallocate after use"):
+        late_experts._register_activation_amax(
+            layer=SimpleNamespace(layer_name="model.layers.4.mlp.experts"),
+            device=torch.device("cpu"),
+            num_experts=8,
+        )
+    assert activation_amax.data_ptr() == data_ptr
+
+
+def test_b12x_activation_amax_is_passed_as_separate_binding_arg(
+    monkeypatch,
+) -> None:
+    b12x_moe._reset_b12x_moe_activation_amax_for_tests()
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setenv("VLLM_B12X_MOE_ACTIVATION_AMAX", "1")
+
+    plan_calls = []
+    run_calls = []
+
+    def fake_plan(**kwargs):
+        plan_calls.append(kwargs)
+        return _FakePlan()
+
+    def fake_run(**kwargs):
+        run_calls.append(kwargs)
+
+    monkeypatch.setattr(b12x_moe, "_plan_b12x_moe_fp4_scratch", fake_plan)
+    monkeypatch.setattr(b12x_moe, "_run_b12x_moe_fp4", fake_run)
+
+    num_experts = 8
+    hidden_size = 16
+    experts = _make_fake_b12x_experts()
+    experts._prepared_fp4_moe_by_dtype[torch.bfloat16].w4a16 = SimpleNamespace(
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=32,
+        w13=torch.empty(1),
+    )
+    experts._register_activation_amax(
+        layer=SimpleNamespace(layer_name="model.layers.2.mlp.experts"),
+        device=torch.device("cpu"),
+        num_experts=num_experts,
+    )
+
+    hidden_states = torch.zeros(3, hidden_size, dtype=torch.bfloat16)
+    output = torch.empty_like(hidden_states)
+    topk_ids = torch.zeros(3, 4, dtype=torch.int32)
+    topk_weights = torch.full((3, 4), 0.25, dtype=torch.float32)
+    workspace2 = torch.empty(64, dtype=torch.uint8)
+
+    experts.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=torch.empty(0, dtype=torch.uint8),
+        w2=torch.empty(0, dtype=torch.uint8),
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        global_num_experts=num_experts,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=workspace2,
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    assert len(plan_calls) == 1
+    assert len(run_calls) == 1
+    assert plan_calls[0]["collect_activation_amax"] is True
+    assert run_calls[0]["activation_amax"] is not workspace2
+    assert run_calls[0]["activation_amax"].shape == (3, num_experts, 2)
+    assert run_calls[0]["layer_idx"] == 2
+
+
+def test_b12x_activation_amax_save_every_writes_main_and_mtp_files(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    b12x_moe._reset_b12x_moe_activation_amax_for_tests()
+    monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
+    monkeypatch.setenv("VLLM_B12X_MOE_ACTIVATION_AMAX", "1")
+    monkeypatch.setenv("VLLM_B12X_MOE_ACTIVATION_AMAX_SAVE_EVERY", "2")
+    monkeypatch.setenv("VLLM_B12X_MOE_ACTIVATION_AMAX_FILE", str(tmp_path / "amax.pt"))
+
+    main = _make_fake_b12x_experts()
+    main._activation_amax_base_num_layers = 60
+    main._register_activation_amax(
+        layer=SimpleNamespace(layer_name="model.layers.3.mlp.experts"),
+        device=torch.device("cpu"),
+        num_experts=8,
+    )
+    mtp = _make_fake_b12x_experts()
+    mtp._activation_amax_base_num_layers = 60
+    mtp._register_activation_amax(
+        layer=SimpleNamespace(layer_name="model.layers.60.mlp.experts"),
+        device=torch.device("cpu"),
+        num_experts=8,
+    )
+
+    main_amax, main_layer = main._activation_amax_args(
+        device=torch.device("cpu"),
+        num_experts=8,
+    )
+    mtp_amax, mtp_layer = mtp._activation_amax_args(
+        device=torch.device("cpu"),
+        num_experts=8,
+    )
+    assert main_amax is not None and mtp_amax is not None
+    assert main_layer == 3
+    assert mtp_layer == 0
+    main_amax[main_layer, 1, 0] = 11.0
+    mtp_amax[mtp_layer, 2, 1] = 17.0
+
+    b12x_moe.maybe_save_b12x_moe_activation_amax()
+    assert not list(tmp_path.glob("*.pt"))
+
+    b12x_moe.maybe_save_b12x_moe_activation_amax()
+    files = sorted(tmp_path.glob("*.pt"))
+    assert len(files) == 2
+    loaded = [torch.load(path, weights_only=False) for path in files]
+    payloads = {payload["model"]: payload for payload in loaded}
+    assert set(payloads) == {"main", "mtp"}
+    assert payloads["main"]["activation_amax"][3, 1, 0] == 11.0
+    assert payloads["mtp"]["activation_amax"][0, 2, 1] == 17.0
+    assert payloads["main"]["layers"][3]["prefix"] == "model.layers.3.mlp.experts"
+    assert payloads["mtp"]["layers"][0]["external_layer_idx"] == 60
 
 
 def test_b12x_force_a8_mxfp4_prepares_w4a8_tier(monkeypatch) -> None:

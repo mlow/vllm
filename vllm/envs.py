@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
+    VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1042,6 +1043,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # disabled by default while mixed-quant and sparse-attention paths settle.
     "VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE": lambda: bool(
         int(os.getenv("VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE", "0"))
+    ),
+    # Re-run every B12X piecewise subgraph eagerly immediately before capture.
+    # PIECEWISE descriptors already receive an eager full-forward warmup before
+    # capture, so this remains opt-in for debugging kernels that still need it.
+    "VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM": lambda: bool(
+        int(os.getenv("VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM", "0"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

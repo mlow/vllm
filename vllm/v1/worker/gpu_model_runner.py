@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -129,7 +130,9 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionType,
+    CommonAttentionBatchTopology,
     CommonAttentionMetadata,
+    exact_attention_metadata_cache_key,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -236,6 +239,15 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+def _maybe_save_b12x_moe_activation_amax() -> None:
+    b12x_moe = sys.modules.get("vllm.model_executor.layers.fused_moe.b12x_moe")
+    if b12x_moe is None:
+        return
+    maybe_save = getattr(b12x_moe, "maybe_save_b12x_moe_activation_amax", None)
+    if maybe_save is not None:
+        maybe_save()
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -2352,6 +2364,14 @@ class GPUModelRunner(
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
+            batch_topology=CommonAttentionBatchTopology(
+                query_start_loc_np=self.query_start_loc.cpu[
+                    : num_reqs_padded + 1
+                ].numpy(),
+                num_reqs=num_reqs_padded,
+                max_query_len=max_query_len,
+                max_seq_len_upper_bound=max_seq_len,
+            ),
         )
 
         if self.dcp_world_size > 1:
@@ -2383,6 +2403,7 @@ class GPUModelRunner(
         cached_attn_metadata: dict[
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
+        exact_cached_attn_metadata: dict[tuple[Any, ...], AttentionMetadata] = {}
 
         def _build_attn_group_metadata(
             kv_cache_gid: int,
@@ -2396,11 +2417,16 @@ class GPUModelRunner(
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(builder))
-
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
                 if cascade_attn_prefix_lens
                 else 0
+            )
+            exact_cache_key = exact_attention_metadata_cache_key(
+                kv_cache_spec,
+                type(builder),
+                cascade_attn_prefix_len,
+                common_attn_metadata,
             )
 
             extra_attn_metadata_args = {}
@@ -2427,6 +2453,11 @@ class GPUModelRunner(
                     common_attn_metadata
                 )
             elif (
+                builder.supports_exact_metadata_reuse
+                and exact_cache_key in exact_cached_attn_metadata
+            ):
+                attn_metadata_i = exact_cached_attn_metadata[exact_cache_key]
+            elif (
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
             ):
@@ -2443,6 +2474,8 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
+                if builder.supports_exact_metadata_reuse:
+                    exact_cached_attn_metadata[exact_cache_key] = attn_metadata_i
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -4376,6 +4409,7 @@ class GPUModelRunner(
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
+                    _maybe_save_b12x_moe_activation_amax()
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -4657,6 +4691,8 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
             )
+
+        _maybe_save_b12x_moe_activation_amax()
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:
@@ -5714,6 +5750,8 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        include_mm_inputs: bool = True,
+        single_request_prefill: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5741,6 +5779,12 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            include_mm_inputs: If True, include synthetic multimodal inputs for
+                multimodal models. Text-only warmups can disable this to cover
+                the same attention specialization as text generation requests.
+            single_request_prefill: If True, create one prefill request with
+                `num_tokens` tokens. This covers text-only single-request
+                prefill kernels without keying warmup on a live prompt length.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -5775,6 +5819,7 @@ class GPUModelRunner(
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
             assert not uniform_decode
+            assert not single_request_prefill
             # Create mixed batch:
             # first half decode tokens, second half one prefill
             num_decode_tokens = min(max_num_reqs - 1, num_tokens // 2)
@@ -5787,10 +5832,15 @@ class GPUModelRunner(
             max_query_len = num_prefill_tokens
         elif uniform_decode:
             assert not create_mixed_batch
+            assert not single_request_prefill
             num_reqs = min(max_num_reqs, cdiv(num_tokens, max_query_len))
             num_scheduled_tokens_list = [max_query_len] * num_reqs
             if num_tokens % max_query_len != 0:
                 num_scheduled_tokens_list[-1] = num_tokens % max_query_len
+        elif single_request_prefill:
+            assert not create_mixed_batch
+            num_reqs = 1
+            num_scheduled_tokens_list = [num_tokens]
         else:
             num_reqs = min(num_tokens, max_num_reqs)
             min_tokens_per_req = num_tokens // num_reqs
@@ -5930,7 +5980,11 @@ class GPUModelRunner(
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
             model_kwargs = self._init_model_kwargs()
-            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+            if (
+                include_mm_inputs
+                and self.supports_mm_inputs
+                and not self.model_config.is_encoder_decoder
+            ):
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
                 model_kwargs = {
@@ -6328,9 +6382,19 @@ class GPUModelRunner(
                         for i, output in enumerate(dummy_encoder_outputs):
                             self.encoder_cache[f"tmp_{i}"] = output
 
-        # Add `is_profile` here to pre-allocate communication buffers
+        # Add `is_profile` here to pre-allocate communication buffers.
+        # If multimodal profiling is skipped, profile the language model with
+        # text inputs as well so compile specializes to the same forward
+        # contract used by text-only requests.
+        include_mm_inputs = not (
+            self.supports_mm_inputs
+            and self.model_config.multimodal_config is not None
+            and self.model_config.multimodal_config.skip_mm_profiling
+        )
         hidden_states, last_hidden_states = self._dummy_run(
-            self.max_num_tokens, is_profile=True
+            self.max_num_tokens,
+            is_profile=True,
+            include_mm_inputs=include_mm_inputs,
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
