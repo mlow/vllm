@@ -4984,6 +4984,15 @@ class GPUModelRunner(
                     "aux_hidden_states are required when using `extract_hidden_states`"
                 )
             target_hidden_states = [h[:num_scheduled_tokens] for h in aux_hidden_states]
+            expected_num_hidden_states = self.drafter.num_hidden_states
+            if len(target_hidden_states) + 1 == expected_num_hidden_states:
+                target_hidden_states.append(hidden_states[:num_scheduled_tokens])
+            elif len(target_hidden_states) != expected_num_hidden_states:
+                raise ValueError(
+                    "extract_hidden_states expected "
+                    f"{expected_num_hidden_states} hidden-state tensors, got "
+                    f"{len(target_hidden_states)} aux tensors"
+                )
 
             draft_token_ids = self.drafter.propose(
                 num_speculative_tokens=num_spec_tokens_to_schedule,
