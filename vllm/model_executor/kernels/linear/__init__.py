@@ -13,7 +13,7 @@ or kernel implementation, add it to this __init__.py to maintain
 import stability.
 """
 
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import torch
 
@@ -81,6 +81,7 @@ from vllm.model_executor.kernels.linear.mxfp4.xpu import (
     XPUMxFp4LinearKernel,
 )
 from vllm.model_executor.kernels.linear.mxfp8 import (
+    B12xMxfp8LinearKernel,
     Mxfp8LinearKernel,
     Mxfp8LinearLayerConfig,
 )
@@ -136,6 +137,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
     AiterInt8ScaledMMLinearKernel,
     AiterPerTokenFp8ScaledMMLinearKernel,
     AiterPreshuffledPerTokenFp8ScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.b12x import (
+    B12xFp8BlockScaledMMKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
     CPUFp8BlockScaledMMKernel,
@@ -196,6 +200,10 @@ def _get_linear_backend() -> str:
 # set are considered candidates. If none can implement the layer config,
 # an error is raised to respect the user's explicit intent.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
+    "b12x": {
+        B12xFp8BlockScaledMMKernel,
+        B12xMxfp8LinearKernel,
+    },
     "cutlass": {
         CutlassInt8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
@@ -319,6 +327,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum, list[type[Fp8BlockScaledMMLinearKernel | FP8ScaledMMLinearKernel]]
 ] = {
     PlatformEnum.CUDA: [
+        B12xFp8BlockScaledMMKernel,
         FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
         DeepGemmFp8BlockScaledMMKernel,
         CutlassFp8BlockScaledMMKernel,
@@ -385,6 +394,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
 # in priority/performance order (when available)
 _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
         EmulationMxfp8LinearKernel,
@@ -510,7 +520,23 @@ def choose_scaled_mm_linear_kernel(
 
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
-    if linear_backend != "auto":
+    b12x_fp8_gemm_required = (
+        envs.VLLM_USE_B12X_FP8_GEMM
+        and B12xFp8BlockScaledMMKernel in platform_kernels
+    )
+    if b12x_fp8_gemm_required:
+        if force_kernel is not None and force_kernel is not B12xFp8BlockScaledMMKernel:
+            raise ValueError(
+                "VLLM_USE_B12X_FP8_GEMM requires B12xFp8BlockScaledMMKernel "
+                f"for block-FP8 linear layers, got {force_kernel.__name__}."
+            )
+        if linear_backend not in ("auto", "b12x"):
+            raise ValueError(
+                "VLLM_USE_B12X_FP8_GEMM requires --linear-backend=auto or b12x "
+                f"for block-FP8 linear layers, got {linear_backend}."
+            )
+        platform_kernels = [cast(type[_KernelT], B12xFp8BlockScaledMMKernel)]
+    elif linear_backend != "auto":
         filtered = _filter_kernels_by_backend(linear_backend, platform_kernels)
         if not filtered:
             raise ValueError(
@@ -725,7 +751,15 @@ def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
 
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
-    if linear_backend != "auto":
+    b12x_fp8_gemm_required = envs.VLLM_USE_B12X_FP8_GEMM
+    if b12x_fp8_gemm_required:
+        if linear_backend not in ("auto", "b12x"):
+            raise ValueError(
+                "VLLM_USE_B12X_FP8_GEMM requires --linear-backend=auto or b12x "
+                f"for MXFP8 linear layers, got {linear_backend}."
+            )
+        possible = [B12xMxfp8LinearKernel]
+    elif linear_backend != "auto":
         filtered = _filter_kernels_by_backend(linear_backend, possible)
         if not filtered:
             raise ValueError(
@@ -1031,6 +1065,7 @@ __all__ = [
     "init_mxfp8_linear_kernel",
     "Mxfp8LinearKernel",
     "Mxfp8LinearLayerConfig",
+    "B12xMxfp8LinearKernel",
     "init_mxfp4_linear_kernel",
     "MxFp4LinearKernel",
     "MxFp4LinearLayerConfig",
@@ -1052,4 +1087,5 @@ __all__ = [
     "_KernelT",
     "DeepGemmFp8BlockScaledMMKernel",
     "FlashInferFp8DeepGEMMDynamicBlockScaledKernel",
+    "B12xFp8BlockScaledMMKernel",
 ]
