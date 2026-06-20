@@ -63,10 +63,10 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
-    VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
+    VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -1029,18 +1029,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use b12x for FP4 MoE experts.
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_MOE": lambda: bool(int(os.getenv("VLLM_USE_B12X_MOE", "0"))),
-    # Force DeepSeek V4 native MXFP4/E8M0 MoE weights through b12x's
-    # native/modelopt-layout W4A16 prep path.
-    "VLLM_B12X_MOE_FORCE_MODELOPT_PREP": lambda: bool(
-        int(os.getenv("VLLM_B12X_MOE_FORCE_MODELOPT_PREP", "0"))
-    ),
     # Use b12x for MiniMax M3's block-sparse MSA attention.
     # This is opt-in while page-128 MSA support is integrated.
     "VLLM_USE_B12X_MINIMAX_M3_MSA": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_MINIMAX_M3_MSA", "0"))
     ),
     # Diagnostic flag retained for local experiments. MiniMax M3 compile is
-    # disabled by default while mixed-quant and sparse-attention paths settle.
+    # fail-closed in the model until the no-break path is validated.
     "VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE": lambda: bool(
         int(os.getenv("VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE", "0"))
     ),
@@ -1049,6 +1044,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # capture, so this remains opt-in for debugging kernels that still need it.
     "VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM": lambda: bool(
         int(os.getenv("VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM", "0"))
+    ),
+    # Force DeepSeek V4 native MXFP4/E8M0 MoE weights through b12x's
+    # native/modelopt-layout W4A16 prep path.
+    "VLLM_B12X_MOE_FORCE_MODELOPT_PREP": lambda: bool(
+        int(os.getenv("VLLM_B12X_MOE_FORCE_MODELOPT_PREP", "0"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
@@ -1646,10 +1646,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")
     ),
     # Enforce function parameter schemas in structural-tag based tool calling.
-    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: os.getenv(
-        "VLLM_ENFORCE_STRICT_TOOL_CALLING", "True"
-    ).lower()
-    in ("true", "1"),
+    "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: (
+        os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
+    ),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.
