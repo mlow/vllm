@@ -91,6 +91,13 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.lower() not in ("0", "false", "no", "off")
+
+
 @triton.jit
 def _mask_page_table_after_nsa_len_kernel(
     page_table_ptr,
@@ -572,15 +579,23 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # Split-K cap: ceil(topk / tile). Bounds the borrowed mid_out/mid_lse
         # chunk dim and the workspace max_chunks_per_row.
         self._num_splits_cap = max(1, _cdiv(self.topk_tokens, _DECODE_SPLIT_TILE))
-        self._prefill_num_heads = (
-            _cdiv(self._workspace_num_heads, _PREFILL_HEADS_PER_BLOCK)
-            * _PREFILL_HEADS_PER_BLOCK
+        self._prefill_hpb8_enabled = _env_flag("VLLM_B12X_MLA_PREFILL_HPB8")
+        self._prefill_num_heads = self._round_prefill_num_heads(
+            self._workspace_num_heads
         )
         if self._prefill_num_heads != self._workspace_num_heads:
             logger.info_once(
                 "Padding B12X_MLA_SPARSE prefill heads from %d to %d.",
                 self._workspace_num_heads,
                 self._prefill_num_heads,
+            )
+        elif (
+            self._prefill_hpb8_enabled
+            and self._workspace_num_heads < _PREFILL_HEADS_PER_BLOCK
+        ):
+            logger.info_once(
+                "Using B12X_MLA_SPARSE prefill hpb8 path with %d heads.",
+                self._workspace_num_heads,
             )
 
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
@@ -679,6 +694,18 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
+
+    def _round_prefill_num_heads(self, num_heads: int) -> int:
+        num_heads = int(num_heads)
+        if (
+            self._prefill_hpb8_enabled
+            and 0 < num_heads < _PREFILL_HEADS_PER_BLOCK
+        ):
+            return num_heads
+        return (
+            _cdiv(num_heads, _PREFILL_HEADS_PER_BLOCK)
+            * _PREFILL_HEADS_PER_BLOCK
+        )
 
     def _sync_dcp_warmup(self) -> None:
         if self.device.type == "cuda":
@@ -902,14 +929,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             return out, None
         else:
             # Extend / prefill -> single-pass unified prefill (no split-K
-            # scratch needed; only output_buffer is read). The b12x prefill
-            # kernel currently requires head blocks of 16, so high-TP shards
-            # with fewer local heads are padded and sliced back after launch.
+            # scratch needed; only output_buffer is read). By default b12x
+            # prefill uses 16-head blocks. An opt-in hpb8 path lets high-TP
+            # GLM shards with 8 local heads pass the real head count through to
+            # b12x, which avoids the padded Q tensor and output slice.
             cache_seqlens = attn_metadata.cache_seq_lens_per_req
-            prefill_num_heads = (
-                _cdiv(num_actual_heads, _PREFILL_HEADS_PER_BLOCK)
-                * _PREFILL_HEADS_PER_BLOCK
-            )
+            prefill_num_heads = self._round_prefill_num_heads(num_actual_heads)
             if prefill_num_heads == num_actual_heads:
                 prefill_q = q_all
             else:
