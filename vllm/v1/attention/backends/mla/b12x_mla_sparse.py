@@ -744,7 +744,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # GLM fp8_ds_mla cache records are 656 B/token. One page is enough:
         # prewarm top-k indices all point at slot zero.
         kv_cache = torch.zeros(
-            (self.block_size, 1, 656), dtype=torch.uint8, device=self.device
+            (1, self.block_size, 656), dtype=torch.uint8, device=self.device
         )
         for rows in rows_to_warm:
             rows = int(rows)
@@ -872,11 +872,29 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         )
         _mask_page_table_after_nsa_len(page_table_1, nsa_cache_seqlens)
 
-        # KV cache -> flat (num_slots, 1, nbytes) uint8 (b12x requires rank-3
-        # uint8; page_size tells it the per-block stride). page_table_1 are
-        # physical slot ids consistent with block_size == page_size.
+        # KV cache -> paged rank-3 uint8. B12X unified SM120 kernels consume
+        # flat slot ids in selected_indices, but compute raw byte offsets as:
+        #   block = slot // page_size, local = slot % page_size
+        # so the cache tensor itself must expose a per-block stride of
+        # block_size * record_bytes. The older split path used a token-flat
+        # (num_slots, 1, bytes) view; that makes stride(0) one record and breaks
+        # the unified block-stride contract.
         kv_u8 = kv_c_and_k_pe_cache.view(torch.uint8)
-        kv_cache = kv_u8.reshape(-1, 1, kv_u8.shape[-1])
+        if kv_u8.ndim == 3 and kv_u8.shape[1] == self.block_size:
+            kv_cache = kv_u8
+        elif kv_u8.ndim == 3 and kv_u8.shape[1] == 1:
+            if kv_u8.shape[0] % self.block_size != 0:
+                raise ValueError(
+                    "B12X_MLA_SPARSE flat KV cache rows must be divisible by "
+                    f"block_size={self.block_size}; got {kv_u8.shape[0]}"
+                )
+            kv_cache = kv_u8.reshape(-1, self.block_size, kv_u8.shape[-1])
+        else:
+            raise ValueError(
+                "B12X_MLA_SPARSE expected fp8_ds_mla KV cache as "
+                f"(blocks,{self.block_size},bytes) or (slots,1,bytes), got "
+                f"{tuple(kv_u8.shape)}"
+            )
         if not kv_cache.is_contiguous():
             kv_cache = kv_cache.contiguous()
 
