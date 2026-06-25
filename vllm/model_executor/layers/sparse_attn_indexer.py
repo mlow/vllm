@@ -1717,7 +1717,9 @@ def sparse_attn_indexer(
             and topk_tokens in (512, 1024, 2048)
             and num_rows <= 32
             and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
-            and current_platform.has_device_capability(90)
+            # The cluster-cooperative kernel is an SM90 path. On SM120 it can
+            # launch-fail during DS4 sparse-indexer warmup; use persistent_topk.
+            and current_platform.is_device_capability_family(90)
         )
         if use_cooperative_topk:
             workspace_manager = current_workspace_manager()

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Literal, Union
 
 import torch
 
+from vllm import envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config
 from vllm.config.kernel import MoEBackend
