@@ -174,8 +174,14 @@ def warmup_kernels(
     decode_query_len = model_runner.decode_query_len
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
     # length exceeds decode_query_len, preventing it from being misclassified as
-    # a uniform decode batch.
-    prompt_len = decode_query_len + 1
+    # a uniform decode batch. Under DCP, also make the synthetic prompt span all
+    # KV shards; some sparse MLA backends do not support warmup batches where a
+    # DCP rank receives zero local KV tokens.
+    min_dcp_prompt_len = max(
+        1,
+        getattr(model_runner, "dcp_size", 1) * getattr(model_runner, "cp_interleave", 1),
+    )
+    prompt_len = max(decode_query_len + 1, min_dcp_prompt_len)
     prompt_token_ids = list(range(prompt_len))
     # After prefill, decode generates decode_query_len tokens.
     decode_len = prompt_len + decode_query_len
