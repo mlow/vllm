@@ -16,7 +16,10 @@ def _create_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
     import os as _os
 
     draft_parallel_config = speculative_config.draft_parallel_config
-    if _os.environ.get("VLLM_DCP_SHARD_DRAFT", "1").lower() in (
+    # Eagle draft models have their own attention configuration and may use
+    # GQA/MQA layouts that are invalid under the target model's DCP setting.
+    # Keep the draft at its native DCP unless explicitly requested.
+    if _os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
         "1",
         "true",
         "yes",
