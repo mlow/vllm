@@ -16,10 +16,12 @@ def _create_draft_vllm_config(vllm_config: VllmConfig) -> VllmConfig:
     import os as _os
 
     draft_parallel_config = speculative_config.draft_parallel_config
-    # Eagle draft models have their own attention configuration and may use
-    # GQA/MQA layouts that are invalid under the target model's DCP setting.
-    # Keep the draft at its native DCP unless explicitly requested.
-    if _os.environ.get("VLLM_DCP_SHARD_DRAFT", "0").lower() in (
+    # External draft models (Eagle/Eagle3/DFlash) have their own attention
+    # layouts, so keep their native DCP unless explicitly requested. Native MTP
+    # layers are part of the target model path; under DCP they need the same
+    # sharded sparse-indexer buffers as the target.
+    default_shard_draft = "1" if speculative_config.method == "mtp" else "0"
+    if _os.environ.get("VLLM_DCP_SHARD_DRAFT", default_shard_draft).lower() in (
         "1",
         "true",
         "yes",
