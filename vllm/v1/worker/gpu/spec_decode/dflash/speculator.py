@@ -541,7 +541,15 @@ def _prepare_dflash_inputs_kernel(
         mask=is_query,
         other=0,
     ).to(tl.int64)
-    q_slot = q_block_id * block_size + (query_pos % block_size)
+    # Prefix-cache hits for DCP-replicated DFlash replay a resident
+    # sliding-window tail with null padding for evicted/global positions.
+    # Do not treat the null block as a real writable cache slot.
+    q_resident = is_query & (q_block_id != 0)
+    q_slot = tl.where(
+        q_resident,
+        q_block_id * block_size + (query_pos % block_size),
+        PAD_SLOT_ID,
+    )
 
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
     tl.store(out_query_positions_ptr + query_idx, query_pos, mask=is_query)

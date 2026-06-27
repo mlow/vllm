@@ -544,25 +544,21 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        has_dcp_replicated_group = any(
+        self.has_dcp_replicated_group = any(
             getattr(group.kv_cache_spec, "dcp_replicated", False)
             for group in kv_cache_config.kv_cache_groups
         )
         # Prefix caching under DCP is unsafe for hybrid layouts whose groups do
-        # not advance from exactly the same cached prefix. For DeepSeek V4's
-        # MLA/SWA hybrid this was already disabled. DFlash drafts have the same
-        # requirement under DCP: the target KV is sharded, but the draft KV is
-        # replicated per DCP rank. Reusing a target prefix while the draft group
-        # has no matching prefix leaves DFlash verification with inconsistent
-        # KV state and can surface later as a CUDA illegal memory access.
+        # not advance from exactly the same cached prefix. Keep the historical
+        # DeepSeek V4 MLA/SWA guard. DFlash is different: the draft KV cache is
+        # replicated and window-bounded under DCP, so prefix-cache hits are safe
+        # as long as the draft group can materialize its local sliding-window
+        # tail and older context slots remain padded.
         self.disable_prefix_cache_for_dcp_hybrid = (
             enable_caching
             and dcp_world_size > 1
             and pcp_world_size == 1
-            and (
-                is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
-                or has_dcp_replicated_group
-            )
+            and is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
         )
         if not self.disable_prefix_cache_for_dcp_hybrid:
             assert all(
@@ -618,6 +614,49 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             if group.use_eagle:
                 for gid in group.group_ids:
                     self.single_type_managers[gid].use_eagle = True
+
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> list[int]:
+        if (
+            self.dcp_world_size > 1
+            and self.pcp_world_size == 1
+            and self.has_dcp_replicated_group
+        ):
+            # This value drives cascade attention metadata, not prefix-cache
+            # lookup. A DFlash hybrid has sharded target KV plus replicated
+            # sliding-window draft KV. Reporting target common-prefix blocks
+            # while the draft group reports zero can enable cascade attention
+            # for only part of the hybrid execution. Prefix-cache reuse remains
+            # handled by find_longest_cache_hit(), where each group returns the
+            # concrete blocks it can safely replay (including draft tail blocks
+            # and null padding for evicted context).
+            return [0] * len(self.kv_cache_config.kv_cache_groups)
+        return super().get_num_common_prefix_blocks(running_request_id)
+
+    def _cache_hash_block_size(self, kv_cache_spec: KVCacheSpec) -> int:
+        """Return the token granularity used to hash this group's cache blocks.
+
+        DCP-sharded KV groups allocate/cache one scheduler-visible block per
+        DCP/PCP partition. Their block hash must therefore use the expanded
+        block size. DCP-replicated draft groups keep the model block size and
+        replay only their sliding-window tail.
+        """
+        block_size = kv_cache_spec.block_size
+        if (
+            self.dcp_world_size * self.pcp_world_size > 1
+            and not getattr(kv_cache_spec, "dcp_replicated", False)
+        ):
+            block_size *= self.dcp_world_size * self.pcp_world_size
+        return block_size
+
+    def _block_hashes_for_spec(
+        self, block_hashes: list[BlockHash], kv_cache_spec: KVCacheSpec
+    ) -> BlockHashList:
+        block_size = self._cache_hash_block_size(kv_cache_spec)
+        if block_size == self.hash_block_size:
+            return block_hashes
+        return BlockHashListWithBlockSize(
+            block_hashes, self.hash_block_size, block_size
+        )
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         if self.disable_prefix_cache_for_dcp_hybrid:
@@ -678,13 +717,6 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
             return blocks, 0
 
-        def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            if kv_cache_spec.block_size == self.hash_block_size:
-                return block_hashes
-            return BlockHashListWithBlockSize(
-                block_hashes, self.hash_block_size, kv_cache_spec.block_size
-            )
-
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_length = max_cache_hit_length
         longest_hit_length = 0
@@ -726,7 +758,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         curr_hit_length + spec.block_size, max_cache_hit_length
                     )
                 hit_blocks = manager_cls.find_longest_cache_hit(
-                    block_hashes=_get_block_hashes(spec),
+                    block_hashes=self._block_hashes_for_spec(block_hashes, spec),
                     max_length=_max_length,
                     kv_cache_group_ids=group_ids,
                     block_pool=self.block_pool,
@@ -736,7 +768,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     dcp_world_size=self.dcp_world_size,
                     pcp_world_size=self.pcp_world_size,
                 )
-                _new_hit_length = len(hit_blocks[0]) * spec.block_size
+                effective_block_size = self._cache_hash_block_size(spec)
+                _new_hit_length = len(hit_blocks[0]) * effective_block_size
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
@@ -757,7 +790,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # Truncate full attention blocks to final hit_length (if present)
         first_group = self.attention_groups[0]
         if isinstance(first_group.spec, FullAttentionSpec):
-            num_blocks = hit_length // first_group.spec.block_size
+            num_blocks = hit_length // self._cache_hash_block_size(first_group.spec)
             for group_id in first_group.group_ids:
                 if (blks := hit_blocks_by_group[group_id]) is not None:
                     del blks[num_blocks:]
@@ -780,20 +813,13 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             (blocks_per_group, hit_lengths_per_group)
         """
 
-        def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            if kv_cache_spec.block_size == self.hash_block_size:
-                return block_hashes
-            return BlockHashListWithBlockSize(
-                block_hashes, self.hash_block_size, kv_cache_spec.block_size
-            )
-
         num_groups = len(self.kv_cache_config.kv_cache_groups)
         hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(num_groups)]
         hit_lengths: list[int] = [0] * num_groups
 
         for spec, group_ids, manager_cls, use_eagle in self.attention_groups:
             blocks = manager_cls.find_longest_cache_hit(
-                block_hashes=_get_block_hashes(spec),
+                block_hashes=self._block_hashes_for_spec(block_hashes, spec),
                 max_length=max_cache_hit_length,
                 kv_cache_group_ids=group_ids,
                 block_pool=self.block_pool,
@@ -803,7 +829,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 dcp_world_size=self.dcp_world_size,
                 pcp_world_size=self.pcp_world_size,
             )
-            group_hit = len(blocks[0]) * spec.block_size
+            group_hit = len(blocks[0]) * self._cache_hash_block_size(spec)
             for gid, blks in zip(group_ids, blocks):
                 hit_blocks[gid] = blks
                 hit_lengths[gid] = group_hit
