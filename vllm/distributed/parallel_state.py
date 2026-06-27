@@ -1423,7 +1423,16 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+    maybe_dcp_capture = (
+        get_dcp_group().graph_capture(context)
+        if _DCP is not None and get_dcp_group().world_size > 1
+        else nullcontext()
+    )
+    with (
+        get_tp_group().graph_capture(context),
+        get_pp_group().graph_capture(context),
+        maybe_dcp_capture,
+    ):
         yield context
 
 
