@@ -516,7 +516,15 @@ def _prepare_dflash_inputs_kernel(
         mask=is_ctx,
         other=0,
     ).to(tl.int64)
-    ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
+    # Sliding-window draft KV: old context positions can be evicted and point
+    # at the null block. Map those to PAD so the cache-write kernel skips them
+    # instead of clobbering physical block 0.
+    ctx_resident = is_ctx & (ctx_block_id != 0)
+    ctx_slot = tl.where(
+        ctx_resident,
+        ctx_block_id * block_size + (ctx_pos % block_size),
+        PAD_SLOT_ID,
+    )
     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
 

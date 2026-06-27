@@ -544,17 +544,27 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        # Prefix caching under DCP is only disabled for the genuine DeepseekV4
-        # MLA/SWA hybrid. A DCP-replicated draft group keeps its full cache per
-        # rank and can be hashed alongside the sharded target using the GCD
-        # hash block size from resolve_kv_cache_block_sizes().
-        self.disable_prefix_cache_for_dsv4_dcp = (
+        has_dcp_replicated_group = any(
+            getattr(group.kv_cache_spec, "dcp_replicated", False)
+            for group in kv_cache_config.kv_cache_groups
+        )
+        # Prefix caching under DCP is unsafe for hybrid layouts whose groups do
+        # not advance from exactly the same cached prefix. For DeepSeek V4's
+        # MLA/SWA hybrid this was already disabled. DFlash drafts have the same
+        # requirement under DCP: the target KV is sharded, but the draft KV is
+        # replicated per DCP rank. Reusing a target prefix while the draft group
+        # has no matching prefix leaves DFlash verification with inconsistent
+        # KV state and can surface later as a CUDA illegal memory access.
+        self.disable_prefix_cache_for_dcp_hybrid = (
             enable_caching
             and dcp_world_size > 1
             and pcp_world_size == 1
-            and is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+            and (
+                is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
+                or has_dcp_replicated_group
+            )
         )
-        if not self.disable_prefix_cache_for_dsv4_dcp:
+        if not self.disable_prefix_cache_for_dcp_hybrid:
             assert all(
                 mgr.block_size % hash_block_size == 0
                 for mgr in self.single_type_managers
@@ -562,7 +572,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         assert (
             dcp_world_size == 1
             or not is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
-            or self.disable_prefix_cache_for_dsv4_dcp
+            or self.disable_prefix_cache_for_dcp_hybrid
         ), "DCP prefix caching unsupported for the DeepseekV4 MLA/SWA hybrid."
         assert pcp_world_size == 1, "PCP not support hybrid attn now."
         self.verify_and_split_kv_cache_groups()
@@ -610,7 +620,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     self.single_type_managers[gid].use_eagle = True
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
-        if self.disable_prefix_cache_for_dsv4_dcp:
+        if self.disable_prefix_cache_for_dcp_hybrid:
             return
 
         # Cache hits in this coordinator are always a multiple of
@@ -662,7 +672,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 - A tuple of the cache hit blocks for each single type manager.
                 - The number of tokens of the longest cache hit.
         """
-        if self.disable_prefix_cache_for_dsv4_dcp:
+        if self.disable_prefix_cache_for_dcp_hybrid:
             blocks: tuple[list[KVCacheBlock], ...] = tuple(
                 [] for _ in range(len(self.kv_cache_config.kv_cache_groups))
             )
@@ -723,6 +733,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_spec=spec,
                     drop_eagle_block=drop_eagle_block,
                     alignment_tokens=self.scheduler_block_size,
+                    dcp_world_size=self.dcp_world_size,
+                    pcp_world_size=self.pcp_world_size,
                 )
                 _new_hit_length = len(hit_blocks[0]) * spec.block_size
                 if drop_eagle_block:
@@ -788,6 +800,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 kv_cache_spec=spec,
                 drop_eagle_block=use_eagle,
                 alignment_tokens=self.scheduler_block_size,
+                dcp_world_size=self.dcp_world_size,
+                pcp_world_size=self.pcp_world_size,
             )
             group_hit = len(blocks[0]) * spec.block_size
             for gid, blks in zip(group_ids, blocks):
