@@ -104,6 +104,9 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
+    set_dspark_aux_hidden_state_layers,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
@@ -221,8 +224,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
 
-            if self.speculative_config.method in ("eagle3", "dflash"):
-                # EAGLE3/DFlash require auxiliary hidden states from target
+            if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
+                # EAGLE3/DFlash/DSpark require auxiliary hidden states from target
                 # model outputs.
                 self.use_aux_hidden_state_outputs = True
                 if self.use_pp:
@@ -320,7 +323,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                if self.speculative_config.method == "dspark":
+                    set_dspark_aux_hidden_state_layers(
+                        self.model, self.speculative_config
+                    )
+                else:
+                    set_eagle3_aux_hidden_state_layers(
+                        self.model, self.speculative_config
+                    )
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(
@@ -507,6 +517,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
         )
+        draft_tokens_for_next_step = None
         if self.speculator is not None:
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
@@ -1575,7 +1586,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             with record_function_or_nullcontext(
                 f"vllm:v2/speculator/{phase}/store_draft_tokens"
             ):
-                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                if draft_tokens.shape[1] == self.num_speculative_steps:
+                    self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                    draft_tokens_for_next_step = self.req_states.draft_tokens[
+                        input_batch.idx_mapping
+                    ]
+                elif draft_tokens.shape[1] == 0:
+                    # Some block speculators can intentionally decline to draft
+                    # on the next step (for example after a full rejection while
+                    # their private KV state is being realigned). Keep the
+                    # persistent fixed-width buffer untouched, but report an
+                    # empty draft list to the scheduler for the next iteration.
+                    draft_tokens_for_next_step = draft_tokens
+                else:
+                    raise RuntimeError(
+                        "Speculator returned unsupported draft shape "
+                        f"{tuple(draft_tokens.shape)}; expected "
+                        f"(*, {self.num_speculative_steps}) or (*, 0)."
+                    )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
@@ -1585,7 +1613,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 self.draft_tokens_handler.set_draft_tokens(
                     input_batch,
-                    self.req_states.draft_tokens[input_batch.idx_mapping],
+                    draft_tokens_for_next_step
+                    if draft_tokens_for_next_step is not None
+                    else self.req_states.draft_tokens[input_batch.idx_mapping],
                 )
 
         # Post-step KV connector related operations.
