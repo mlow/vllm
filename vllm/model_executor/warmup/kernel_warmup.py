@@ -9,9 +9,11 @@ happen during model execution.
 from typing import TYPE_CHECKING
 
 import torch
+from torch import nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.mxfp8.b12x import warmup_b12x_mxfp8_linear
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
@@ -24,6 +26,9 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
+from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+    minimax_m3_msa_warmup,
+)
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import is_deep_gemm_supported
 from vllm.utils.flashinfer import has_flashinfer
@@ -35,20 +40,102 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def kernel_warmup(worker: "Worker"):
-    from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
-        minimax_m3_msa_warmup,
+def _is_flashinfer_backend(backend) -> bool:
+    try:
+        return backend.get_name() == "FLASHINFER"
+    except NotImplementedError:
+        return False
+
+
+def _is_flashinfer_object(obj: object) -> bool:
+    cls = obj.__class__
+    name = cls.__name__.lower()
+    module = cls.__module__.lower()
+    return "flashinfer" in name or "flashinfer" in module
+
+
+def _contains_flashinfer_object(
+    obj: object,
+    *,
+    depth: int = 0,
+    seen: set[int] | None = None,
+) -> bool:
+    if obj is None or isinstance(obj, (str, bytes, int, float, bool, torch.Tensor)):
+        return False
+    if _is_flashinfer_object(obj):
+        return True
+    if depth >= 3:
+        return False
+    if seen is None:
+        seen = set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return False
+    seen.add(obj_id)
+
+    if isinstance(obj, nn.Module):
+        return False
+    if isinstance(obj, dict):
+        values = obj.values()
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        values = obj
+    elif hasattr(obj, "__dict__"):
+        values = vars(obj).values()
+    else:
+        return False
+
+    return any(
+        _contains_flashinfer_object(value, depth=depth + 1, seen=seen)
+        for value in values
     )
 
-    # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
-    # layer per token; warm them across token sizes first so the first real
-    # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
+
+def _uses_flashinfer_attention(runner: "GPUModelRunner") -> bool:
+    return bool(
+        runner.attn_groups
+        and any(
+            _is_flashinfer_backend(group.backend)
+            for groups in runner.attn_groups
+            for group in groups
+        )
+    )
+
+
+def _uses_flashinfer_model_kernels(model: nn.Module) -> bool:
+    for module in model.modules():
+        if _is_flashinfer_object(module):
+            return True
+        if any(
+            _contains_flashinfer_object(value)
+            for value in vars(module).values()
+            if not isinstance(value, nn.Module)
+        ):
+            return True
+    return False
+
+
+def _uses_flashinfer_compute_kernels(worker: "Worker") -> bool:
+    return _uses_flashinfer_attention(
+        worker.model_runner
+    ) or _uses_flashinfer_model_kernels(worker.get_model())
+
+
+def kernel_warmup(worker: "Worker"):
+    mhc_warmup_token_sizes = list(
+        worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+    )
+    max_num_scheduled_tokens = worker.scheduler_config.max_num_scheduled_tokens
+    if max_num_scheduled_tokens is not None:
+        mhc_warmup_token_sizes.append(max_num_scheduled_tokens)
+
+    # DSv4 mHC kernels run every decoder layer per token; warm them across
+    # token sizes first so the first real request doesn't pay JIT cost. No-op
+    # for non-DSv4 models (gated inside); still warms the boundary TileLang
+    # kernels used by the b12x mHC forward path.
     deepseek_v4_mhc_warmup(
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
-        cudagraph_capture_sizes=(
-            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
-        ),
+        cudagraph_capture_sizes=mhc_warmup_token_sizes,
     )
 
     # Run next so input-prep kernels JIT against pristine runner state.
@@ -66,6 +153,21 @@ def kernel_warmup(worker: "Worker"):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
+    warmed_mxfp8 = warmup_b12x_mxfp8_linear(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=(
+            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+        ),
+        output_dtype=getattr(
+            getattr(worker, "model_config", None),
+            "dtype",
+            torch.bfloat16,
+        ),
+    )
+    if warmed_mxfp8:
+        logger.info("Warmed up %d B12X MXFP8 linear GEMM signatures.", warmed_mxfp8)
+
     minimax_m3_msa_warmup(worker)
 
     enable_flashinfer_autotune = (
@@ -74,18 +176,23 @@ def kernel_warmup(worker: "Worker"):
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
-    elif has_flashinfer() and current_platform.has_device_capability(90):
+    elif not has_flashinfer():
+        logger.info("Skipping FlashInfer autotune because FlashInfer is unavailable.")
+    elif not current_platform.has_device_capability(90):
+        logger.info(
+            "Skipping FlashInfer autotune because the device capability is below 90."
+        )
+    elif not _uses_flashinfer_compute_kernels(worker):
+        logger.info(
+            "Skipping FlashInfer autotune because no FlashInfer compute kernels "
+            "are active."
+        )
+    else:
         flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
-    def _is_flashinfer_backend(backend):
-        try:
-            return backend.get_name() == "FLASHINFER"
-        except NotImplementedError:
-            return False
-
     if (
         not worker.model_runner.is_pooling_model
         and worker.model_runner.attn_groups
@@ -181,7 +288,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             "Falling back to default tactics."
         )
     else:
-        write_flashinfer_autotune_cache(cache_path, tune_results)
+        if not is_leader and world.local_rank == 0:
+            write_flashinfer_autotune_cache(cache_path, tune_results)
         world.barrier()
         from flashinfer.autotuner import AutoTuner
 
