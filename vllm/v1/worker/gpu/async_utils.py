@@ -57,6 +57,10 @@ class AsyncOutput(AsyncModelRunnerOutput):
         num_sampled_tokens: list[int] = self.num_sampled_tokens_np.tolist()
         for token_ids, num_tokens in zip(sampled_token_ids, num_sampled_tokens):
             del token_ids[num_tokens:]
+            for i, token_id in enumerate(token_ids):
+                if token_id < 0:
+                    del token_ids[i:]
+                    break
         self.model_runner_output.sampled_token_ids = sampled_token_ids
 
         if self.num_nans is not None:

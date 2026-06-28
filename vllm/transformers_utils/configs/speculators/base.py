@@ -128,8 +128,11 @@ class SpeculatorsConfig(PretrainedConfig):
             )
 
         # Build base vLLM speculative configuration
+        method = config_dict.get("speculators_model_type")
+        if method == "dflash_sparse_mla":
+            method = "causal_cascade"
         result = {
-            "method": config_dict.get("speculators_model_type"),
+            "method": method,
             "num_speculative_tokens": num_speculative_tokens,
         }
         if result["method"] == "peagle":

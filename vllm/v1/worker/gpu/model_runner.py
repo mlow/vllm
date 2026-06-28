@@ -225,9 +225,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
 
-            if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
-                # EAGLE3/DFlash/DSpark require auxiliary hidden states from target
-                # model outputs.
+            if self.speculative_config.method in (
+                "eagle3",
+                "dflash",
+                "dspark",
+                "causal_cascade",
+            ):
+                # EAGLE3/DFlash/DSpark/CausalCascade require auxiliary hidden
+                # states from target model outputs.
                 self.use_aux_hidden_state_outputs = True
                 if self.use_pp:
                     raise ValueError(
@@ -323,7 +328,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             if self.use_aux_hidden_state_outputs:
                 assert self.speculative_config is not None
-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                if self.speculative_config.method == "causal_cascade":
+                    setter = getattr(
+                        self.model, "set_dflash_anchor_hidden_state_output", None
+                    )
+                    if setter is None:
+                        raise RuntimeError(
+                            "Sparse-MLA CausalCascade requires model support for "
+                            "final pre-norm hidden-state output."
+                        )
+                    setter(True)
+                else:
+                    set_eagle3_aux_hidden_state_layers(
+                        self.model, self.speculative_config
+                    )
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(

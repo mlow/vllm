@@ -180,3 +180,16 @@ def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
     ):
         if config_dict.get(key) is not None:
             pre_trained_config[key] = config_dict[key]
+
+
+@register_speculator("dflash_sparse_mla")
+def update_dflash_sparse_mla(config_dict: dict, pre_trained_config: dict) -> None:
+    """Map training-side sparse-MLA DFlash checkpoints to CausalCascade."""
+
+    transformer_layer_config = dict(config_dict.get("transformer_layer_config") or {})
+    for key, value in config_dict.items():
+        if key == "transformer_layer_config":
+            continue
+        pre_trained_config[key] = value
+    pre_trained_config["transformer_layer_config"] = transformer_layer_config
+    pre_trained_config["architectures"] = ["CausalCascadeDraftModel"]

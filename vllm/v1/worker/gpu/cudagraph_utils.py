@@ -318,9 +318,7 @@ class CudaGraphManager:
                     )
                     if desc not in descs_by_mode[decode_mode]:
                         descs_by_mode[decode_mode].append(desc)
-                        descs_by_token_lora[(num_tokens, num_active_loras)].append(
-                            desc
-                        )
+                        descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
 
         if not descs_by_token_lora:
             return
@@ -410,9 +408,12 @@ class CudaGraphManager:
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
-                        with guard_b12x_kernel_resolution(
-                            "vLLM full CUDA graph capture after B12X warmup"
-                        ), torch.cuda.graph(graph, self.pool):
+                        with (
+                            guard_b12x_kernel_resolution(
+                                "vLLM full CUDA graph capture after B12X warmup"
+                            ),
+                            torch.cuda.graph(graph, self.pool),
+                        ):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
                             # unjoined stream error. The last layer's start_prefetch
@@ -589,6 +590,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
+                    dflash_input_ids=input_buffers.input_ids[:num_tokens],
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside

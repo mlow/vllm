@@ -52,14 +52,11 @@ class DraftTokensHandler:
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
-        if not input_batch.has_structured_output_reqs:
-            # No draft token validation needs to be performed by
-            # the scheduler for this batch.
-            self.draft_tokens_np = None
-            return
 
-        # For spec decoding + structured outputs, we must transfer the
-        # draft tokens back to the scheduler for grammar validation.
+        # The scheduler needs the real draft lengths. Some speculators use
+        # -1 as a sentinel for fallback/no-draft slots; sending placeholder
+        # -1 values back to the scheduler can cause them to be scheduled as
+        # verifier inputs on the next step.
         current_stream = torch.cuda.current_stream(self.device)
         self.copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.copy_stream):
@@ -77,6 +74,11 @@ class DraftTokensHandler:
         else:
             # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
+        for token_ids in draft_token_ids:
+            for i, token_id in enumerate(token_ids):
+                if token_id < 0:
+                    del token_ids[i:]
+                    break
         return DraftTokenIds(self.req_ids, draft_token_ids)
 
 

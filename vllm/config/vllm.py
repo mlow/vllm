@@ -2155,15 +2155,17 @@ class VllmConfig:
                 "mtp",
                 "dflash",
                 "dspark",
+                "causal_cascade",
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
-            # DFlash and DSpark use parallel drafting natively in V2 via their
-            # own speculators.
+            # DFlash, DSpark, and CausalCascade use parallel drafting in their
+            # speculators that draft the whole block in one pass.
             if (
                 speculative_config.parallel_drafting
-                and speculative_config.method not in ("dflash", "dspark")
+                and speculative_config.method
+                not in ("dflash", "dspark", "causal_cascade")
             ):
                 unsupported.append("parallel drafting for EAGLE speculative decoding")
 

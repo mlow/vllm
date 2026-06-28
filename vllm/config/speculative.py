@@ -10,8 +10,8 @@ from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
-from vllm.config.kernel import MoEBackend
 from vllm.config.cache import CacheDType
+from vllm.config.kernel import MoEBackend
 from vllm.config.model import HfOverrides, ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.utils import config
@@ -59,8 +59,14 @@ MTPModelTypes = Literal[
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
+CausalCascadeModelTypes = Literal["causal_cascade"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
+    CausalCascadeModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -316,6 +322,7 @@ class SpeculativeConfig:
             "extract_hidden_states",
             "dflash",
             "dspark",
+            "causal_cascade",
         )
         factors.append(uses_aux_hidden_states)
 
@@ -333,9 +340,7 @@ class SpeculativeConfig:
                 # captured aux ids are shifted by one (hidden_states[0] is the
                 # embedding output), matching eagle3_utils.
                 dflash_config = (
-                    getattr(
-                        self.draft_model_config.hf_config, "dflash_config", None
-                    )
+                    getattr(self.draft_model_config.hf_config, "dflash_config", None)
                     or {}
                 )
                 target_layer_ids = dflash_config.get("target_layer_ids")
@@ -881,7 +886,13 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in (
+                    "eagle",
+                    "eagle3",
+                    "dflash",
+                    "dspark",
+                    "causal_cascade",
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -892,6 +903,12 @@ class SpeculativeConfig:
                     self.method = "eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
+                elif (
+                    "causalcascade" in self.draft_model_config.model.lower()
+                    or "causal-cascade" in self.draft_model_config.model.lower()
+                    or "dflash_sparse_mla" in self.draft_model_config.model.lower()
+                ):
+                    self.method = "causal_cascade"
                 elif "dflash" in self.draft_model_config.model.lower():
                     self.method = "dflash"
                 elif (
@@ -956,7 +973,7 @@ class SpeculativeConfig:
                     ]
                     self.update_arch_()
 
-                if self.method in ("dflash", "dspark"):
+                if self.method in ("dflash", "dspark", "causal_cascade"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -1300,13 +1317,29 @@ class SpeculativeConfig:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        return self.method in (
+            "eagle",
+            "eagle3",
+            "mtp",
+            "dflash",
+            "dspark",
+            "causal_cascade",
+        )
+
+    def requires_eagle_cache_drop(self) -> bool:
+        """Whether prefix cache hits must drop one block for hidden states."""
+        return self.use_eagle() and not (
+            self.use_dflash() or self.use_dspark() or self.use_causal_cascade()
+        )
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 
     def use_dspark(self) -> bool:
         return self.method == "dspark"
+
+    def use_causal_cascade(self) -> bool:
+        return self.method == "causal_cascade"
 
     def uses_batch_size_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

@@ -504,17 +504,23 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if (
+            self.check_for_draft_tokens
+            and self.async_scheduling
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            self._update_draft_token_ids_from_executor()
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
+    def _update_draft_token_ids_from_executor(self) -> None:
+        draft_token_ids = self.model_executor.take_draft_token_ids()
+        if draft_token_ids is not None:
+            self.scheduler.update_draft_token_ids(draft_token_ids)
+
     def post_step(self, model_executed: bool) -> None:
-        # When using async scheduling we can't get draft token ids in advance,
-        # so we update draft token ids in the worker process and don't
-        # need to update draft token ids here.
         if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
-            draft_token_ids = self.model_executor.take_draft_token_ids()
-            if draft_token_ids is not None:
-                self.scheduler.update_draft_token_ids(draft_token_ids)
+            self._update_draft_token_ids_from_executor()
 
     def step_with_batch_queue(
         self,
@@ -605,6 +611,12 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if (
+            self.check_for_draft_tokens
+            and self.async_scheduling
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            self._update_draft_token_ids_from_executor()
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is

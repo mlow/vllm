@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 import torch
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -257,6 +256,7 @@ class FlashInferMLASparseMetadata(AttentionMetadata):
     seq_lens: torch.Tensor
     num_decodes: int
     num_decode_tokens: int
+    cache_seq_lens_per_token: torch.Tensor
 
     # Sparse-specific
     block_size: int = 64
@@ -298,6 +298,11 @@ class FlashInferMLASparseMetadataBuilder(
             dtype=torch.int32,
             device=device,
         )
+        self.cache_seq_lens_per_token_buffer = torch.empty(
+            (vllm_config.scheduler_config.max_num_batched_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
 
     def build(
         self,
@@ -328,6 +333,20 @@ class FlashInferMLASparseMetadataBuilder(
         )
         req_id_per_token_tensor = self.req_id_per_token_buffer[:num_tokens]
 
+        self.cache_seq_lens_per_token_buffer.fill_(0)
+        if cm.positions is not None and cm.positions.ndim == 1:
+            cache_seq_lens_per_token = cm.positions[:num_tokens].to(torch.int32) + 1
+        else:
+            cache_seq_lens_per_token = cm.seq_lens.index_select(
+                0, req_id_per_token_tensor.to(torch.long)
+            ).to(torch.int32)
+        self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
+            cache_seq_lens_per_token, non_blocking=True
+        )
+        cache_seq_lens_per_token_tensor = self.cache_seq_lens_per_token_buffer[
+            :num_tokens
+        ]
+
         return FlashInferMLASparseMetadata(
             num_reqs=cm.num_reqs,
             max_query_len=cm.max_query_len,
@@ -340,6 +359,7 @@ class FlashInferMLASparseMetadataBuilder(
             seq_lens=cm.seq_lens,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            cache_seq_lens_per_token=cache_seq_lens_per_token_tensor,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
             cp_kv_cache_interleave_size=(
@@ -376,6 +396,52 @@ def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
         )
         _fi_sparse_workspace_by_device[device] = workspace
     return workspace
+
+
+def _maybe_capture_causal_cascade_sparse_mla(
+    layer: AttentionLayer,
+    kv_c_and_k_pe_cache: torch.Tensor,
+    page_table_1: torch.Tensor,
+    topk_indices: torch.Tensor,
+    nsa_cache_seqlens: torch.Tensor,
+    cache_seq_lens_per_token: torch.Tensor,
+    req_id_per_token: torch.Tensor,
+    num_actual_toks: int,
+) -> None:
+    layer_name = getattr(layer, "layer_name", None)
+    if layer_name is None:
+        layer_index = getattr(layer, "layer_idx", None)
+        if layer_index is not None:
+            try:
+                layer_name = f"layers.{int(layer_index)}"
+            except (TypeError, ValueError):
+                return
+    if layer_name is None:
+        return
+
+    from vllm.v1.worker.gpu.spec_decode.causal_cascade import (
+        live_state as causal_cascade_live_state,
+    )
+
+    if causal_cascade_live_state.get_causal_cascade_live_state() is None:
+        return
+
+    from vllm.forward_context import get_forward_context
+
+    dflash_input_ids = get_forward_context().additional_kwargs.get("dflash_input_ids")
+    if dflash_input_ids is not None:
+        dflash_input_ids = dflash_input_ids[:num_actual_toks]
+    causal_cascade_live_state.capture_causal_cascade_sparse_mla_layer(
+        str(layer_name),
+        kv_c_and_k_pe_cache,
+        page_table_1,
+        topk_indices,
+        nsa_cache_seqlens,
+        cache_seq_lens_per_token[:num_actual_toks],
+        req_id_per_token[:num_actual_toks],
+        dflash_input_ids,
+        num_actual_toks,
+    )
 
 
 class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata]):
@@ -483,6 +549,16 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
                 NUM_TOPK_TOKENS=topk_indices.shape[1],
                 return_valid_counts=True,
             )
+        _maybe_capture_causal_cascade_sparse_mla(
+            layer,
+            kv_c_and_k_pe_cache,
+            topk_indices_physical,
+            topk_indices,
+            seq_lens,
+            attn_metadata.cache_seq_lens_per_token,
+            attn_metadata.req_id_per_token,
+            num_actual_toks,
+        )
 
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(q.device)
