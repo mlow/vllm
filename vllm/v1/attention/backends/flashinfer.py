@@ -4,7 +4,7 @@
 
 from dataclasses import dataclass
 from functools import partial
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import (
     can_use_trtllm_attention,
+    supports_trtllm_attention,
     use_trtllm_attention,
 )
 from vllm.utils.math_utils import cdiv
@@ -350,7 +351,7 @@ class FlashInferBackend(AttentionBackend):
                 num_kv_heads > 0
                 and num_qo_heads // num_kv_heads > 1
                 and can_use_trtllm_attention(num_qo_heads, num_kv_heads)
-            )
+        )
         if not use_large_pages:
             return [16, 32, 64]
         return [16, 32, 64, 128, 256, 512, 1024]
@@ -362,6 +363,17 @@ class FlashInferBackend(AttentionBackend):
     @classmethod
     def supports_non_causal(cls) -> bool:
         return True
+
+    @classmethod
+    def get_metadata_group_key(cls, attn_layer: Any) -> tuple[Any, ...]:
+        impl = attn_layer.impl
+        scale = getattr(impl, "scale", None)
+        return (
+            getattr(impl, "window_left", None),
+            getattr(impl, "logits_soft_cap", None),
+            float(scale) if scale is not None else None,
+            getattr(impl, "sinks", None) is not None,
+        )
 
     @staticmethod
     def get_impl_cls() -> type["FlashInferImpl"]:
@@ -432,6 +444,27 @@ class FlashInferBackend(AttentionBackend):
         return capability >= DeviceCapability(8, 0) and capability <= DeviceCapability(
             12, 1
         )
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int | None,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        use_mm_prefix: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if (
+            block_size is not None
+            and block_size >= 128
+            and not supports_trtllm_attention()
+        ):
+            return "page size >= 128 requires trtllm-gen attention"
+        return None
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -578,9 +611,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._prefill_wrapper: (
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
-        self._noncausal_prefill_wrapper: BatchPrefillWithPagedKVCacheWrapper | None = (
-            None  # Wrapper for non-causal prefill (DFlash)
-        )
+        self._noncausal_prefill_wrapper: (
+            BatchPrefillWithPagedKVCacheWrapper | None
+        ) = None  # Wrapper for non-causal prefill (DFlash)
         self._decode_wrapper = None  # Wrapper for decode (general shape)
 
         if envs.VLLM_BATCH_INVARIANT:
@@ -675,11 +708,30 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # if TRTLLM attention kernel is not used when building attn metadata
         can_use_trtllm = can_use_trtllm_attention(self.num_qo_heads, self.num_kv_heads)
 
-        # Page sizes >= 128 require the trtllm-gen GQA/MQA path (guaranteed by
-        # get_supported_kernel_block_sizes).
-        assert self.page_size <= 64 or (
-            can_use_trtllm and self.num_qo_heads // self.num_kv_heads > 1
-        ), f"Unexpected FlashInfer page size {self.page_size} without trtllm-gen GQA"
+        # Page sizes >= 128 are served only by the trtllm-gen dynamic kernel,
+        # which requires Blackwell + GQA/MQA (num_qo_heads // num_kv_heads > 1),
+        # not MHA. We do not fall back to the FI native (FA2) kernels for large
+        # pages. Fail fast here rather than mid-serving. (Sizes returned by
+        # get_supported_kernel_block_sizes() are all power-of-2.)
+        if self.page_size >= 128:
+            if self.attention_config.use_trtllm_attention is False:
+                raise ValueError(
+                    f"FlashInfer page size {self.page_size} requires the "
+                    "trtllm-gen backend, but "
+                    "--attention-config.use_trtllm_attention is set to 0."
+                )
+            if not can_use_trtllm:
+                raise NotImplementedError(
+                    f"FlashInfer page size {self.page_size} requires the "
+                    "trtllm-gen backend (Blackwell with NVIDIA artifactory "
+                    "access and num_qo_heads % num_kv_heads == 0)."
+                )
+            if self.num_qo_heads // self.num_kv_heads <= 1:
+                raise NotImplementedError(
+                    f"FlashInfer page size {self.page_size} is only supported "
+                    "by the trtllm-gen dynamic kernel, which requires GQA/MQA "
+                    "(num_qo_heads // num_kv_heads > 1), not MHA."
+                )
 
         if (
             can_use_trtllm
@@ -810,10 +862,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     "NVFP4 KV cache."
                 )
             if self._noncausal_prefill_wrapper is None:
-                self._noncausal_prefill_wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                    self._get_workspace_buffer(),
-                    get_kv_cache_layout(),
-                    backend="auto",
+                self._noncausal_prefill_wrapper = (
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self._get_workspace_buffer(),
+                        get_kv_cache_layout(),
+                        backend="auto",
+                    )
                 )
             return self._noncausal_prefill_wrapper
 
@@ -977,30 +1031,45 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # - Decode (FI native or TRTLLM)
         use_cascade = common_prefix_len > 0
         uses_spec_reorder = self.reorder_batch_threshold > 1
-        # Page sizes >= 128 must use trtllm-gen; force it for prefill too.
+        # Page sizes >= 128 require the trtllm-gen path (the init guard verified
+        # GQA/MQA on Blackwell); force trtllm for prefill too so it does not
+        # fall back to the native wrapper. <= 64 keeps auto-detection.
         prefill_force_trtllm = (
             True if page_size >= 128 else self.attention_config.use_trtllm_attention
         )
-        prefill_use_trtllm = causal and use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
+        prefill_use_trtllm = (
+            causal
+            and use_trtllm_attention(
+                self.num_qo_heads,
+                self.num_kv_heads,
+                num_prefill_tokens,
+                max_seq_len,
+                self.dcp_world_size,
+                self.cache_dtype,
+                self.q_data_type,
+                is_prefill=True,
+                force_use_trtllm=prefill_force_trtllm,
+                has_sinks=self.has_sinks,
+                has_spec=uses_spec_reorder,
+            )
         )
         decode_use_trtllm = (
-            causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+            causal
+            and self.use_trtllm_decode_attention
+            and self.dcp_world_size <= 1
         )
 
         if not causal and self.use_dcp:
             raise NotImplementedError(
                 "FlashInfer non-causal prefill is not supported with DCP yet."
+            )
+        uses_trtllm = (num_prefills > 0 and prefill_use_trtllm) or (
+            num_decodes > 0 and decode_use_trtllm
+        )
+        if not causal and uses_trtllm:
+            raise NotImplementedError(
+                "FlashInfer non-causal attention is not supported with TRTLLM "
+                "kernels yet."
             )
         if not causal and self.use_trtllm_decode_attention:
             logger.warning_once(
