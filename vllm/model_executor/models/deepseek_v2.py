@@ -1540,6 +1540,7 @@ class DeepseekV2Model(nn.Module):
         )
 
         self.aux_hidden_state_layers = tuple[int, ...]()
+        self.output_dflash_anchor_hidden_state = False
 
         # Needed by load_weights
         qk_nope_head_dim = getattr(config, "qk_nope_head_dim", 0)
@@ -1636,7 +1637,11 @@ class DeepseekV2Model(nn.Module):
             # fused_add_rms_norm requires a contiguous residual
             residual = residual.contiguous()
 
-        if self.end_layer in self.aux_hidden_state_layers:
+        if (
+            self.end_layer in self.aux_hidden_state_layers
+            or self.output_dflash_anchor_hidden_state
+        ):
+            assert residual is not None
             aux_hidden_states.append(hidden_states + residual)
 
         hidden_states, _ = self.norm(hidden_states, residual)
@@ -2017,6 +2022,9 @@ class DeepseekV2ForCausalLM(
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
+
+    def set_dflash_anchor_hidden_state_output(self, enabled: bool) -> None:
+        self.model.output_dflash_anchor_hidden_state = bool(enabled)
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)
