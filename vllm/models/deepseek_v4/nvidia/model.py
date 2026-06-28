@@ -80,6 +80,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+
 def _get_virtual_tp_axis_padded_size(config, axis_name: str, default: int) -> int:
     plan = getattr(config, VIRTUAL_TP_PLAN_ATTR, None)
     if not isinstance(plan, dict):
@@ -1562,28 +1563,27 @@ class DeepseekV4Model(nn.Module):
                         if use_dspark_reference_hc:
                             tokens, hc_mult, _ = residual.shape
                             post_ref = post_mix
-                            if (
-                                post_ref.ndim == 2
-                                and post_ref.shape == (hc_mult, tokens)
+                            if post_ref.ndim == 2 and post_ref.shape == (
+                                hc_mult,
+                                tokens,
                             ):
                                 post_ref = post_ref.t().contiguous()
                             comb_ref = res_mix
-                            if (
-                                comb_ref.ndim == 3
-                                and comb_ref.shape == (hc_mult, hc_mult, tokens)
+                            if comb_ref.ndim == 3 and comb_ref.shape == (
+                                hc_mult,
+                                hc_mult,
+                                tokens,
                             ):
                                 comb_ref = comb_ref.permute(2, 0, 1).contiguous()
-                            use_dspark_reference_hc = (
-                                post_ref.shape == (tokens, hc_mult)
-                                and comb_ref.shape == (tokens, hc_mult, hc_mult)
-                            )
+                            use_dspark_reference_hc = post_ref.shape == (
+                                tokens,
+                                hc_mult,
+                            ) and comb_ref.shape == (tokens, hc_mult, hc_mult)
                         if use_dspark_reference_hc:
                             aux_hc_states = (
-                                post_ref.unsqueeze(-1)
-                                * hidden_states.unsqueeze(-2)
+                                post_ref.unsqueeze(-1) * hidden_states.unsqueeze(-2)
                                 + torch.sum(
-                                    comb_ref.unsqueeze(-1)
-                                    * residual.unsqueeze(-2),
+                                    comb_ref.unsqueeze(-1) * residual.unsqueeze(-2),
                                     dim=2,
                                 )
                             ).type_as(hidden_states)

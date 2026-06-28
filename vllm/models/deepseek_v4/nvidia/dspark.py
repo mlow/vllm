@@ -9,6 +9,7 @@ the runtime can be implemented incrementally without accidentally falling back
 to serial MTP.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -39,14 +40,15 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     _decode_e8m0_scales,
@@ -137,7 +139,8 @@ def _maybe_save_tensor_debug(
     os.makedirs(debug_dir, exist_ok=True)
     rank = get_tensor_model_parallel_rank()
     existing = sorted(
-        name for name in os.listdir(debug_dir)
+        name
+        for name in os.listdir(debug_dir)
         if name.startswith(f"rank{rank:02d}_") and name.endswith(".pt")
     )
     if len(existing) >= max_dumps:
@@ -167,7 +170,7 @@ def _build_dspark_topk_idxs(
     window_size: int,
     batch_size: int,
     block_size: int,
-    start_pos: int,
+    positions: torch.Tensor,
     device: torch.device,
 ) -> torch.Tensor:
     """Build DSpark's rolling-window+draft attention index tensor.
@@ -175,16 +178,75 @@ def _build_dspark_topk_idxs(
     The public DSpark reference uses exactly this dense gather contract: all
     available target-window positions followed by the local draft block rows.
     """
-    if start_pos <= 0:
-        raise ValueError("DSpark decode top-k indices require start_pos > 0.")
-    target_rows = min(window_size, start_pos + 1)
-    matrix = torch.cat(
-        [
-            torch.arange(target_rows, device=device, dtype=torch.int32),
-            window_size + torch.arange(block_size, device=device, dtype=torch.int32),
-        ]
+    target = torch.arange(window_size, device=device, dtype=torch.int32)
+    valid_target = target.view(1, 1, window_size) <= positions.to(torch.int32).view(
+        batch_size, 1, 1
     )
-    return matrix.view(1, 1, -1).expand(batch_size, block_size, -1).contiguous()
+    target_idxs = torch.where(
+        valid_target,
+        target.view(1, 1, window_size),
+        target.new_full((1, 1, window_size), -1),
+    )
+    target_idxs = target_idxs.expand(batch_size, block_size, window_size)
+    draft_idxs = (
+        window_size + torch.arange(block_size, device=device, dtype=torch.int32)
+    ).view(1, 1, block_size)
+    draft_idxs = draft_idxs.expand(batch_size, block_size, block_size)
+    return torch.cat([target_idxs, draft_idxs], dim=-1).contiguous()
+
+
+@triton.jit
+def _store_dspark_context_kv_kernel(
+    cache_ptr,
+    main_kv_ptr,
+    positions_ptr,
+    query_start_loc_ptr,
+    num_rejected_ptr,
+    cache_indices_ptr,
+    cache_stride_batch: tl.constexpr,
+    cache_stride_window: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    main_kv_stride_tokens: tl.constexpr,
+    main_kv_stride_dim: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    tail_idx = tl.program_id(1)
+    dim_block = tl.program_id(2)
+    cache_idx = tl.load(cache_indices_ptr + req_idx).to(tl.int64)
+
+    start = tl.load(query_start_loc_ptr + req_idx)
+    end = tl.load(query_start_loc_ptr + req_idx + 1)
+    rejected = tl.load(num_rejected_ptr + req_idx)
+    valid_end = end - rejected
+    valid_len = tl.maximum(valid_end - start, 0)
+    tail_len = tl.minimum(valid_len, WINDOW_SIZE)
+    token_idx = valid_end - tail_len + tail_idx
+    safe_token_idx = tl.maximum(token_idx, 0)
+
+    dims = dim_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    dim_mask = dims < HEAD_DIM
+    valid = tail_idx < tail_len
+
+    pos = tl.load(positions_ptr + safe_token_idx, mask=valid, other=0)
+    slot = pos % WINDOW_SIZE
+    values = tl.load(
+        main_kv_ptr
+        + safe_token_idx * main_kv_stride_tokens
+        + dims * main_kv_stride_dim,
+        mask=valid & dim_mask,
+        other=0.0,
+    )
+    tl.store(
+        cache_ptr
+        + cache_idx * cache_stride_batch
+        + slot * cache_stride_window
+        + dims * cache_stride_dim,
+        values,
+        mask=valid & dim_mask,
+    )
 
 
 def _fake_fp8_e4m3_mxfp_inplace(x: torch.Tensor, block_size: int = 64) -> None:
@@ -338,8 +400,11 @@ def _dequantize_e4m3_e8m0_block_weight(
             "DSpark FP8 block scale shape mismatch: "
             f"expected {expected_scale_shape}, got {tuple(scale.shape)}."
         )
-    expanded_scale = scale.to(torch.float32).repeat_interleave(
-        block_size, dim=0).repeat_interleave(block_size, dim=1)
+    expanded_scale = (
+        scale.to(torch.float32)
+        .repeat_interleave(block_size, dim=0)
+        .repeat_interleave(block_size, dim=1)
+    )
     expanded_scale = expanded_scale[:out_features, :in_features]
     return (weight.to(torch.float32) * expanded_scale).to(out_dtype)
 
@@ -353,7 +418,8 @@ def _fp8_activation_quant_dequant_reference(
     if x.shape[-1] % block_size != 0:
         raise ValueError(
             "DSpark FP8 activation reference requires block-aligned K, got "
-            f"{x.shape[-1]} with block={block_size}.")
+            f"{x.shape[-1]} with block={block_size}."
+        )
     original_shape = x.shape
     xf = x.reshape(-1, x.shape[-1]).float()
     xb = xf.view(xf.shape[0], xf.shape[1] // block_size, block_size)
@@ -379,8 +445,7 @@ def _fp8_block_linear_reference(
         out_dtype=torch.bfloat16,
     )
     x_dq = _fp8_activation_quant_dequant_reference(x)
-    out = x_dq.reshape(-1, x.shape[-1]).float().matmul(
-        weight_bf16.float().t())
+    out = x_dq.reshape(-1, x.shape[-1]).float().matmul(weight_bf16.float().t())
     return out.to(torch.bfloat16).view(*x.shape[:-1], weight.shape[0])
 
 
@@ -407,10 +472,8 @@ def _read_dspark_num_layers(model_path: str, default: int) -> int:
         for name in weight_map:
             parts = name.split(".")
             if len(parts) > 2 and parts[0] == "mtp":
-                try:
+                with contextlib.suppress(ValueError):
                     stage_ids.add(int(parts[1]))
-                except ValueError:
-                    pass
         if stage_ids:
             return max(stage_ids) + 1
     return int(default)
@@ -427,15 +490,16 @@ def _iter_mtp_safetensors(model_path: str) -> Iterable[tuple[str, torch.Tensor]]
     with open(index_path, encoding="utf-8") as f:
         weight_map = json.load(f)["weight_map"]
 
-    files = sorted({filename for name, filename in weight_map.items()
-                    if name.startswith("mtp.")})
+    files = sorted(
+        {filename for name, filename in weight_map.items() if name.startswith("mtp.")}
+    )
     if not files:
         raise ValueError(f"No mtp.* DSpark weights found in {index_path!r}.")
 
     for filename in files:
         path = os.path.join(model_path, filename)
         with safe_open(path, framework="pt", device="cpu") as f:
-            for name in f.keys():
+            for name in f.keys():  # noqa: SIM118
                 if name.startswith("mtp."):
                     yield name, f.get_tensor(name)
 
@@ -519,10 +583,12 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
         self.prefix = prefix
         config = vllm_config.model_config.hf_config
         self._dspark_use_reference_fp8_linears = bool(
-            int(os.getenv("VLLM_DSPARK_REFERENCE_FP8_LINEARS", "0")))
-        self._dspark_use_separate_qkv = bool(
-            int(os.getenv("VLLM_DSPARK_SEPARATE_QKV", "0"))
-        ) or self._dspark_use_reference_fp8_linears
+            int(os.getenv("VLLM_DSPARK_REFERENCE_FP8_LINEARS", "0"))
+        )
+        self._dspark_use_separate_qkv = (
+            bool(int(os.getenv("VLLM_DSPARK_SEPARATE_QKV", "0")))
+            or self._dspark_use_reference_fp8_linears
+        )
         if self._dspark_use_separate_qkv:
             self.attn.wq_a = ReplicatedLinear(
                 config.hidden_size,
@@ -566,8 +632,11 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
                 prefix=f"{prefix}.confidence_head",
             )
             self.hc_head_fn = nn.Parameter(
-                torch.empty(config.hc_mult, config.hc_mult * config.hidden_size,
-                            dtype=torch.float32),
+                torch.empty(
+                    config.hc_mult,
+                    config.hc_mult * config.hidden_size,
+                    dtype=torch.float32,
+                ),
                 requires_grad=False,
             )
             self.hc_head_base = nn.Parameter(
@@ -580,9 +649,7 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
             )
 
         self.dspark_block_size = int(getattr(config, "dspark_block_size", 0) or 0)
-        self.dspark_noise_token_id = int(
-            getattr(config, "dspark_noise_token_id", -1)
-        )
+        self.dspark_noise_token_id = int(getattr(config, "dspark_noise_token_id", -1))
         if self.dspark_block_size <= 0:
             raise ValueError("DSpark requires dspark_block_size in the config.")
         if self.dspark_noise_token_id < 0:
@@ -612,15 +679,12 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
     ) -> torch.Tensor:
         batch_size = main_x.shape[0]
         if self._dspark_use_reference_fp8_linears:
-            kv = self._apply_reference_fp8_linear(
-                "wkv", main_x.view(batch_size, -1))
+            kv = self._apply_reference_fp8_linear("wkv", main_x.view(batch_size, -1))
         elif self._dspark_use_separate_qkv:
             kv = _linear_output(self.attn.wkv(main_x.view(batch_size, -1)))
         else:
-            qr_kv = _linear_output(
-                self.attn.fused_wqa_wkv(main_x.view(batch_size, -1)))
-            _, kv = qr_kv.split([self.attn.q_lora_rank, self.attn.head_dim],
-                                dim=-1)
+            qr_kv = _linear_output(self.attn.fused_wqa_wkv(main_x.view(batch_size, -1)))
+            _, kv = qr_kv.split([self.attn.q_lora_rank, self.attn.head_dim], dim=-1)
         if _dspark_dump_layer_parts_enabled():
             _maybe_save_tensor_debug(
                 "dspark_main_kv_linear",
@@ -660,8 +724,9 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
         batch_size, seq_len, _ = main_x.shape
         window_size = self.attn.window_size
         cache = self.dspark_kv_cache[cache_start : cache_start + batch_size]
-        main_kv = self._compute_main_kv(main_x.reshape(-1, main_x.shape[-1]),
-                                        positions.reshape(-1))
+        main_kv = self._compute_main_kv(
+            main_x.reshape(-1, main_x.shape[-1]), positions.reshape(-1)
+        )
         main_kv = main_kv.view(batch_size, seq_len, self.attn.head_dim)
         tail_len = min(seq_len, window_size)
         tail_kv = main_kv[:, -tail_len:]
@@ -673,6 +738,42 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
             device=main_x.device,
         ).view(batch_size, 1)
         cache[batch_indices, slots] = tail_kv
+
+    def precompute_dspark_context_kv_flat(
+        self,
+        main_x: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_rejected: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """Populate this stage's rolling target-KV window from flat target rows."""
+        if num_reqs <= 0:
+            return
+        main_kv = self._compute_main_kv(main_x, positions).contiguous()
+        block_d = 64
+        grid = (
+            num_reqs,
+            self.attn.window_size,
+            triton.cdiv(self.attn.head_dim, block_d),
+        )
+        _store_dspark_context_kv_kernel[grid](
+            self.dspark_kv_cache,
+            main_kv,
+            positions,
+            query_start_loc,
+            num_rejected,
+            cache_indices,
+            self.dspark_kv_cache.stride(0),
+            self.dspark_kv_cache.stride(1),
+            self.dspark_kv_cache.stride(2),
+            main_kv.stride(0),
+            main_kv.stride(1),
+            HEAD_DIM=self.attn.head_dim,
+            WINDOW_SIZE=self.attn.window_size,
+            BLOCK_D=block_d,
+        )
 
     def cache_dspark_wo_a_bf16(self) -> None:
         """Preserve DSpark's HF-style BF16 WO-A before FP8 kernel repacking.
@@ -689,15 +790,12 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
                 self.attn.n_local_groups * self.attn.o_lora_rank,
                 -1,
             )
-            scale = _decode_e8m0_scales(
-                self.attn.wo_a.weight_scale_inv
-            ).reshape(-1, self.attn.wo_a.weight_scale_inv.shape[-1])
-            cached = (
-                flat_weight.unflatten(0, (-1, 128))
-                .unflatten(-1, (-1, 128))
-                .to(torch.float32)
-                * scale[:, None, :, None].to(torch.float32)
+            scale = _decode_e8m0_scales(self.attn.wo_a.weight_scale_inv).reshape(
+                -1, self.attn.wo_a.weight_scale_inv.shape[-1]
             )
+            cached = flat_weight.unflatten(0, (-1, 128)).unflatten(-1, (-1, 128)).to(
+                torch.float32
+            ) * scale[:, None, :, None].to(torch.float32)
             cached = (
                 cached.flatten(2, 3)
                 .flatten(0, 1)
@@ -731,7 +829,8 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
             layer = getattr(self.attn, attr)
             if not hasattr(layer, "weight_scale_inv"):
                 raise ValueError(
-                    f"DSpark reference FP8 linear {attr} has no block scale.")
+                    f"DSpark reference FP8 linear {attr} has no block scale."
+                )
             weight = layer.weight.detach().clone()
             scale = layer.weight_scale_inv.detach().clone()
             for name, tensor in (
@@ -757,7 +856,8 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
         positions: torch.Tensor,
         x: torch.Tensor,
         main_x: torch.Tensor,
-        start_pos: int,
+        cache_indices: torch.Tensor,
+        start_pos: int | None = None,
     ) -> torch.Tensor:
         batch_size, block_size, hidden_size = x.shape
         if block_size != self.dspark_block_size:
@@ -782,8 +882,7 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
             kv = _linear_output(self.attn.wkv(flat_x))
         else:
             qr_kv = _linear_output(self.attn.fused_wqa_wkv(flat_x))
-            qr, kv = qr_kv.split([self.attn.q_lora_rank, self.attn.head_dim],
-                                 dim=-1)
+            qr, kv = qr_kv.split([self.attn.q_lora_rank, self.attn.head_dim], dim=-1)
         q_normed = self.attn.q_norm(qr)
         if self._dspark_use_reference_fp8_linears:
             q = self._apply_reference_fp8_linear("wq_b", q_normed)
@@ -805,21 +904,17 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
                 },
                 {"layer": self.prefix, "start_pos": start_pos},
             )
-        q = q.view(batch_size * block_size, self.attn.n_local_heads,
-                   self.attn.head_dim)
+        q = q.view(batch_size * block_size, self.attn.n_local_heads, self.attn.head_dim)
         q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.attn.eps)
         q_after_scale_debug = q.clone() if _dspark_dump_layer_parts_enabled() else None
         kv = kv_normed.view(batch_size * block_size, 1, self.attn.head_dim)
 
-        draft_positions = (
-            positions.view(batch_size, 1)
-            + torch.arange(
-                1,
-                block_size + 1,
-                dtype=positions.dtype,
-                device=positions.device,
-            ).view(1, block_size)
-        )
+        draft_positions = positions.view(batch_size, 1) + torch.arange(
+            1,
+            block_size + 1,
+            dtype=positions.dtype,
+            device=positions.device,
+        ).view(1, block_size)
         q = _apply_dspark_rope_hf(
             q,
             draft_positions.reshape(-1),
@@ -846,18 +941,20 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
                 },
                 {"layer": self.prefix, "start_pos": start_pos},
             )
-        q = q.view(batch_size, block_size, self.attn.n_local_heads,
-                   self.attn.head_dim)
+        q = q.view(batch_size, block_size, self.attn.n_local_heads, self.attn.head_dim)
         kv = kv.view(batch_size, block_size, self.attn.head_dim)
 
         window_size = self.attn.window_size
-        self.dspark_kv_cache[:batch_size, start_pos % window_size].copy_(main_kv)
-        all_kv = torch.cat([self.dspark_kv_cache[:batch_size], kv], dim=1)
+        cache_rows = cache_indices.view(batch_size).long()
+        cache_slots = positions.view(batch_size).remainder(window_size).long()
+        self.dspark_kv_cache[cache_rows, cache_slots].copy_(main_kv)
+        cache_window = self.dspark_kv_cache[cache_rows]
+        all_kv = torch.cat([cache_window, kv], dim=1)
         topk_idxs = _build_dspark_topk_idxs(
             window_size=window_size,
             batch_size=batch_size,
             block_size=block_size,
-            start_pos=start_pos,
+            positions=positions.view(batch_size),
             device=x.device,
         )
         if _dspark_dump_layer_parts_enabled():
@@ -869,7 +966,7 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
                     "main_kv": main_kv,
                     "q": q,
                     "kv": kv,
-                    "cache_window": self.dspark_kv_cache[:batch_size],
+                    "cache_window": cache_window,
                     "topk_idxs": topk_idxs,
                 },
                 {"layer": self.prefix, "start_pos": start_pos},
@@ -907,9 +1004,12 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
                 if os.getenv("VLLM_DSPARK_HF_INVERSE_ROPE") == "1"
                 else _fused_inverse_rope_gptj
             )
-            out_ref = inverse_rope(out, draft_positions.reshape(-1),
-                                   self.attn.rotary_emb.cos_sin_cache,
-                                   self.attn.rope_head_dim)
+            out_ref = inverse_rope(
+                out,
+                draft_positions.reshape(-1),
+                self.attn.rotary_emb.cos_sin_cache,
+                self.attn.rope_head_dim,
+            )
             out_ref = out_ref.view(
                 batch_size * block_size,
                 self.attn.n_local_groups,
@@ -972,7 +1072,8 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
         positions: torch.Tensor,
         input_ids: torch.Tensor,
         main_x: torch.Tensor,
-        start_pos: int,
+        cache_indices: torch.Tensor,
+        start_pos: int | None = None,
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
@@ -1025,6 +1126,7 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
             positions,
             x_attn.view(batch_size, block_size, hidden_size),
             main_x,
+            cache_indices,
             start_pos,
         ).reshape(batch_size * block_size, hidden_size)
 
@@ -1043,7 +1145,12 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
             hc_fn_bf16=self.hc_ffn_fn_bf16,
         )
         x_ffn = self.ffn(x_ffn, input_ids_flat)
-        return x_ffn.view(batch_size, block_size, hidden_size), residual, post_mix, res_mix
+        return (
+            x_ffn.view(batch_size, block_size, hidden_size),
+            residual,
+            post_mix,
+            res_mix,
+        )
 
     def forward_reference_hc(
         self,
@@ -1051,7 +1158,8 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
         positions: torch.Tensor,
         input_ids: torch.Tensor,
         main_x: torch.Tensor,
-        start_pos: int,
+        cache_indices: torch.Tensor,
+        start_pos: int | None = None,
     ) -> torch.Tensor:
         """DSpark-only HF-style HC reference path.
 
@@ -1099,6 +1207,7 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
             positions,
             x_attn.view(batch_size, block_size, hidden_size),
             main_x,
+            cache_indices,
             start_pos,
         ).reshape(batch_size * block_size, hidden_size)
         if _dspark_dump_layer_parts_enabled():
@@ -1244,7 +1353,8 @@ class DeepSeekV4DSparkDraft(nn.Module):
         first_layer = self.layers[str(self.dspark_start_layer_idx)]
         assert isinstance(first_layer, DeepSeekV4DSparkLayer)
         main_x = _linear_output(
-            first_layer.main_proj(_maybe_fake_fp8_main_proj_input(main_hidden)))
+            first_layer.main_proj(_maybe_fake_fp8_main_proj_input(main_hidden))
+        )
         main_x = first_layer.main_norm(main_x)
         batch_size = input_ids.shape[0]
         draft_input_ids = input_ids.new_full(
@@ -1269,7 +1379,8 @@ class DeepSeekV4DSparkDraft(nn.Module):
         first_layer = self.layers[str(self.dspark_start_layer_idx)]
         assert isinstance(first_layer, DeepSeekV4DSparkLayer)
         main_x = _linear_output(
-            first_layer.main_proj(_maybe_fake_fp8_main_proj_input(main_hidden)))
+            first_layer.main_proj(_maybe_fake_fp8_main_proj_input(main_hidden))
+        )
         main_x = first_layer.main_norm(main_x)
 
         for req_idx, (start, end) in enumerate(context_ranges):
@@ -1284,6 +1395,36 @@ class DeepSeekV4DSparkDraft(nn.Module):
                     req_positions,
                     cache_start=req_idx,
                 )
+
+    def precompute_context_kv_flat(
+        self,
+        main_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_rejected: torch.Tensor,
+        cache_indices: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """Populate DSpark rolling target-KV caches from flat target rows."""
+        if num_reqs <= 0 or main_hidden.numel() == 0:
+            return
+        first_layer = self.layers[str(self.dspark_start_layer_idx)]
+        assert isinstance(first_layer, DeepSeekV4DSparkLayer)
+        main_x = _linear_output(
+            first_layer.main_proj(_maybe_fake_fp8_main_proj_input(main_hidden))
+        )
+        main_x = first_layer.main_norm(main_x)
+
+        for layer in self.layers.values():
+            assert isinstance(layer, DeepSeekV4DSparkLayer)
+            layer.precompute_dspark_context_kv_flat(
+                main_x,
+                positions,
+                query_start_loc,
+                num_rejected,
+                cache_indices,
+                num_reqs,
+            )
 
     def reset_dspark_kv_cache(self) -> None:
         for layer in self.layers.values():
@@ -1341,9 +1482,11 @@ class DeepSeekV4DSparkDraft(nn.Module):
                     "base_logits": logits,
                 },
                 {
-                    "start_pos": (int(positions[0].item())
-                                  if positions is not None
-                                  and positions.numel() else None),
+                    "start_pos": (
+                        int(positions[0].item())
+                        if positions is not None and positions.numel()
+                        else None
+                    ),
                 },
             )
 
@@ -1363,9 +1506,11 @@ class DeepSeekV4DSparkDraft(nn.Module):
                     },
                     {
                         "step": idx,
-                        "start_pos": (int(positions[0].item())
-                                      if positions is not None
-                                      and positions.numel() else None),
+                        "start_pos": (
+                            int(positions[0].item())
+                            if positions is not None and positions.numel()
+                            else None
+                        ),
                     },
                 )
             if not disable_markov_bias:
@@ -1413,31 +1558,32 @@ class DeepSeekV4DSparkDraft(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if positions.numel() == 0:
             raise ValueError("DSpark forward_spec requires at least one position.")
-        # Initial version only supports uniform decode positions.  The speculator
-        # can relax this later with fully tensorized rolling-cache writes.
-        if not torch.all(positions == positions[0]):
-            raise NotImplementedError(
-                "DSpark forward_spec currently requires uniform decode positions."
-            )
-        start_pos = int(positions[0].item())
+        if idx_mapping is None:
+            raise ValueError("DSpark forward_spec requires idx_mapping.")
+        debug_start_pos = None
+        if os.getenv("VLLM_DSPARK_DEBUG_DIR") or os.getenv(
+            "VLLM_DSPARK_TENSOR_DEBUG_DIR"
+        ):
+            debug_start_pos = int(positions[0].detach().cpu())
         x, main_x, draft_input_ids = self.forward_embed(main_hidden, input_ids)
-        _maybe_dump_stage_debug(
-            "forward_embed",
-            {
-                "main_hidden": main_hidden,
-                "main_x": main_x,
-                "x": x,
-            },
-            {
-                "start_pos": start_pos,
-                "input_ids": [
-                    int(v) for v in input_ids.detach().cpu().tolist()[:8]
-                ],
-                "positions": [
-                    int(v) for v in positions.detach().cpu().tolist()[:8]
-                ],
-            },
-        )
+        if os.getenv("VLLM_DSPARK_DEBUG_DIR"):
+            _maybe_dump_stage_debug(
+                "forward_embed",
+                {
+                    "main_hidden": main_hidden,
+                    "main_x": main_x,
+                    "x": x,
+                },
+                {
+                    "start_pos": debug_start_pos,
+                    "input_ids": [
+                        int(v) for v in input_ids.detach().cpu().tolist()[:8]
+                    ],
+                    "positions": [
+                        int(v) for v in positions.detach().cpu().tolist()[:8]
+                    ],
+                },
+            )
         _maybe_save_tensor_debug(
             "forward_embed",
             {
@@ -1449,15 +1595,9 @@ class DeepSeekV4DSparkDraft(nn.Module):
                 "x": x,
             },
             {
-                "start_pos": start_pos,
+                "start_pos": debug_start_pos,
             },
         )
-        if start_pos == 0:
-            main_positions = positions.view(-1, 1)
-            for layer in self.layers.values():
-                assert isinstance(layer, DeepSeekV4DSparkLayer)
-                layer.precompute_dspark_context_kv(main_x, main_positions)
-            raise RuntimeError("DSpark context prefill does not produce draft tokens.")
 
         final_layer = self.layers[
             str(self.dspark_start_layer_idx + self.num_dspark_layers - 1)
@@ -1471,17 +1611,18 @@ class DeepSeekV4DSparkDraft(nn.Module):
                     positions,
                     draft_input_ids,
                     main_x,
-                    start_pos,
+                    idx_mapping,
+                    debug_start_pos,
                 )
                 _maybe_dump_stage_debug(
                     "layer_reference_hc",
                     {"x": x},
-                    {"layer": layer.prefix, "start_pos": start_pos},
+                    {"layer": layer.prefix, "start_pos": debug_start_pos},
                 )
                 _maybe_save_tensor_debug(
                     "layer_reference_hc",
                     {"x": x},
-                    {"layer": layer.prefix, "start_pos": start_pos},
+                    {"layer": layer.prefix, "start_pos": debug_start_pos},
                 )
         else:
             residual, post_mix, res_mix = None, None, None
@@ -1492,7 +1633,8 @@ class DeepSeekV4DSparkDraft(nn.Module):
                     positions,
                     draft_input_ids,
                     main_x,
-                    start_pos,
+                    idx_mapping,
+                    debug_start_pos,
                     post_mix,
                     res_mix,
                     residual,
@@ -1505,7 +1647,7 @@ class DeepSeekV4DSparkDraft(nn.Module):
                         "post_mix": post_mix,
                         "res_mix": res_mix,
                     },
-                    {"layer": layer.prefix, "start_pos": start_pos},
+                    {"layer": layer.prefix, "start_pos": debug_start_pos},
                 )
                 _maybe_save_tensor_debug(
                     "layer_fused_hc",
@@ -1515,7 +1657,7 @@ class DeepSeekV4DSparkDraft(nn.Module):
                         "post_mix": post_mix,
                         "res_mix": res_mix,
                     },
-                    {"layer": layer.prefix, "start_pos": start_pos},
+                    {"layer": layer.prefix, "start_pos": debug_start_pos},
                 )
             assert residual is not None
             assert post_mix is not None
@@ -1545,12 +1687,12 @@ class DeepSeekV4DSparkDraft(nn.Module):
             _maybe_dump_stage_debug(
                 "final_mhc_post",
                 {"x": x},
-                {"start_pos": start_pos},
+                {"start_pos": debug_start_pos},
             )
             _maybe_save_tensor_debug(
                 "final_mhc_post",
                 {"x": x},
-                {"start_pos": start_pos},
+                {"start_pos": debug_start_pos},
             )
         output_ids, logits, confidence = self.forward_head(
             x,
@@ -1564,20 +1706,21 @@ class DeepSeekV4DSparkDraft(nn.Module):
             active_num_reqs=active_num_reqs,
             use_fp64_gumbel=use_fp64_gumbel,
         )
-        _maybe_dump_stage_debug(
-            "forward_head",
-            {
-                "logits": logits,
-                "confidence": confidence,
-            },
-            {
-                "start_pos": start_pos,
-                "output_ids": [
-                    [int(v) for v in row]
-                    for row in output_ids.detach().cpu().tolist()[:2]
-                ],
-            },
-        )
+        if os.getenv("VLLM_DSPARK_DEBUG_DIR"):
+            _maybe_dump_stage_debug(
+                "forward_head",
+                {
+                    "logits": logits,
+                    "confidence": confidence,
+                },
+                {
+                    "start_pos": debug_start_pos,
+                    "output_ids": [
+                        [int(v) for v in row]
+                        for row in output_ids.detach().cpu().tolist()[:2]
+                    ],
+                },
+            )
         _maybe_save_tensor_debug(
             "forward_head",
             {
@@ -1588,7 +1731,7 @@ class DeepSeekV4DSparkDraft(nn.Module):
                 "confidence": confidence,
             },
             {
-                "start_pos": start_pos,
+                "start_pos": debug_start_pos,
             },
         )
         return output_ids, logits, confidence
@@ -1660,8 +1803,7 @@ class DeepSeekV4DSparkDraft(nn.Module):
                 entry["scale"],
                 out_dtype=param.dtype,
             )
-            dequant_weight = dequant_weight.to(
-                device=param.device, dtype=param.dtype)
+            dequant_weight = dequant_weight.to(device=param.device, dtype=param.dtype)
             with torch.no_grad():
                 param.data.copy_(dequant_weight)
             loaded_params.add(param_name)
@@ -1694,10 +1836,9 @@ class DeepSeekV4DSparkDraft(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if ".experts." in name:
                     continue
-                if (
-                    self.layers[str(spec_layer)]._dspark_use_separate_qkv
-                    and weight_name in ("attn.wq_a", "attn.wkv")
-                ):
+                if self.layers[
+                    str(spec_layer)
+                ]._dspark_use_separate_qkv and weight_name in ("attn.wq_a", "attn.wkv"):
                     continue
                 if weight_name in ("w1", "w3") and ".shared_experts." not in name:
                     continue
@@ -1746,16 +1887,16 @@ class DeepSeekV4DSparkDraft(nn.Module):
                     loaded_params.add(name)
                     continue
                 if ".shared_experts.w2" in name:
-                    name = name.replace(".shared_experts.w2",
-                                        ".shared_experts.down_proj")
+                    name = name.replace(
+                        ".shared_experts.w2", ".shared_experts.down_proj"
+                    )
                 if name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias",
                         ".ffn.gate.e_score_correction_bias",
                     )
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader",
-                                        default_weight_loader)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 

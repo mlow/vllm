@@ -517,7 +517,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
         )
-        draft_tokens_for_next_step = None
         if self.speculator is not None:
             self.speculator.init_cudagraph_manager(cudagraph_mode)
 
@@ -1110,9 +1109,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
-            with record_function_or_nullcontext(
-                f"vllm:v2/target/{phase}/grammar"
-            ):
+            with record_function_or_nullcontext(f"vllm:v2/target/{phase}/grammar"):
                 self.structured_outputs_worker.apply_grammar_bitmask(
                     logits,
                     input_batch,
@@ -1122,9 +1119,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
-            with record_function_or_nullcontext(
-                f"vllm:v2/target/{phase}/sample"
-            ):
+            with record_function_or_nullcontext(f"vllm:v2/target/{phase}/sample"):
                 sampler_output = self.sampler(logits, input_batch)
         else:
             # Rejection sampling for spec decoding.
@@ -1246,9 +1241,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             if self.lora_config:
                 # Activate LoRA adapters.
-                with record_function_or_nullcontext(
-                    f"vllm:v2/target/{phase}/lora"
-                ):
+                with record_function_or_nullcontext(f"vllm:v2/target/{phase}/lora"):
                     lora_inputs = self.lora_state.make_lora_inputs(
                         input_batch.req_ids,
                         input_batch.idx_mapping_np,
@@ -1477,9 +1470,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
-            with record_function_or_nullcontext(
-                f"vllm:v2/target/{phase}/pp_broadcast"
-            ):
+            with record_function_or_nullcontext(f"vllm:v2/target/{phase}/pp_broadcast"):
                 self.pp_handler.broadcast(
                     sampler_output.sampled_token_ids,
                     num_sampled,
@@ -1488,9 +1479,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         assert self.prompt_logprobs_worker is not None
-        with record_function_or_nullcontext(
-            f"vllm:v2/target/{phase}/prompt_logprobs"
-        ):
+        with record_function_or_nullcontext(f"vllm:v2/target/{phase}/prompt_logprobs"):
             prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
                 self.model.compute_logits,
                 hidden_states,
@@ -1510,9 +1499,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
         # Start async output copy here so that it can overlap with speculator proposal.
-        with record_function_or_nullcontext(
-            f"vllm:v2/target/{phase}/async_output"
-        ):
+        with record_function_or_nullcontext(f"vllm:v2/target/{phase}/async_output"):
             async_output = AsyncOutput(
                 model_runner_output=model_runner_output,
                 sampler_output=sampler_output,
@@ -1566,9 +1553,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            with record_function_or_nullcontext(
-                f"vllm:v2/speculator/{phase}/propose"
-            ):
+            with record_function_or_nullcontext(f"vllm:v2/speculator/{phase}/propose"):
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,
@@ -1619,9 +1604,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         # Post-step KV connector related operations.
-        with record_function_or_nullcontext(
-            f"vllm:v2/target/{phase}/kv_post_forward"
-        ):
+        with record_function_or_nullcontext(f"vllm:v2/target/{phase}/kv_post_forward"):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
 

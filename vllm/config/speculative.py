@@ -470,9 +470,7 @@ class SpeculativeConfig:
                                     if not _quant_config_targets_prefix(
                                         quant_config, module_prefix
                                     ):
-                                        _extend_unique(
-                                            ignored, [f"{module_prefix}*"]
-                                        )
+                                        _extend_unique(ignored, [f"{module_prefix}*"])
                             else:
                                 if _quant_config_targets_prefix(quant_config, prefix):
                                     continue

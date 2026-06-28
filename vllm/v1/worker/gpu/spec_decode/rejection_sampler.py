@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import json
-import os
-import time
-
 import torch
 
 from vllm.config import SpeculativeConfig
@@ -77,109 +73,6 @@ class RejectionSampler:
                 dtype=torch.float32,
                 device=device,
             )
-        self._dspark_debug_dumped = 0
-
-    def _maybe_dump_dspark_debug(
-        self,
-        input_batch: InputBatch,
-        target_logits: torch.Tensor,
-        draft_logits: torch.Tensor | None,
-        draft_sampled: torch.Tensor,
-    ) -> None:
-        debug_dir = os.getenv("VLLM_DSPARK_DEBUG_DIR")
-        if not debug_dir:
-            return
-        max_dumps = int(os.getenv("VLLM_DSPARK_DEBUG_MAX_DUMPS", "8"))
-        if self._dspark_debug_dumped >= max_dumps:
-            return
-        num_reqs = int(input_batch.num_reqs)
-        if num_reqs <= 0 or target_logits.numel() == 0:
-            return
-
-        # Keep this intentionally tiny and opt-in: it is a GPU->CPU sync used
-        # only to inspect DSpark draft/target alignment during bring-up.
-        req = 0
-        start = int(input_batch.cu_num_logits[req].item())
-        end = int(input_batch.cu_num_logits[req + 1].item())
-        if end <= start:
-            return
-        idx_mapping = int(input_batch.idx_mapping[req].item())
-        rows = []
-        local_pos = input_batch.expanded_local_pos[start:end].detach().cpu()
-        positions = input_batch.positions[input_batch.logits_indices][
-            start:end
-        ].detach().cpu()
-        sampled = draft_sampled[start:end].detach().cpu()
-        for offset, row_idx in enumerate(range(start, end)):
-            target_row = target_logits[row_idx]
-            target_topv, target_topi = torch.topk(target_row, k=8)
-            row = {
-                "row": int(row_idx),
-                "local_pos": int(local_pos[offset]),
-                "position": int(positions[offset]),
-                "input_token": int(sampled[offset]),
-                "target_top_ids": [int(x) for x in target_topi.detach().cpu()],
-                "target_top_logits": [
-                    float(x) for x in target_topv.detach().cpu()
-                ],
-            }
-            if (
-                draft_logits is not None
-                and row["local_pos"] < self.num_speculative_steps
-            ):
-                draft_row = draft_logits[idx_mapping, row["local_pos"]]
-                draft_topv, draft_topi = torch.topk(draft_row, k=8)
-                row["draft_top_ids"] = [
-                    int(x) for x in draft_topi.detach().cpu()
-                ]
-                row["draft_top_logits"] = [
-                    float(x) for x in draft_topv.detach().cpu()
-                ]
-                if offset + 1 < sampled.numel():
-                    draft_token = int(sampled[offset + 1])
-                    row["draft_token_from_input"] = draft_token
-                    # Opt-in DSpark bring-up diagnostics. Full log-softmax is
-                    # intentionally restricted to this debug path.
-                    if draft_token >= 0:
-                        target_log_probs = torch.log_softmax(
-                            target_row.float(), dim=-1)
-                        draft_log_probs = torch.log_softmax(
-                            draft_row.float(), dim=-1)
-                        target_lp = float(
-                            target_log_probs[draft_token].detach().cpu())
-                        draft_lp = float(
-                            draft_log_probs[draft_token].detach().cpu())
-                        row["draft_token_target_logprob"] = target_lp
-                        row["draft_token_draft_logprob"] = draft_lp
-                        row["draft_token_accept_prob"] = min(
-                            1.0, float(torch.exp(
-                                torch.tensor(target_lp - draft_lp)).item()))
-            rows.append(row)
-
-        os.makedirs(debug_dir, exist_ok=True)
-        path = os.path.join(debug_dir, "rejection_debug.jsonl")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "time": time.time(),
-                        "dump_index": self._dspark_debug_dumped,
-                        "num_reqs": num_reqs,
-                        "cu_num_logits": [
-                            int(x)
-                            for x in input_batch.cu_num_logits.detach()
-                            .cpu()
-                            .tolist()
-                        ],
-                        "req_index": req,
-                        "req_state_index": idx_mapping,
-                        "rows": rows,
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-        self._dspark_debug_dumped += 1
 
     def _get_logprobs_tensors(
         self,
@@ -236,12 +129,6 @@ class RejectionSampler:
             pos,
             draft_sampled,
             input_batch.expanded_local_pos,
-        )
-        self._maybe_dump_dspark_debug(
-            input_batch,
-            processed_logits,
-            draft_logits,
-            draft_sampled,
         )
         sampled, num_sampled = rejection_sample(
             processed_logits,
