@@ -851,6 +851,110 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
         scale = getattr(self.attn, f"_dspark_{attr}_scale_e8m0")
         return _fp8_block_linear_reference(x, weight, scale)
 
+    def _dspark_output_projection(
+        self,
+        out: torch.Tensor,
+        draft_positions: torch.Tensor,
+        batch_size: int,
+        block_size: int,
+        hidden_size: int,
+        start_pos: int | None,
+    ) -> torch.Tensor:
+        flat_positions = draft_positions.reshape(-1)
+        if getattr(self.attn, "_use_b12x_wo", False):
+            # B12X owns WO-A/WO-B through a fused helper and marks the generic
+            # FP8 linears as unavailable.  DSpark attention layers are removed
+            # from the no-compile context, so call the helper directly instead
+            # of the target attention custom op that looks layers up by name.
+            out_final = self.attn._apply_b12x_wo_projection(
+                out,
+                flat_positions,
+                o_storage=out,
+                o_storage_offset=out.storage_offset(),
+                o_stride_0=out.stride(0),
+                o_stride_1=out.stride(1),
+                o_stride_2=out.stride(2),
+            ).view(batch_size, block_size, hidden_size)
+            if _dspark_dump_layer_parts_enabled():
+                _maybe_save_tensor_debug(
+                    "dspark_attention_final",
+                    {"out": out_final},
+                    {"layer": self.prefix, "start_pos": start_pos},
+                )
+            return out_final
+
+        # DSpark's public reference uses a BF16 inverse-RoPE + WO-A/WO-B path
+        # here.  The target DeepSeek V4 CUDA path uses a fused FP8 _o_proj that
+        # assumes target-layer RoPE/cache invariants and corrupts DSpark draft
+        # numerics for compress_ratio=0.
+        if os.getenv("VLLM_DSPARK_REFERENCE_WO") == "1":
+            inverse_rope = (
+                _apply_dspark_inverse_rope_hf
+                if os.getenv("VLLM_DSPARK_HF_INVERSE_ROPE") == "1"
+                else _fused_inverse_rope_gptj
+            )
+            out_ref = inverse_rope(
+                out,
+                flat_positions,
+                self.attn.rotary_emb.cos_sin_cache,
+                self.attn.rope_head_dim,
+            )
+            out_ref = out_ref.view(
+                batch_size * block_size,
+                self.attn.n_local_groups,
+                -1,
+            )
+            if not getattr(self, "_dspark_reference_wo_shape_logged", False):
+                logger.warning(
+                    "DSpark reference WO shapes: weight=%s scale=%s "
+                    "groups=%s rank=%s out_width=%s",
+                    tuple(self.attn.wo_a.weight.shape),
+                    tuple(getattr(self.attn.wo_a, "weight_scale_inv", ()).shape),
+                    self.attn.n_local_groups,
+                    self.attn.o_lora_rank,
+                    out_ref.shape[-1],
+                )
+                self._dspark_reference_wo_shape_logged = True
+            wo_a = _get_cached_wo_a_bf16(
+                self.attn.wo_a,
+                self.attn.n_local_groups,
+                self.attn.o_lora_rank,
+                out_ref.shape[-1],
+            )
+            z = torch.einsum("tgd,grd->tgr", out_ref, wo_a)
+            if _dspark_dump_layer_parts_enabled():
+                _maybe_save_tensor_debug(
+                    "dspark_attention_reference_wo",
+                    {
+                        "out_ref": out_ref,
+                        "wo_a": wo_a,
+                        "z": z,
+                    },
+                    {"layer": self.prefix, "start_pos": start_pos},
+                )
+        else:
+            z = rocm_inv_rope_einsum(
+                self.attn.rotary_emb,
+                out,
+                flat_positions,
+                self.attn.rope_head_dim,
+                self.attn.n_local_groups,
+                self.attn.o_lora_rank,
+                self.attn.wo_a,
+            )
+        out_final = self.attn.wo_b(z.flatten(1)).view(
+            batch_size,
+            block_size,
+            hidden_size,
+        )
+        if _dspark_dump_layer_parts_enabled():
+            _maybe_save_tensor_debug(
+                "dspark_attention_final",
+                {"out": out_final},
+                {"layer": self.prefix, "start_pos": start_pos},
+            )
+        return out_final
+
     def _dspark_attention(
         self,
         positions: torch.Tensor,
@@ -994,77 +1098,14 @@ class DeepSeekV4DSparkLayer(DeepseekV4DecoderLayer):
                 {"out": out},
                 {"layer": self.prefix, "start_pos": start_pos},
             )
-        # DSpark's public reference uses a BF16 inverse-RoPE + WO-A/WO-B path
-        # here.  The target DeepSeek V4 CUDA path uses a fused FP8 _o_proj that
-        # assumes target-layer RoPE/cache invariants and corrupts DSpark draft
-        # numerics for compress_ratio=0.
-        if os.getenv("VLLM_DSPARK_REFERENCE_WO") == "1":
-            inverse_rope = (
-                _apply_dspark_inverse_rope_hf
-                if os.getenv("VLLM_DSPARK_HF_INVERSE_ROPE") == "1"
-                else _fused_inverse_rope_gptj
-            )
-            out_ref = inverse_rope(
-                out,
-                draft_positions.reshape(-1),
-                self.attn.rotary_emb.cos_sin_cache,
-                self.attn.rope_head_dim,
-            )
-            out_ref = out_ref.view(
-                batch_size * block_size,
-                self.attn.n_local_groups,
-                -1,
-            )
-            if not getattr(self, "_dspark_reference_wo_shape_logged", False):
-                logger.warning(
-                    "DSpark reference WO shapes: weight=%s scale=%s "
-                    "groups=%s rank=%s out_width=%s",
-                    tuple(self.attn.wo_a.weight.shape),
-                    tuple(getattr(self.attn.wo_a, "weight_scale_inv", ()).shape),
-                    self.attn.n_local_groups,
-                    self.attn.o_lora_rank,
-                    out_ref.shape[-1],
-                )
-                self._dspark_reference_wo_shape_logged = True
-            wo_a = _get_cached_wo_a_bf16(
-                self.attn.wo_a,
-                self.attn.n_local_groups,
-                self.attn.o_lora_rank,
-                out_ref.shape[-1],
-            )
-            z = torch.einsum("tgd,grd->tgr", out_ref, wo_a)
-            if _dspark_dump_layer_parts_enabled():
-                _maybe_save_tensor_debug(
-                    "dspark_attention_reference_wo",
-                    {
-                        "out_ref": out_ref,
-                        "wo_a": wo_a,
-                        "z": z,
-                    },
-                    {"layer": self.prefix, "start_pos": start_pos},
-                )
-        else:
-            z = rocm_inv_rope_einsum(
-                self.attn.rotary_emb,
-                out,
-                draft_positions.reshape(-1),
-                self.attn.rope_head_dim,
-                self.attn.n_local_groups,
-                self.attn.o_lora_rank,
-                self.attn.wo_a,
-            )
-        out_final = self.attn.wo_b(z.flatten(1)).view(
+        return self._dspark_output_projection(
+            out,
+            draft_positions,
             batch_size,
             block_size,
             hidden_size,
+            start_pos,
         )
-        if _dspark_dump_layer_parts_enabled():
-            _maybe_save_tensor_debug(
-                "dspark_attention_final",
-                {"out": out_final},
-                {"layer": self.prefix, "start_pos": start_pos},
-            )
-        return out_final
 
     def forward(
         self,

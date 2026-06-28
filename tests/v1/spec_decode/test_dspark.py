@@ -9,6 +9,7 @@ import torch
 
 from vllm.config import SpeculativeConfig
 from vllm.models.deepseek_v4.nvidia.dspark import (
+    DeepSeekV4DSparkLayer,
     _build_dspark_topk_idxs,
     _read_dspark_num_layers,
 )
@@ -128,3 +129,71 @@ def test_build_dspark_topk_idxs_uses_rolling_target_window_then_draft_block():
         dtype=torch.int32,
     )
     torch.testing.assert_close(idxs, expected)
+
+
+def test_dspark_b12x_output_projection_uses_attention_helper():
+    layer = object.__new__(DeepSeekV4DSparkLayer)
+    layer.prefix = "model.layers.40"
+
+    class GenericWoB:
+        def __call__(self, x):
+            raise AssertionError("DSpark should not call generic wo_b in B12X mode")
+
+    out = torch.arange(12, dtype=torch.bfloat16).view(2, 2, 3)
+    draft_positions = torch.tensor([[11, 12]], dtype=torch.int64)
+    fused_out = torch.arange(8, dtype=torch.bfloat16).view(2, 4)
+    calls = {}
+
+    class B12xAttention:
+        _use_b12x_wo = True
+        hidden_size = 4
+        wo_b = GenericWoB()
+
+        def _apply_b12x_wo_projection(
+            self,
+            o,
+            positions,
+            *,
+            o_storage=None,
+            o_storage_offset=0,
+            o_stride_0=0,
+            o_stride_1=0,
+            o_stride_2=0,
+        ):
+            calls["args"] = (
+                o,
+                positions,
+                o_storage,
+                o_storage_offset,
+                o_stride_0,
+                o_stride_1,
+                o_stride_2,
+            )
+            return fused_out
+
+    layer.attn = B12xAttention()
+
+    projected = layer._dspark_output_projection(
+        out,
+        draft_positions,
+        batch_size=1,
+        block_size=2,
+        hidden_size=4,
+        start_pos=10,
+    )
+
+    torch.testing.assert_close(projected, fused_out.view(1, 2, 4))
+    (
+        o,
+        positions,
+        o_storage,
+        o_storage_offset,
+        o_stride_0,
+        o_stride_1,
+        o_stride_2,
+    ) = calls["args"]
+    assert o is out
+    assert o_storage is out
+    assert o_storage_offset == out.storage_offset()
+    assert (o_stride_0, o_stride_1, o_stride_2) == out.stride()
+    torch.testing.assert_close(positions, torch.tensor([11, 12], dtype=torch.int64))
