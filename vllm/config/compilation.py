@@ -756,6 +756,7 @@ class CompilationConfig:
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
+        "vllm::minimax_m3_sparse_attention_with_output",
         "vllm::deepseek_v4_attention",
     ]
 
@@ -1136,6 +1137,7 @@ class CompilationConfig:
                         self.pass_config.fuse_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+                    self.splitting_ops.append("vllm::minimax_m3_sparse_kv_cache_update")
 
             elif len(self.splitting_ops) == 0:
                 if (
@@ -1244,6 +1246,7 @@ class CompilationConfig:
         kv_cache_update_ops = [
             "vllm::unified_kv_cache_update",
             "vllm::unified_mla_kv_cache_update",
+            "vllm::minimax_m3_sparse_kv_cache_update",
         ]
         return self.splitting_ops is not None and all(
             op in self.splitting_ops for op in kv_cache_update_ops
@@ -1489,6 +1492,17 @@ class CompilationConfig:
                 if round_up(size, multiple_of) <= self.max_cudagraph_capture_size
             )
         )
+        # Spec decode uniform decode graphs are shaped by request count:
+        # num_reqs * (1 + num_speculative_tokens). Keep small interactive
+        # request counts exact so FULL decode graphs do not replay with
+        # padded virtual requests just because the original capture-size list
+        # skipped that request count.
+        small_decode_sizes = {
+            multiple_of * num_reqs
+            for num_reqs in range(1, 33)
+            if multiple_of * num_reqs <= self.max_cudagraph_capture_size
+        }
+        rounded_sizes = sorted(set(rounded_sizes) | small_decode_sizes)
 
         if len(rounded_sizes) == 0 and multiple_of <= self.max_cudagraph_capture_size:
             # if one valid but would be round_down use that
