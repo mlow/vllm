@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -185,6 +186,38 @@ def new_mamba_spec(
         mamba_cache_mode=mamba_cache_mode,
         num_speculative_blocks=num_speculative_blocks,
     )
+
+
+def test_unify_kv_cache_spec_page_size_uses_lcm_for_non_divisible_pages():
+    mimo_spec = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=2,
+        head_size=192,
+        head_size_v=128,
+        dtype=torch.float32,
+    )
+    dflash_spec = FullAttentionSpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=128,
+        head_size_v=128,
+        dtype=torch.float32,
+    )
+
+    assert mimo_spec.page_size_bytes == 163840
+    assert dflash_spec.page_size_bytes == 65536
+    assert mimo_spec.page_size_bytes % dflash_spec.page_size_bytes != 0
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {
+            "model.layers.0.self_attn": mimo_spec,
+            "draft_model.layers.0.self_attn": dflash_spec,
+        }
+    )
+
+    assert {spec.page_size_bytes for spec in unified.values()} == {327680}
+    assert unified["model.layers.0.self_attn"].block_size == 128
+    assert unified["draft_model.layers.0.self_attn"].block_size == 320
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
@@ -1471,6 +1504,230 @@ def test_get_max_concurrency_for_kv_cache_config():
     assert max_concurrency == max_concurrency_hybrid_model
 
 
+def _make_dsv4_vllm_config(dcp: int):
+    class _Dsv4VllmConfig(SimpleNamespace):
+        def validate_block_size(self):
+            pass
+
+    return _Dsv4VllmConfig(
+        model_config=SimpleNamespace(
+            max_model_len=256000,
+            original_max_model_len=256000,
+            hf_config=SimpleNamespace(model_type="deepseek_v4"),
+        ),
+        scheduler_config=SimpleNamespace(
+            disable_hybrid_kv_cache_manager=False,
+            max_num_batched_tokens=2048,
+        ),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp,
+            prefill_context_parallel_size=1,
+        ),
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            block_size=None,
+            kv_cache_max_concurrency=None,
+            kv_cache_size_tokens=None,
+            num_gpu_blocks=None,
+            num_gpu_blocks_override=None,
+        ),
+        compilation_config=SimpleNamespace(
+            compilation_time=0,
+            encoder_compilation_time=0,
+        ),
+    )
+
+
+def _make_dsv4_heterogeneous_kv_cache_specs():
+    def full_mla_spec(compress_ratio: int):
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            cache_dtype_str="fp8_ds_mla",
+            compress_ratio=compress_ratio,
+            alignment=576,
+            model_version="deepseek_v4",
+        )
+
+    def indexer_spec():
+        return MLAAttentionSpec(
+            block_size=256,
+            num_kv_heads=1,
+            head_size=132,
+            dtype=torch.uint8,
+            compress_ratio=4,
+            alignment=576,
+        )
+
+    def swa_cache_spec():
+        return SlidingWindowMLASpec(
+            block_size=64,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.uint8,
+            sliding_window=128,
+            cache_dtype_str="fp8_ds_mla",
+            alignment=576,
+            model_version="deepseek_v4",
+        )
+
+    def compressor_state_spec(compress_ratio: int):
+        overlap = compress_ratio == 4
+        return SlidingWindowMLASpec(
+            block_size=4 if overlap else 8,
+            num_kv_heads=1,
+            head_size=2 * (1 + overlap) * 512,
+            dtype=torch.float32,
+            sliding_window=(1 + overlap) * compress_ratio,
+            alignment=576,
+            dcp_sharded=True,
+        )
+
+    ratios = [128, 128] + [4, 128] * 29 + [4]
+    assert ratios.count(4) == 30
+    assert ratios.count(128) == 31
+
+    kv_cache_specs: dict[str, KVCacheSpec] = {}
+    for layer_idx, ratio in enumerate(ratios):
+        prefix = f"layers.{layer_idx}"
+        kv_cache_specs[f"{prefix}.mla_attn"] = full_mla_spec(ratio)
+        kv_cache_specs[f"{prefix}.swa_cache"] = swa_cache_spec()
+        kv_cache_specs[f"{prefix}.compressor.state_cache"] = (
+            compressor_state_spec(ratio)
+        )
+        if ratio == 4:
+            kv_cache_specs[f"{prefix}.indexer.k_cache"] = indexer_spec()
+            kv_cache_specs[f"{prefix}.indexer.compressor.state_cache"] = (
+                compressor_state_spec(ratio)
+            )
+
+    return kv_cache_specs
+
+
+def _make_dsv4_heterogeneous_kv_cache_groups():
+    kv_cache_specs = _make_dsv4_heterogeneous_kv_cache_specs()
+    grouped_specs = kv_cache_utils.group_and_unify_kv_cache_specs(kv_cache_specs)
+    assert grouped_specs is not None
+    return kv_cache_utils._get_kv_cache_groups_uniform_groups(grouped_specs)
+
+
+def test_dsv4_max_concurrency_uses_uniform_group_pool_math():
+    kv_cache_groups = _make_dsv4_heterogeneous_kv_cache_groups()
+
+    for dcp, expected_request_blocks in [(5, 538), (10, 307)]:
+        vllm_config = _make_dsv4_vllm_config(dcp)
+        kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
+            vllm_config, kv_cache_groups, available_memory=4_500_000_000
+        )
+        assert kv_cache_config.num_blocks == 3054
+        assert get_max_concurrency_for_kv_cache_config(
+            vllm_config, kv_cache_config
+        ) == pytest.approx(3054 / expected_request_blocks)
+
+
+def test_resolve_kv_cache_block_sizes_mixed_dcp_replicated_groups():
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=64),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=4,
+            prefill_context_parallel_size=1,
+        ),
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=128,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target"],
+                MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft"],
+                MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.float32,
+                    dcp_replicated=True,
+                ),
+            ),
+        ],
+    )
+
+    scheduler_block_size, hash_block_size = kv_cache_utils.resolve_kv_cache_block_sizes(
+        kv_cache_config,
+        vllm_config,
+    )
+
+    assert scheduler_block_size == 256
+    assert hash_block_size == 64
+
+
+def test_dsv4_engine_capacity_uses_worker_kv_cache_config():
+    from vllm.v1.engine.core import EngineCore
+
+    class FakeModelExecutor:
+        def __init__(self):
+            self.initialized_kv_cache_configs = None
+
+        def get_kv_cache_specs(self):
+            return [_make_dsv4_heterogeneous_kv_cache_specs()]
+
+        def determine_available_memory(self):
+            return [4_500_000_000]
+
+        def initialize_from_config(self, kv_cache_configs):
+            self.initialized_kv_cache_configs = kv_cache_configs
+
+    class FakeEngineCore:
+        def __init__(self):
+            self.available_gpu_memory_for_kv_cache = -1
+            self.model_executor = FakeModelExecutor()
+
+        def collective_rpc(self, method, args=()):
+            raise AssertionError(f"unexpected collective_rpc({method}, {args})")
+
+    vllm_config = _make_dsv4_vllm_config(dcp=5)
+    engine_core = FakeEngineCore()
+
+    scheduler_kv_cache_config = EngineCore._initialize_kv_caches(
+        engine_core, vllm_config
+    )
+
+    initialized_kv_cache_configs = (
+        engine_core.model_executor.initialized_kv_cache_configs
+    )
+    assert initialized_kv_cache_configs is not None
+    worker_kv_cache_config = initialized_kv_cache_configs[0]
+    assert all(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in worker_kv_cache_config.kv_cache_groups
+    )
+    assert not any(
+        isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+        for group in scheduler_kv_cache_config.kv_cache_groups
+    )
+    scheduler_page_sizes = {
+        group.kv_cache_spec.page_size_bytes
+        for group in scheduler_kv_cache_config.kv_cache_groups
+    }
+    assert len(scheduler_page_sizes) > 1
+    expected_num_tokens, expected_max_concurrency = get_kv_cache_capacity(
+        vllm_config, worker_kv_cache_config
+    )
+    assert vllm_config.cache_config.kv_cache_max_concurrency == pytest.approx(
+        expected_max_concurrency
+    )
+    assert vllm_config.cache_config.kv_cache_size_tokens == expected_num_tokens
+
+
 def test_allocate_with_lookahead():
     """Verify that lookahead tokens correctly affect block allocation"""
     block_size = 4
@@ -1803,8 +2060,9 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # different hidden size that cannot be aligned by using different block size,
-    # but can be aligned by padding the smaller physical page.
+    # Different hidden size and different type that cannot be aligned by using
+    # different block size, but can be aligned by padding the smaller physical
+    # page.
     swa_spec = new_sliding_window_spec(head_size=96, indexes_kv_by_block_stride=True)
     kv_cache_specs_hybrid = {
         "layer_1": new_kv_cache_spec(head_size=64, indexes_kv_by_block_stride=True),

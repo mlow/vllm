@@ -26,7 +26,12 @@ class PrefillSpeculatorCudaGraphManager(CudaGraphManager):
     def capture(
         self,
         forward_fn: Callable,
-        attn_states: dict[BatchExecutionDescriptor, AttentionStatePair],
+        attn_states: dict[BatchExecutionDescriptor, AttentionStatePair] | None = None,
+        model_state: ModelState | None = None,
+        input_buffers: InputBuffers | None = None,
+        block_tables: BlockTables | None = None,
+        attn_groups: list[list[AttentionGroup]] | None = None,
+        kv_cache_config: KVCacheConfig | None = None,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
         def create_forward_fn(
@@ -40,8 +45,27 @@ class PrefillSpeculatorCudaGraphManager(CudaGraphManager):
                 if self.dp_size > 1
                 else None
             )
-            attn_state_pair = attn_states[desc]
-            attn_state = attn_state_pair.warmup if warmup else attn_state_pair.captured
+            if attn_states is not None:
+                attn_state_pair = attn_states[desc]
+                attn_state = (
+                    attn_state_pair.warmup if warmup else attn_state_pair.captured
+                )
+            else:
+                assert model_state is not None
+                assert input_buffers is not None
+                assert block_tables is not None
+                assert attn_groups is not None
+                assert kv_cache_config is not None
+                attn_state = prepare_inputs_to_capture(
+                    num_reqs,
+                    num_tokens,
+                    model_state,
+                    input_buffers,
+                    block_tables,
+                    attn_groups,
+                    kv_cache_config,
+                    skip_attn=(desc.cg_mode == CUDAGraphMode.PIECEWISE),
+                )
             attn_metadata, slot_mappings = attn_state
             fwd = lambda cg_mode: forward_fn(
                 num_reqs,

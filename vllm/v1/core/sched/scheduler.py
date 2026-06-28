@@ -60,7 +60,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.utils import compute_iteration_details, record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
@@ -227,6 +227,7 @@ class Scheduler(SchedulerInterface):
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.requires_eagle_cache_drop = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.num_lookahead_tokens = 0
         self.dynamic_sd_lookup: list[int] | None = None
@@ -239,6 +240,9 @@ class Scheduler(SchedulerInterface):
                 )
             if speculative_config.use_eagle():
                 self.use_eagle = True
+                self.requires_eagle_cache_drop = (
+                    speculative_config.requires_eagle_cache_drop()
+                )
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -256,7 +260,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=self.requires_eagle_cache_drop,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
@@ -351,13 +355,13 @@ class Scheduler(SchedulerInterface):
             # must be a multiple of `block_size`.
             # As an exception, if `num_new_tokens` is less than `block_size`, the
             # state is simply not cached, requiring no special handling.
-            # Additionally, when Eagle mode is enabled, FullAttn prunes the last
-            # matching block. To prevent this from causing a Mamba cache miss, the
-            # last chunk must be not smaller than `block_size`.
+            # Additionally, when Eagle-style cache drop is enabled, FullAttn
+            # prunes the last matching block. To prevent this from causing a
+            # Mamba cache miss, the last chunk must be not smaller than
+            # `block_size`.
             block_size = self.cache_config.block_size
             last_cache_position = request.num_tokens - request.num_tokens % block_size
-            # eagle prune
-            if self.use_eagle:
+            if self.requires_eagle_cache_drop:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
@@ -493,7 +497,7 @@ class Scheduler(SchedulerInterface):
                     request.num_computed_tokens,
                     num_new_tokens,
                     encoder_compute_budget,
-                    shift_computed_tokens=1 if self.use_eagle else 0,
+                    shift_computed_tokens=1 if self.requires_eagle_cache_drop else 0,
                 )
 
             if self.need_mamba_block_aligned_split:
@@ -823,7 +827,9 @@ class Scheduler(SchedulerInterface):
                             num_computed_tokens,
                             num_new_tokens,
                             encoder_compute_budget,
-                            shift_computed_tokens=1 if self.use_eagle else 0,
+                            shift_computed_tokens=1
+                            if self.requires_eagle_cache_drop
+                            else 0,
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
@@ -1790,7 +1796,13 @@ class Scheduler(SchedulerInterface):
 
         if (
             stats := self.make_stats(
-                spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
+                spec_decoding_stats,
+                kv_connector_stats,
+                cudagraph_stats,
+                perf_stats,
+                num_scheduled_prompt_tokens=compute_iteration_details(
+                    scheduler_output
+                ).num_ctx_tokens,
             )
         ) is not None:
             # Return stats to only one of the front-ends.
@@ -2231,6 +2243,7 @@ class Scheduler(SchedulerInterface):
         kv_connector_stats: KVConnectorStats | None = None,
         cudagraph_stats: CUDAGraphStat | None = None,
         perf_stats: PerfStats | None = None,
+        num_scheduled_prompt_tokens: int = 0,
     ) -> SchedulerStats | None:
         if not self.log_stats:
             return None
@@ -2261,6 +2274,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            num_scheduled_prompt_tokens=num_scheduled_prompt_tokens,
         )
 
     def make_spec_decoding_stats(
