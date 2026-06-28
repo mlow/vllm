@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 import regex as re
 
-from vllm.entrypoints.chat_utils import make_tool_call_id
+from vllm.entrypoints.chat_utils import get_tool_call_id_type, make_tool_call_id
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaFunctionCall,
     DeltaMessage,
@@ -89,11 +89,18 @@ class ParserEngine(Parser):
         tools: list[Tool] | None = None,
         *,
         parser_engine_config: ParserEngineConfig,
+        model_config=None,
         **kwargs,
     ) -> None:
         self.model_tokenizer = tokenizer
         self._tools = tools
-        self._stream_state = StreamState()
+        self._stream_state = StreamState(
+            tool_call_id_type=(
+                get_tool_call_id_type(model_config)
+                if model_config is not None
+                else "random"
+            ),
+        )
         self._reasoning_parser = None
         self._tool_parser = None
         self.parser_engine_config = parser_engine_config
@@ -171,6 +178,16 @@ class ParserEngine(Parser):
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
         return
+
+    def is_reasoning_end_for_prompt(self, input_ids: Sequence[int]) -> bool:
+        """See :meth:`ReasoningParser.is_reasoning_end_for_prompt`.
+
+        ParserEngine-backed parsers use the same default as ReasoningParser:
+        the rendered prompt is treated as proving reasoning has ended when the
+        normal generated-token state check says so. Parsers with adaptive
+        prompt templates can override this on the concrete engine class.
+        """
+        return self.is_reasoning_end(list(input_ids))
 
     def finish_streaming(self) -> DeltaMessage | None:
         events = self._engine.finish()
@@ -419,6 +436,7 @@ class ParserEngine(Parser):
         *,
         finished: bool,
     ) -> DeltaMessage | None:
+        self._initialize_history_tool_call_cnt(request)
         if not self._prompt_streaming_prepared and prompt_token_ids is not None:
             # NOTE: call the hook BEFORE setting the flag, because the hook
             # may invoke ``_reset`` (e.g. via ``initialize_streaming``) which
@@ -658,6 +676,7 @@ class ParserEngine(Parser):
         enable_auto_tools: bool = False,
         model_output_token_ids: Sequence[int] = (),
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
+        self._initialize_history_tool_call_cnt(request)
         self._check_skip_tool_parsing(request)
         reasoning, content, tool_call_info = self._single_pass_parse(
             model_output,

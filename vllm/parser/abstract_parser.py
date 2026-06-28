@@ -11,6 +11,10 @@ from functools import cached_property
 from openai.types.responses import ToolChoiceFunction
 from pydantic import TypeAdapter, ValidationError
 
+from vllm.entrypoints.chat_utils import (
+    get_tool_call_id_type,
+    make_tool_call_id,
+)
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
@@ -24,6 +28,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
 from vllm.parser.metrics import record_tool_parser_invocation
+from vllm.parser.utils import count_history_tool_calls
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
@@ -32,6 +37,7 @@ from vllm.tool_parsers.streaming import (
     extract_named_tool_call_streaming,
     extract_required_tool_call_streaming,
 )
+from vllm.tool_parsers.utils import partial_tag_overlap
 
 logger = init_logger(__name__)
 
@@ -46,7 +52,11 @@ class StreamState:
     previous_text: str = ""
     previous_token_ids: list[int] = field(default_factory=list)
     history_tool_call_cnt: int = 0
+    history_tool_call_cnt_initialized: bool = False
     tool_call_id_type: str = "random"
+    # Reasoning text temporarily withheld from output because it might be the
+    # start of a tool-call start marker appearing inside the reasoning stream.
+    pending_reasoning: str = ""
     # only used for "required" and "named tool" choices,
     # tracks whether function name has been fully returned in the stream yet
     function_name_returned: bool = False
@@ -108,6 +118,7 @@ class Parser:
         tokenizer: TokenizerLike,
         tools: list[Tool] | None = None,
         *args,
+        model_config=None,
         **kwargs,
     ):
         self.model_tokenizer = tokenizer
@@ -124,7 +135,14 @@ class Parser:
             self._reasoning_parser is None
             or self._reasoning_parser.engine_based_streaming
         ) and (self._tool_parser is None or self._tool_parser.engine_based_streaming)
-        self._stream_state = StreamState(engine_based=self._engine_based)
+        self._stream_state = StreamState(
+            tool_call_id_type=(
+                get_tool_call_id_type(model_config)
+                if model_config is not None
+                else "random"
+            ),
+            engine_based=self._engine_based,
+        )
 
     @cached_property
     def vocab(self) -> dict[str, int]:
@@ -148,6 +166,19 @@ class Parser:
     @tool_parser.setter
     def tool_parser(self, parser: ToolParser | None) -> None:
         self._tool_parser = parser
+
+    def _initialize_history_tool_call_cnt(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> None:
+        state = self._stream_state
+        if state.history_tool_call_cnt_initialized:
+            return
+        if state.tool_call_id_type != "kimi_k2":
+            state.history_tool_call_cnt_initialized = True
+            return
+        state.history_tool_call_cnt = count_history_tool_calls(request)
+        state.history_tool_call_cnt_initialized = True
 
     # ========== Reasoning Parser Methods ==========
 
@@ -375,6 +406,18 @@ class DelegatingParser(Parser):
             return request.tool_choice.function.name
         raise ValueError("Invalid tool_choice for function name extraction.")
 
+    def _make_tool_call_id(self, function_name: str) -> str | None:
+        state = self._stream_state
+        if state.tool_call_id_type != "kimi_k2":
+            return None
+        tool_call_id = make_tool_call_id(
+            id_type=state.tool_call_id_type,
+            func_name=function_name,
+            idx=state.history_tool_call_cnt,
+        )
+        state.history_tool_call_cnt += 1
+        return tool_call_id
+
     def _extract_tool_calls(
         self,
         content: str | None,
@@ -404,9 +447,11 @@ class DelegatingParser(Parser):
         if is_named_tool_choice and supports_required_and_named:
             if content is None:
                 return [], None
+            function_name = self._get_function_name(request)
             tool_calls.append(
                 FunctionCall(
-                    name=self._get_function_name(request),
+                    id=self._make_tool_call_id(function_name),
+                    name=function_name,
                     arguments=content,
                 )
             )
@@ -422,6 +467,7 @@ class DelegatingParser(Parser):
             for tc in parsed_calls:
                 tool_calls.append(
                     FunctionCall(
+                        id=self._make_tool_call_id(tc.name),
                         name=tc.name,
                         arguments=json.dumps(tc.parameters, ensure_ascii=False),
                     )
@@ -463,6 +509,22 @@ class DelegatingParser(Parser):
             request = self._tool_parser.adjust_request(request)
         return request
 
+    def _reasoning_enabled(self) -> bool:
+        """Whether the model will emit a reasoning prefix before its answer
+        / tool call for this request.
+
+        The parser (and thus its reasoning parser) is constructed per request
+        with that request's ``chat_template_kwargs``, so the reasoning parser
+        already reflects whether thinking is enabled. Defaults to ``True`` —
+        xgrammar's own default — when the reasoning parser cannot report it,
+        so the structural-tag grammar models the reasoning phase the engine's
+        structured-output FSM expects.
+        """
+        reasoner = self._reasoning_parser
+        if reasoner is None:
+            return False
+        return bool(getattr(reasoner, "thinking_enabled", True))
+
     def _apply_structural_tag(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
@@ -484,9 +546,18 @@ class DelegatingParser(Parser):
         if not need_tool_calling:
             return request
 
+        reasoning_enabled = self._reasoning_enabled()
+
+        # When the model emits a reasoning prefix (e.g. ``...</think>``) before
+        # its tool call, the structural-tag grammar MUST include the reasoning
+        # section. Otherwise the grammar only models the tool-call format and
+        # the structured-output FSM rejects the reasoning tokens at the
+        # reasoning->tool boundary (HTTP 500 non-streaming / mid-stream error
+        # streaming). The engine's structural-tag same-step advance also assumes
+        # the tag models this phased (reasoning -> tool) output.
         structure_tag = self._tool_parser.get_structural_tag(
             request,
-            reasoning=False,
+            reasoning=reasoning_enabled,
         )
         if structure_tag is None:
             return request
@@ -499,6 +570,23 @@ class DelegatingParser(Parser):
             request.text = None
         else:
             request.response_format = None
+
+        # The structural tag now models the reasoning phase itself (an
+        # unconstrained prefix terminated by the reasoning-end marker), so the
+        # structured-output engine must enforce the grammar from the FIRST
+        # token rather than deferring past a reasoning section it would no
+        # longer detect separately. Without this, tokens sampled immediately
+        # after the reasoning-end marker escape the grammar bitmask, so a
+        # forced/required tool suffix can be violated (e.g. the model samples
+        # prose instead of the tool call); the FSM advance then rejects those
+        # tokens and the request fails with an internal error. This reuses the
+        # same signal the Mistral grammar path uses to mark "the grammar
+        # handles reasoning" (-> reasoning_ended=True at generation start). The
+        # reasoning prefix is unconstrained, so thinking is not restricted; only
+        # the post-reasoning tool call is enforced. PrivateAttr exists only on
+        # ChatCompletionRequest, hence the guard.
+        if reasoning_enabled and hasattr(request, "_grammar_from_tool_parser"):
+            request._grammar_from_tool_parser = True
         return request
 
     def extract_reasoning_streaming(
@@ -667,6 +755,11 @@ class DelegatingParser(Parser):
             return False
         return self._reasoning_parser.is_reasoning_end(input_ids)
 
+    def is_reasoning_end_for_prompt(self, input_ids: list[int]) -> bool:
+        if self._reasoning_parser is None:
+            return False
+        return self._reasoning_parser.is_reasoning_end_for_prompt(input_ids)
+
     def is_reasoning_end_streaming(
         self, input_ids: list[int], delta_ids: list[int]
     ) -> bool:
@@ -733,13 +826,155 @@ class DelegatingParser(Parser):
         enable_auto_tools: bool = False,
         model_output_token_ids: Sequence[int] = (),
     ) -> tuple[str | None, str | None, list[FunctionCall] | None]:
+        self._initialize_history_tool_call_cnt(request)
         reasoning, content = self.extract_reasoning(model_output, request)
         tool_calls, content = self._extract_tool_calls(
             content=content,
             request=request,
             enable_auto_tools=enable_auto_tools,
         )
+
+        # In-reasoning tool-call recovery: Check whether the model emitted a
+        # tool-call without first closing the reasoning channel. If nothing else
+        # was parsed, re-run the tool parser over the reasoning tail and promote
+        # a balanced block.
+        if not tool_calls and self._can_recover_in_reasoning_tool_calls(
+            request, content, enable_auto_tools
+        ):
+            recovered, reasoning = self._recover_tool_calls_from_reasoning(
+                reasoning, request
+            )
+            if recovered:
+                tool_calls = recovered
+
         return reasoning, content, tool_calls
+
+    def _can_recover_in_reasoning_tool_calls(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+        content: str | None,
+        enable_auto_tools: bool,
+    ) -> bool:
+        if self._tool_parser is None or not enable_auto_tools:
+            return False
+        if request.tool_choice not in ("auto", None):
+            return False
+        if content is not None and content.strip():
+            return False
+        return self._tool_parser_recovers_in_reasoning()
+
+    def _tool_parser_recovers_in_reasoning(self) -> bool:
+        tp = self._tool_parser
+        return bool(
+            tp is not None
+            and tp.recovers_tool_calls_in_reasoning
+            and tp.tool_call_start_token
+            and tp.tool_call_end_token
+        )
+
+    def _recover_tool_calls_from_reasoning(
+        self,
+        reasoning: str | None,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> tuple[list[FunctionCall] | None, str | None]:
+        """Promote a tool-call block emitted inside the reasoning channel.
+
+        Requires a *balanced* `<...tool_calls>...</...tool_calls>` block so we
+        never promote half-formed output or a marker the model merely mentioned
+        while reasoning. Returns the recovered calls and the leftover reasoning
+        prose (the text that preceded the block); on no-op the reasoning is
+        returned unchanged.
+        """
+        tool_parser = self._tool_parser
+        assert tool_parser is not None
+        start = tool_parser.tool_call_start_token
+        end = tool_parser.tool_call_end_token
+        if not start or not end:
+            return None, reasoning
+        if not reasoning or start not in reasoning or end not in reasoning:
+            return None, reasoning
+
+        info = tool_parser.extract_tool_calls(reasoning, request)  # type: ignore[arg-type]
+        if info is None or not info.tools_called:
+            return None, reasoning
+
+        recovered = [
+            FunctionCall(
+                id=tc.id,
+                name=tc.function.name,
+                arguments=tc.function.arguments,
+            )
+            for tc in info.tool_calls
+        ]
+        # The prose before the block was genuine reasoning; keep it as such.
+        new_reasoning = info.content
+        if new_reasoning and not new_reasoning.strip():
+            new_reasoning = None
+        return recovered, new_reasoning
+
+    def _intercept_in_reasoning_tool_marker(
+        self,
+        state: "StreamState",
+        delta_message: DeltaMessage | None,
+        finished: bool,
+    ) -> tuple[DeltaMessage | None, str, bool]:
+        """Detect a tool-call start marker emitted while still reasoning.
+
+        Streaming counterpart of :meth:`_recover_tool_calls_from_reasoning`.
+        When the model omits a reasoning end marker before a ``<...tool_calls>``
+        block, the block would otherwise be streamed out as reasoning and the
+        tool call lost. This watches the reasoning stream for the start marker,
+        buffering any trailing partial-marker text so it is never leaked as
+        reasoning.
+
+        Returns ``(delta_message, carry_text, ended)``. When ``ended`` is True,
+        the reasoning delta has been trimmed to stop right before the marker and
+        ``carry_text`` (marker + trailing text) should be handed to the
+        tool-call phase. Only applies to tool parsers that opt in via
+        ``recovers_tool_calls_in_reasoning``; others are left untouched.
+        """
+        if not self._tool_parser_recovers_in_reasoning():
+            return delta_message, "", False
+        tool_parser = self._tool_parser
+        assert tool_parser is not None
+        start = tool_parser.tool_call_start_token
+        assert start is not None
+
+        reasoning_delta = (
+            delta_message.reasoning if delta_message and delta_message.reasoning else ""
+        )
+        # Nothing buffered and nothing new to inspect: leave the delta as-is.
+        if not reasoning_delta and not state.pending_reasoning:
+            return delta_message, "", False
+
+        buf = state.pending_reasoning + reasoning_delta
+        idx = buf.find(start)
+        if idx != -1:
+            # Full marker found: emit reasoning up to it, hand off the rest.
+            state.pending_reasoning = ""
+            emitted = buf[:idx]
+            carry = buf[idx:]
+            if delta_message is None:
+                delta_message = DeltaMessage()
+            delta_message.reasoning = emitted or None
+            delta_message.content = None
+            return delta_message, carry, True
+
+        # No full marker. Withhold any trailing run that could begin one, unless
+        # the stream has finished (in which case it was never a marker).
+        overlap = 0 if finished else partial_tag_overlap(buf, start)
+        emitted = buf[: len(buf) - overlap] if overlap else buf
+        state.pending_reasoning = buf[len(buf) - overlap :] if overlap else ""
+
+        if not emitted:
+            # Everything is withheld this round; emit no reasoning.
+            if delta_message is not None:
+                delta_message.reasoning = None
+            return delta_message, "", False
+        if delta_message is None:
+            delta_message = DeltaMessage()
+        delta_message.reasoning = emitted
+        return delta_message, "", False
 
     def parse_delta(
         self,
@@ -750,11 +985,12 @@ class DelegatingParser(Parser):
         *,
         finished: bool,
     ) -> DeltaMessage | None:
+        self._initialize_history_tool_call_cnt(request)
         state = self._stream_state
 
         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
             state.prompt_reasoning_checked = True
-            if self._reasoning_parser is None or self.is_reasoning_end(
+            if self._reasoning_parser is None or self.is_reasoning_end_for_prompt(
                 prompt_token_ids
             ):
                 state.reasoning_ended = True
@@ -807,6 +1043,22 @@ class DelegatingParser(Parser):
                         else ""
                     )
                     delta_text = current_text
+            else:
+                # In-reasoning tool-call recovery: Check whether the model
+                # emitted a tool-call marker without first closing the reasoning
+                # channel. Detect it mid-stream, stop reasoning right before it,
+                # and hand the marker (plus the rest) to the tool-call phase
+                # below.
+                delta_message, carry_text, marker_ended = (
+                    self._intercept_in_reasoning_tool_marker(
+                        state, delta_message, finished=finished
+                    )
+                )
+                if marker_ended:
+                    state.reasoning_ended = True
+                    current_text = carry_text
+                    delta_text = carry_text
+                    delta_token_ids = current_token_ids
 
         # Tool call extraction
         if self._in_tool_call_phase(state):
