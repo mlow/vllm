@@ -149,8 +149,14 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
+DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
+    DSparkModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -388,6 +394,7 @@ class SpeculativeConfig:
             "eagle3",
             "extract_hidden_states",
             "dflash",
+            "dspark",
         )
         factors.append(uses_aux_hidden_states)
 
@@ -406,6 +413,12 @@ class SpeculativeConfig:
                     layer_ids = [
                         i + 1 for i in dflash_config.get("target_layer_ids", [])
                     ]
+            if not layer_ids:
+                layer_ids = getattr(
+                    self.draft_model_config.hf_config,
+                    "dspark_target_layer_ids",
+                    None,
+                )
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
@@ -457,9 +470,7 @@ class SpeculativeConfig:
                                     if not _quant_config_targets_prefix(
                                         quant_config, module_prefix
                                     ):
-                                        _extend_unique(
-                                            ignored, [f"{module_prefix}*"]
-                                        )
+                                        _extend_unique(ignored, [f"{module_prefix}*"])
                             else:
                                 if _quant_config_targets_prefix(quant_config, prefix):
                                     continue
@@ -764,6 +775,15 @@ class SpeculativeConfig:
                 # --quantization fp8 with a bf16 checkpoint.
                 if not self.quantization:
                     self.quantization = self.target_model_config.quantization
+            elif self.method == "dspark":
+                if self.target_model_config is None:
+                    raise ValueError("target_model_config must be present for dspark")
+                # DeepSeek V4 DSpark ships the draft module inside the target
+                # checkpoint under the mtp.* namespace. It is not the serial MTP
+                # architecture, so it is routed to its own speculator below.
+                self.model = self.target_model_config.model
+                if not self.quantization:
+                    self.quantization = self.target_model_config.quantization
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
             elif self.method == "ngram_gpu":
@@ -891,7 +911,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -903,6 +923,8 @@ class SpeculativeConfig:
                     self.method = "eagle3"
                 elif "dflash" in self.draft_model_config.model.lower():
                     self.method = "dflash"
+                elif "dspark" in self.draft_model_config.model.lower():
+                    self.method = "dspark"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
@@ -951,6 +973,15 @@ class SpeculativeConfig:
 
                 if self.method == "dflash":
                     self.parallel_drafting = True
+                elif self.method == "dspark":
+                    self.parallel_drafting = True
+                    block_size = getattr(
+                        self.draft_model_config.hf_config,
+                        "dspark_block_size",
+                        None,
+                    )
+                    if self.num_speculative_tokens is None and block_size:
+                        self.num_speculative_tokens = int(block_size)
 
                 if self.num_speculative_tokens is not None and hasattr(
                     self.draft_model_config.hf_config, "num_lookahead_tokens"
@@ -1296,14 +1327,17 @@ class SpeculativeConfig:
         )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp", "dflash")
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
 
     def requires_eagle_cache_drop(self) -> bool:
         """Whether prefix cache hits must drop one block for hidden states."""
-        return self.use_eagle() and not self.use_dflash()
+        return self.use_eagle() and not (self.use_dflash() or self.use_dspark())
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_dspark(self) -> bool:
+        return self.method == "dspark"
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
