@@ -13,6 +13,10 @@ from vllm.models.deepseek_v4.nvidia.dspark import (
     _build_dspark_topk_idxs,
     _read_dspark_num_layers,
 )
+from vllm.models.deepseek_v4.nvidia.ops.dspark_sparse_attn_tilelang import (
+    _get_tilelang_block_size,
+    _get_tilelang_padded_heads,
+)
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import _get_target_layer_ids
 
 
@@ -129,6 +133,37 @@ def test_build_dspark_topk_idxs_uses_rolling_target_window_then_draft_block():
         dtype=torch.int32,
     )
     torch.testing.assert_close(idxs, expected)
+
+
+@pytest.mark.parametrize(
+    ("heads", "expected"),
+    [
+        (1, 64),
+        (16, 64),
+        (32, 32),
+        (64, 64),
+    ],
+)
+def test_dspark_tilelang_sparse_attn_pads_tp4_head_count(heads, expected):
+    assert _get_tilelang_padded_heads(heads) == expected
+
+
+def test_dspark_tilelang_sparse_attn_rejects_oversized_head_count():
+    with pytest.raises(ValueError, match="at most 64 local heads"):
+        _get_tilelang_padded_heads(128)
+
+
+@pytest.mark.parametrize(
+    ("heads", "expected"),
+    [
+        (32, 32),
+        (64, 16),
+    ],
+)
+def test_dspark_tilelang_sparse_attn_uses_small_tile_for_padded_heads(
+    heads, expected
+):
+    assert _get_tilelang_block_size(heads) == expected
 
 
 def test_dspark_b12x_output_projection_uses_attention_helper():
