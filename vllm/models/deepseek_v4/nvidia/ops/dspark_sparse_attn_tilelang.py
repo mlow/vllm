@@ -14,38 +14,6 @@ from typing import Any
 import torch
 
 
-_TILELANG_MIN_MMA_HEADS = 64
-_TILELANG_MIN_DIRECT_HEADS = 32
-_TILELANG_MAX_SUPPORTED_HEADS = 64
-_TILELANG_SMALL_HEAD_BLOCK = 16
-_TILELANG_DEFAULT_BLOCK = 32
-
-
-def _get_tilelang_padded_heads(heads: int) -> int:
-    """Return the DSpark TileLang kernel-facing head count.
-
-    TP2 DeepSeek V4 DSpark has 32 local heads and compiles with the original
-    32-token top-k tile, so keep that fast path unchanged.  TP4 has 16 local
-    heads, which TileLang rejects for this MMA layout.  Pad only that
-    kernel-facing head dimension and slice the output back to the real count.
-    """
-    if heads < _TILELANG_MIN_DIRECT_HEADS:
-        return _TILELANG_MIN_MMA_HEADS
-    if heads > _TILELANG_MAX_SUPPORTED_HEADS:
-        raise ValueError(
-            "DSpark TileLang sparse attention supports at most "
-            f"{_TILELANG_MAX_SUPPORTED_HEADS} local heads, got {heads}"
-        )
-    return heads
-
-
-def _get_tilelang_block_size(heads: int) -> int:
-    """Return the sparse-attention top-k tile size for a kernel head count."""
-    if heads >= _TILELANG_MIN_MMA_HEADS:
-        return _TILELANG_SMALL_HEAD_BLOCK
-    return _TILELANG_DEFAULT_BLOCK
-
-
 @cache
 def _build_dspark_sparse_attn_kernel(num_heads: int, head_dim: int, scale: float):
     import tilelang
@@ -68,12 +36,16 @@ def _build_dspark_sparse_attn_kernel(num_heads: int, head_dim: int, scale: float
         topk = T.symbolic("topk")
 
         num_stages = 2
-        threads = 256
-        # Small-head TP shards are padded to 64 heads to satisfy TileLang's MMA
-        # warp layout. Use a smaller top-k tile for those kernels so the
-        # combined q/kv/out/scores shared-memory footprint still fits under the
-        # sm120 per-block dynamic shared-memory limit.
-        block = _get_tilelang_block_size(h)
+        # TP4 has 16 DSpark heads per rank. With 8 warps, TileLang's FullRow
+        # repartition leaves too few warp-column tiles for this MMA layout.
+        # Use 4 warps for that native-head path; TP2 keeps the measured faster
+        # 8-warps path.
+        threads = 128 if num_heads <= 16 else 256
+        # The upstream DSpark reference uses 64, which asks for ~104 KiB
+        # dynamic shared memory on DeepSeek V4 head dims and is rejected on
+        # this sm120 stack. 32 keeps the same online-softmax algorithm while
+        # fitting under the per-block shared-memory limit.
+        block = 32
         num_blocks = tilelang.cdiv(topk, block)
 
         @T.prim_func
@@ -184,8 +156,9 @@ def dspark_sparse_attn(
         topk_idxs = topk_idxs.to(torch.int32)
 
     batch, draft_tokens, heads, head_dim = q.shape
-    padded_heads = _get_tilelang_padded_heads(heads)
-    if padded_heads != heads:
+    padded_heads = heads
+    if heads < 16:
+        padded_heads = 16
         q = torch.cat(
             [q, q.new_zeros(batch, draft_tokens, padded_heads - heads, head_dim)],
             dim=2,
@@ -197,7 +170,7 @@ def dspark_sparse_attn(
     out = torch.empty_like(q)
     kernel = _build_dspark_sparse_attn_kernel(padded_heads, head_dim, softmax_scale)
     kernel(q.contiguous(), kv.contiguous(), out, attn_sink.contiguous(), topk_idxs)
-    if padded_heads != heads:
+    if heads < 16:
         return out.narrow(2, 0, heads).contiguous()
     return out
 
