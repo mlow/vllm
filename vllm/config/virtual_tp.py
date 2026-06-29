@@ -99,13 +99,10 @@ def _build_b12x_virtual_tp_plan(
 
     original_attention_heads = _require_int_attr(text_config, "num_attention_heads")
     # DeepSeek V4 carries output-group constraints tied to padded head count.
-    # GLM/DSA usually only needs divisibility by TP. However, when GLM needs
-    # virtual attention-head padding (for example 64 heads on TP6), B12X MG
-    # prefill must receive a full local HPB shard: 64->66 gives 11 local heads
-    # and the B12X wrapper pads that partial HPB to 16 without a valid_hpb mask,
-    # corrupting long-context output. Keep the no-padding GLM path for TP sizes
-    # that already divide the model heads, notably TP8/TP16.
-    if is_deepseek_v4 or original_attention_heads % attention_tp_size:
+    # GLM/DSA only needs divisibility by TP at the model-config level. B12X
+    # sparse MLA handles partial local head blocks by padding/slicing inside the
+    # backend, so GLM TP6 can stay 64->66 instead of inflating to 96 heads.
+    if is_deepseek_v4:
         attention_head_alignment = _ATTENTION_HEAD_LOCAL_ALIGNMENT
     else:
         attention_head_alignment = 1
