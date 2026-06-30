@@ -757,8 +757,16 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         rows_to_warm = (1, 2, 4, max(1, int(max_batched)))
         seen_rows: set[int] = set()
-        # GLM fp8_ds_mla cache records are 656 B/token. One page is enough:
-        # prewarm top-k indices all point at slot zero.
+        # GLM fp8_ds_mla cache records are 656 B/token; the real KV cache is
+        # laid out (num_blocks, block_size, 656) (see the allocator at the
+        # block-shape branch above), so a page's stride(0) = block_size*656.
+        # The prewarm dummy must match that layout -- (1, block_size, 656) --
+        # so _cache_block_stride_bytes sees stride >= page_size*656. The prior
+        # (block_size, 1, 656) shape put block_size in dim 0, giving stride(0)
+        # = 656 < page_size*656, which tripped the SM120 stride assertion
+        # whenever this prewarm ran (i.e. spec + cudagraphs, the first config
+        # to reach here; verifier-only and eager-snap both skipped it).
+        # One page is enough: prewarm top-k indices all point at slot zero.
         kv_cache = torch.zeros(
             (1, self.block_size, 656), dtype=torch.uint8, device=self.device
         )
