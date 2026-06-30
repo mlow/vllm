@@ -132,6 +132,15 @@ class CausalCascadeLiveState:
         self._max_num_batched_tokens = int(
             getattr(vllm_config.scheduler_config, "max_num_batched_tokens", 0) or 0
         )
+        max_num_seqs = int(
+            getattr(vllm_config.scheduler_config, "max_num_seqs", 0) or 0
+        )
+        # Native capture only runs for decode/speculative rows. Some verifier
+        # graph shapes include one extra row per request, so reserve block+1.
+        self._capture_max_rows = min(
+            self._max_num_batched_tokens,
+            max_num_seqs * (self._block_size + 1),
+        )
         hf_config = getattr(vllm_config.model_config, "hf_config", None)
         self._hidden_size = int(getattr(hf_config, "hidden_size", 0) or 0)
         self._is_tp_rank_zero = get_tensor_model_parallel_rank() == 0
@@ -150,11 +159,13 @@ class CausalCascadeLiveState:
             )
         logger.info(
             "CausalCascade native live state configured layers=%s topk=%d "
-            "block_size=%d max_num_batched_tokens=%d hidden_size=%d tp_rank0=%s",
+            "block_size=%d max_num_batched_tokens=%d capture_max_rows=%d "
+            "hidden_size=%d tp_rank0=%s",
             self._layer_ids,
             self._topk,
             self._block_size,
             self._max_num_batched_tokens,
+            self._capture_max_rows,
             self._hidden_size,
             self._is_tp_rank_zero,
         )
@@ -475,6 +486,34 @@ class CausalCascadeLiveState:
                 :,
                 :layer_topk,
             ].to(torch.int32)
+            cache_lens = buffer.cache_lens.index_select(
+                0,
+                row_index,
+            ).to(torch.long)
+            if torch.any(cache_lens <= 0):
+                missing(
+                    "nonpositive_cache_lens",
+                    layer_id=layer_id,
+                    cache_lens=cache_lens.detach().cpu().tolist(),
+                )
+                return None
+            if selected_cache_lens is not None and not torch.equal(
+                cache_lens,
+                selected_cache_lens,
+            ):
+                missing("cache_len_layer_mismatch", layer_id=layer_id)
+                return None
+            invalid_topk = valid_mask & (
+                (topk_indices < 0)
+                | (topk_indices.to(torch.long) >= cache_lens.unsqueeze(1))
+            )
+            if torch.any(invalid_topk):
+                missing(
+                    "noncausal_topk_indices",
+                    layer_id=layer_id,
+                    invalid_count=int(invalid_topk.sum().item()),
+                )
+                return None
 
             gathered, valid_mask = pack_sparse_mla_rows(flat_cache, physical_slots)
             packed_layers.append(gathered)
@@ -483,14 +522,9 @@ class CausalCascadeLiveState:
             valid_mask_layers.append(valid_mask.contiguous())
 
             if anchor_pos is None:
-                cache_lens = buffer.cache_lens.index_select(
-                    0,
-                    row_index,
-                ).to(torch.long)
-                topk_anchor_pos = topk_indices.to(torch.long).amax(dim=1)
-                anchor_pos = torch.where(
-                    topk_anchor_pos >= 0, topk_anchor_pos, cache_lens - 1
-                )
+                # Exact per-query causal lengths come from B12X metadata. The
+                # sparse top-k set need not include the query position itself.
+                anchor_pos = cache_lens - 1
                 selected_cache_lens = cache_lens.contiguous()
                 selected_nsa_lens = (
                     buffer.nsa_lens.index_select(
@@ -582,10 +616,10 @@ class CausalCascadeLiveState:
         }
 
     def _allocate_capture_buffers(self, device: torch.device) -> None:
-        if self._max_num_batched_tokens <= 0:
+        if self._capture_max_rows <= 0:
             logger.warning_once(
                 "CausalCascade live state cannot allocate capture buffers because "
-                "max_num_batched_tokens is unset."
+                "the decode capture capacity is unset."
             )
             return
         if self._hidden_size <= 0:
@@ -596,11 +630,11 @@ class CausalCascadeLiveState:
         elif (
             self._anchor_hidden_state_buffer is None
             or self._anchor_hidden_state_buffer.device != device
-            or self._anchor_hidden_state_buffer.shape[0] < self._max_num_batched_tokens
+            or self._anchor_hidden_state_buffer.shape[0] < self._capture_max_rows
             or self._anchor_hidden_state_buffer.shape[1] != self._hidden_size
         ):
             self._anchor_hidden_state_buffer = torch.empty(
-                (self._max_num_batched_tokens, self._hidden_size),
+                (self._capture_max_rows, self._hidden_size),
                 device=device,
                 dtype=torch.bfloat16,
             )
@@ -610,38 +644,38 @@ class CausalCascadeLiveState:
             if (
                 existing is not None
                 and existing.page_table.device == device
-                and existing.page_table.shape[0] >= self._max_num_batched_tokens
+                and existing.page_table.shape[0] >= self._capture_max_rows
                 and existing.page_table.shape[1] >= self._topk
             ):
                 continue
             self._capture_buffers[layer_id] = _LayerCaptureBuffer(
                 page_table=torch.empty(
-                    (self._max_num_batched_tokens, self._topk),
+                    (self._capture_max_rows, self._topk),
                     device=device,
                     dtype=torch.int32,
                 ),
                 topk_indices=torch.empty(
-                    (self._max_num_batched_tokens, self._topk),
+                    (self._capture_max_rows, self._topk),
                     device=device,
                     dtype=torch.int32,
                 ),
                 nsa_lens=torch.empty(
-                    self._max_num_batched_tokens,
+                    self._capture_max_rows,
                     device=device,
                     dtype=torch.int32,
                 ),
                 cache_lens=torch.empty(
-                    self._max_num_batched_tokens,
+                    self._capture_max_rows,
                     device=device,
                     dtype=torch.int32,
                 ),
                 req_ids=torch.empty(
-                    self._max_num_batched_tokens,
+                    self._capture_max_rows,
                     device=device,
                     dtype=torch.int32,
                 ),
                 token_ids=torch.empty(
-                    self._max_num_batched_tokens,
+                    self._capture_max_rows,
                     device=device,
                     dtype=torch.long,
                 ),
