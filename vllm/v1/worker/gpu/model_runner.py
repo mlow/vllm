@@ -121,17 +121,6 @@ from vllm.v1.worker.utils import KVBlockZeroer
 logger = init_logger(__name__)
 
 
-def _profile_batch_phase(input_batch: InputBatch) -> str:
-    if input_batch.num_draft_tokens > 0:
-        return "verify"
-    if (
-        input_batch.max_query_len <= 1
-        and input_batch.num_tokens == input_batch.num_reqs
-    ):
-        return "decode"
-    return "prefill"
-
-
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -1413,7 +1402,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        phase = _profile_batch_phase(input_batch)
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
@@ -1489,57 +1477,50 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if hasattr(self.model, "get_mtp_target_hidden_states"):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
-            with record_function_or_nullcontext(
-                f"vllm:v2/speculator/{phase}/propose"
-            ):
-                draft_tokens = self.speculator.propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    spec_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    self.req_states.last_sampled_tokens,
-                    self.req_states.next_prefill_tokens,
-                    self.sampler.sampling_states.temperature.gpu,
-                    self.sampler.sampling_states.seeds.gpu,
-                    mm_inputs=mm_inputs,
+
+            draft_tokens = self.speculator.propose(
+                input_batch,
+                attn_metadata,
+                slot_mappings_by_layer,
+                spec_hidden_states,
+                aux_hidden_states,
+                num_sampled,
+                num_rejected,
+                self.req_states.last_sampled_tokens,
+                self.req_states.next_prefill_tokens,
+                self.sampler.sampling_states.temperature.gpu,
+                self.sampler.sampling_states.seeds.gpu,
+                mm_inputs=mm_inputs,
+            )
+
+            if draft_tokens.shape[1] == self.num_speculative_steps:
+                self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                draft_tokens_for_next_step = self.req_states.draft_tokens[
+                    input_batch.idx_mapping
+                ]
+            elif draft_tokens.shape[1] == 0:
+                # Some block speculators can intentionally decline to draft
+                # on the next step (for example after a full rejection while
+                # their private KV state is being realigned). Keep the
+                # persistent fixed-width buffer untouched, but report an
+                # empty draft list to the scheduler for the next iteration.
+                draft_tokens_for_next_step = draft_tokens
+            else:
+                raise RuntimeError(
+                    "Speculator returned unsupported draft shape "
+                    f"{tuple(draft_tokens.shape)}; expected "
+                    f"(*, {self.num_speculative_steps}) or (*, 0)."
                 )
-            with record_function_or_nullcontext(
-                f"vllm:v2/speculator/{phase}/store_draft_tokens"
-            ):
-                if draft_tokens.shape[1] == self.num_speculative_steps:
-                    self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
-                    draft_tokens_for_next_step = self.req_states.draft_tokens[
-                        input_batch.idx_mapping
-                    ]
-                elif draft_tokens.shape[1] == 0:
-                    # Some block speculators can intentionally decline to draft
-                    # on the next step (for example after a full rejection while
-                    # their private KV state is being realigned). Keep the
-                    # persistent fixed-width buffer untouched, but report an
-                    # empty draft list to the scheduler for the next iteration.
-                    draft_tokens_for_next_step = draft_tokens
-                else:
-                    raise RuntimeError(
-                        "Speculator returned unsupported draft shape "
-                        f"{tuple(draft_tokens.shape)}; expected "
-                        f"(*, {self.num_speculative_steps}) or (*, 0)."
-                    )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            with record_function_or_nullcontext(
-                f"vllm:v2/target/{phase}/set_draft_tokens"
-            ):
-                self.draft_tokens_handler.set_draft_tokens(
-                    input_batch,
-                    draft_tokens_for_next_step
-                    if draft_tokens_for_next_step is not None
-                    else self.req_states.draft_tokens[input_batch.idx_mapping],
-                )
+            self.draft_tokens_handler.set_draft_tokens(
+                input_batch,
+                draft_tokens_for_next_step
+                if draft_tokens_for_next_step is not None
+                else self.req_states.draft_tokens[input_batch.idx_mapping],
+            )
 
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
