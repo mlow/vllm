@@ -18,6 +18,32 @@ class _FakePlan:
         return [SimpleNamespace(dtype=torch.uint8, shape=(64,))]
 
 
+def _make_fake_prepared_experts(
+    *,
+    quant_mode: str = "nvfp4",
+    activation: str = "swigluoai_uninterleave",
+    num_experts: int = 8,
+    hidden_size: int = 64,
+    intermediate_size: int = 16,
+    plan=None,
+):
+    if plan is None:
+        plan = SimpleNamespace(
+            quant_modes=frozenset({quant_mode}),
+            io_dtype="bfloat16",
+            activation=activation,
+            discards_source_parameters=False,
+        )
+    return SimpleNamespace(
+        plan=plan,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
+        w1_fp4=torch.empty(1, dtype=torch.uint8),
+    )
+
+
 def _make_fake_b12x_experts() -> b12x_moe.B12xExperts:
     num_experts = 8
     experts = object.__new__(b12x_moe.B12xExperts)
@@ -51,15 +77,8 @@ def _make_fake_b12x_experts() -> b12x_moe.B12xExperts:
         w1_bias=None,
         w2_bias=None,
     )
-    experts._prepared_fp4_moe_by_dtype = {
-        torch.bfloat16: SimpleNamespace(
-            w1_runtime_alphas=torch.ones(num_experts, dtype=torch.float32),
-            w2_runtime_alphas=torch.ones(num_experts, dtype=torch.float32),
-            w4a16=None,
-            w4a8_tier=None,
-        )
-    }
-    experts._source_params_compacted = False
+    experts._prepared_experts = _make_fake_prepared_experts()
+    experts._source_parameters_released = False
     experts._unit_scale_by_device = {}
     experts._activation_amax_base_num_layers = None
     experts._activation_amax_state_key = None
@@ -118,6 +137,119 @@ def test_b12x_moe_custom_op_matches_generic_mutation_contract() -> None:
     assert "Tensor(a0!) hidden_states" in b12x_shared_schema
 
 
+def test_b12x_moe_run_binds_only_the_prepared_expert_owner(monkeypatch) -> None:
+    import b12x.integration.tp_moe as b12x_tp_moe
+
+    execute_calls = []
+
+    class Plan:
+        bind_kwargs = None
+
+        def bind(self, **kwargs):
+            self.bind_kwargs = kwargs
+            return "binding"
+
+    monkeypatch.setattr(
+        b12x_tp_moe,
+        "b12x_moe_fp4",
+        lambda *, binding: execute_calls.append(binding),
+    )
+    plan = Plan()
+    experts = object()
+    a = torch.empty(2, 16, dtype=torch.bfloat16)
+    output = torch.empty_like(a)
+    topk_ids = torch.zeros(2, 4, dtype=torch.int32)
+    topk_weights = torch.full((2, 4), 0.25, dtype=torch.float32)
+    scratch = torch.empty(64, dtype=torch.uint8)
+
+    b12x_moe._run_b12x_moe_fp4(
+        a=a,
+        experts=experts,
+        output=output,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        input_scales_static=True,
+        unit_scale_contract=False,
+        plan=plan,
+        scratch=scratch,
+    )
+
+    assert execute_calls == ["binding"]
+    assert plan.bind_kwargs == {
+        "scratch": scratch,
+        "a": a,
+        "experts": experts,
+        "topk_weights": topk_weights,
+        "topk_ids": topk_ids,
+        "output": output,
+        "input_scales_static": True,
+        "unit_scale_contract": False,
+        "activation_amax": None,
+        "layer_idx": None,
+    }
+
+
+def test_b12x_source_release_leaves_prepared_owner_as_storage_owner() -> None:
+    layer = torch.nn.Module()
+    layer.w13_weight = torch.nn.Parameter(
+        torch.empty(8, 32, 16, dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        torch.empty(8, 64, 8, dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.empty(8, 32, 2, dtype=torch.uint8),
+        requires_grad=False,
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.empty(8, 64, 1, dtype=torch.uint8),
+        requires_grad=False,
+    )
+    experts = _make_fake_b12x_experts()
+    experts.quant_config._w1 = SimpleNamespace(scale=layer.w13_weight_scale)
+    experts.quant_config._w2 = SimpleNamespace(scale=layer.w2_weight_scale)
+    owner = SimpleNamespace(
+        w1_fp4=layer.w13_weight,
+        w2_fp4=layer.w2_weight,
+        w1_blockscale=layer.w13_weight_scale,
+        w2_blockscale=layer.w2_weight_scale,
+    )
+    experts._prepared_experts = owner
+    owner_ptrs = tuple(
+        tensor.untyped_storage().data_ptr()
+        for tensor in (
+            owner.w1_fp4,
+            owner.w2_fp4,
+            owner.w1_blockscale,
+            owner.w2_blockscale,
+        )
+    )
+
+    experts._release_source_parameters(layer)
+    experts._release_source_parameters(layer)
+
+    assert layer.w13_weight.numel() == 0
+    assert layer.w2_weight.numel() == 0
+    assert layer.w13_weight_scale.numel() == 0
+    assert layer.w2_weight_scale.numel() == 0
+    assert experts.quant_config._w1.scale.numel() == 0
+    assert experts.quant_config._w2.scale.numel() == 0
+    assert (
+        tuple(
+            tensor.untyped_storage().data_ptr()
+            for tensor in (
+                owner.w1_fp4,
+                owner.w2_fp4,
+                owner.w1_blockscale,
+                owner.w2_blockscale,
+            )
+        )
+        == owner_ptrs
+    )
+
+
 def test_b12x_moe_warmup_uses_minimax_swiglu_params(monkeypatch) -> None:
     plan_calls = []
     run_calls = []
@@ -151,12 +283,10 @@ def test_b12x_moe_warmup_uses_minimax_swiglu_params(monkeypatch) -> None:
     assert len(run_calls) == 1
     assert plan_calls[0]["tokens"] == 7
     assert plan_calls[0]["quant_mode"] == "nvfp4"
-    assert plan_calls[0]["source_format"] == "modelopt_nvfp4"
-    assert plan_calls[0]["w13_layout"] == "w31"
-    assert plan_calls[0]["activation"] == "swigluoai_uninterleave"
     assert plan_calls[0]["swiglu_limit"] == 7.0
     assert plan_calls[0]["swiglu_alpha"] == 1.702
     assert plan_calls[0]["swiglu_beta"] == 1.0
+    assert plan_calls[0]["experts"] is experts._prepared_experts
 
     assert run_calls[0]["a"].shape == (7, 64)
     assert run_calls[0]["output"].shape == (7, 64)
@@ -164,7 +294,8 @@ def test_b12x_moe_warmup_uses_minimax_swiglu_params(monkeypatch) -> None:
     assert run_calls[0]["topk_weights"].dtype == torch.float32
     assert run_calls[0]["scratch"].dtype == torch.uint8
     assert run_calls[0]["scratch"].numel() == 64
-    assert run_calls[0]["input_scales_are_reciprocal"] is True
+    assert run_calls[0]["experts"] is experts._prepared_experts
+    assert run_calls[0]["input_scales_static"] is True
 
 
 def test_b12x_force_a16_nvfp4_selects_w4a16(monkeypatch) -> None:
@@ -233,11 +364,12 @@ def test_b12x_activation_amax_is_passed_as_separate_binding_arg(
     num_experts = 8
     hidden_size = 16
     experts = _make_fake_b12x_experts()
-    experts._prepared_fp4_moe_by_dtype[torch.bfloat16].w4a16 = SimpleNamespace(
+    experts._prepared_experts = _make_fake_prepared_experts(
+        quant_mode="w4a16",
+        activation="swigluoai_uninterleave",
         num_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=32,
-        w13=torch.empty(1),
     )
     experts._register_activation_amax(
         layer=SimpleNamespace(layer_name="model.layers.2.mlp.experts"),
@@ -331,33 +463,49 @@ def test_b12x_activation_amax_save_every_writes_main_and_mtp_files(
     assert payloads["mtp"]["layers"][0]["external_layer_idx"] == 60
 
 
-def test_b12x_force_a8_mxfp4_prepares_w4a8_tier(monkeypatch) -> None:
+def test_b12x_force_a8_mxfp4_prepares_one_expert_owner(monkeypatch) -> None:
+    import b12x.integration as b12x_integration
+
     monkeypatch.setenv("B12X_MOE_FORCE_A16", "1")
     monkeypatch.setenv("B12X_FORCE_MOE_A8", "1")
 
-    calls = []
-    w4a8_tier = SimpleNamespace(
-        num_experts=8,
-        hidden_size=256,
-        intermediate_size=128,
-        params_dtype=torch.bfloat16,
-        w13_rp=torch.empty((1,), dtype=torch.uint8),
+    plan_calls = []
+    prepare_calls = []
+    weight_plan = SimpleNamespace(
+        quant_modes=frozenset({"w4a8_mx"}),
+        io_dtype="bfloat16",
+        activation="silu",
+        discards_source_parameters=True,
     )
 
+    def fake_plan(**kwargs):
+        plan_calls.append(kwargs)
+        return weight_plan
+
     def fake_prepare(**kwargs):
-        calls.append(kwargs)
-        return SimpleNamespace(
-            source_format=kwargs["source_format"],
-            w13_layout=kwargs["w13_layout"],
-            w1_runtime_alphas=None,
-            w2_runtime_alphas=None,
-            w4a16=None,
-            w4a8_tier=w4a8_tier,
+        prepare_calls.append(kwargs)
+        return _make_fake_prepared_experts(
+            quant_mode="w4a8_mx",
+            activation="silu",
+            num_experts=8,
+            hidden_size=256,
+            intermediate_size=128,
+            plan=weight_plan,
         )
 
-    monkeypatch.setattr(b12x_moe, "_prepare_b12x_fp4_moe_weights", fake_prepare)
+    monkeypatch.setattr(
+        b12x_integration,
+        "plan_b12x_fp4_moe_weights",
+        fake_plan,
+    )
+    monkeypatch.setattr(
+        b12x_integration,
+        "prepare_b12x_fp4_moe_weights",
+        fake_prepare,
+    )
 
     experts = _make_fake_b12x_experts()
+    experts._prepared_experts = None
     experts.quant_config.quant_dtype = "mxfp4"
     experts.quant_config.weight_quant_dtype = "mxfp4"
     experts.quant_config.g1_alphas = None
@@ -369,7 +517,7 @@ def test_b12x_force_a8_mxfp4_prepares_w4a8_tier(monkeypatch) -> None:
     w1 = torch.empty((8, 256, 128), dtype=torch.uint8)
     w2 = torch.empty((8, 256, 64), dtype=torch.uint8)
 
-    prepared = experts._get_or_prepare_fp4_moe_weights(
+    prepared = experts._get_or_prepare_experts(
         w1=w1,
         w2=w2,
         activation=MoEActivation.SILU,
@@ -377,16 +525,17 @@ def test_b12x_force_a8_mxfp4_prepares_w4a8_tier(monkeypatch) -> None:
     )
 
     assert experts._quant_mode() == "w4a8_mx"
-    assert prepared.w4a8_tier is w4a8_tier
-    assert len(calls) == 1
-    assert calls[0]["source_format"] == "fp4_e8m0_k32"
-    assert calls[0]["w13_layout"] == "w31"
-    assert calls[0]["prepare_runtime_alphas"] is False
-    assert calls[0]["prepare_w4a16"] is False
-    assert calls[0]["prepare_w4a8_tier"] is True
-    assert calls[0]["reuse_input_storage"] is True
-    assert torch.equal(calls[0]["w1_global_scale"], torch.ones(8))
-    assert torch.equal(calls[0]["w2_global_scale"], torch.ones(8))
+    assert prepared is experts._prepared_experts
+    assert len(plan_calls) == 1
+    assert plan_calls[0]["quant_modes"] == "w4a8_mx"
+    assert plan_calls[0]["source_format"] == "fp4_e8m0_k32"
+    assert plan_calls[0]["w13_layout"] == "w31"
+    assert len(prepare_calls) == 1
+    assert prepare_calls[0]["plan"] is weight_plan
+    assert prepare_calls[0]["w1_fp4"] is w1
+    assert prepare_calls[0]["w2_fp4"] is w2
+    assert torch.equal(prepare_calls[0]["w1_global_scale"], torch.ones(8))
+    assert torch.equal(prepare_calls[0]["w2_global_scale"], torch.ones(8))
 
 
 def test_warmup_b12x_moe_dynamic_dedupes_signatures(monkeypatch) -> None:
