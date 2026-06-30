@@ -24,11 +24,11 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
 )
-from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.logger import init_logger
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.cudagraph_utils import AttentionStatePair
 from vllm.v1.worker.gpu.input_batch import InputBatch
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.causal_cascade.live_state import (
     configure_causal_cascade_live_state,
     get_causal_cascade_live_state,
@@ -72,9 +72,7 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             os.environ.get("CAUSAL_CASCADE_MIN_CONTEXT_TOKENS", "0")
         )
         if self._ablate_cross_attention:
-            logger.warning(
-                "CausalCascadeSpeculator live sparse-MLA cross attention is ablated"
-            )
+            logger.warning("CausalCascadeSpeculator live sparse-MLA cross attention is ablated")
         logger.info(
             "CausalCascadeSpeculator first live draft slot=%d "
             "use_capture_positions=%s min_context_tokens=%d",
@@ -207,7 +205,9 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         count = self._debug_success_calls
         if not (count <= 5 or count & (count - 1) == 0):
             return
-        sample_tokens = self.draft_tokens[: min(num_reqs, 2)].detach().cpu().tolist()
+        sample_tokens = (
+            self.draft_tokens[: min(num_reqs, 2)].detach().cpu().tolist()
+        )
         rows = live_inputs["mla_cache_rows_packed"]
         position_ids = live_inputs["position_ids"]
         physical_slots = live_inputs["mla_cache_physical_slots"]
@@ -232,7 +232,11 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             int(topk_indices.max().item()),
             float(anchor_hidden_state.float().norm(dim=-1).mean().item()),
             hidden_source,
-            ("n/a" if hidden_max_abs_diff is None else f"{hidden_max_abs_diff:.6f}"),
+            (
+                "n/a"
+                if hidden_max_abs_diff is None
+                else f"{hidden_max_abs_diff:.6f}"
+            ),
             position_ids[: min(num_reqs, 2)].detach().cpu().tolist(),
             sample_tokens,
         )
@@ -326,6 +330,9 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
                 "anchor_token_conditioning",
                 None,
             ),
+            "markov_head_rank": int(
+                getattr(self.model.config, "markov_head_rank", 0)
+            ),
             "row_indices": self._cpu_tensor(row_indices[:dump_reqs]),
             "capture_row_indices": self._cpu_tensor(capture_row_indices[:dump_reqs]),
             "valid_row_ends": self._cpu_tensor(valid_row_ends[:dump_reqs]),
@@ -343,9 +350,7 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             "query_start_loc": self._cpu_tensor(
                 input_batch.query_start_loc[: dump_reqs + 1]
             ),
-            "cu_num_logits": self._cpu_tensor(
-                input_batch.cu_num_logits[: dump_reqs + 1]
-            ),
+            "cu_num_logits": self._cpu_tensor(input_batch.cu_num_logits[: dump_reqs + 1]),
             "logits_indices": self._cpu_tensor(input_batch.logits_indices),
             "expanded_local_pos": self._cpu_tensor(input_batch.expanded_local_pos),
             "verified_input_ids": self._cpu_tensor(
@@ -374,9 +379,7 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             ),
             "verifier_bonus_token_ids": first_reqs(verifier_bonus_token_ids),
             "known_token_ids": first_reqs(known_token_ids),
-            "input_batch_positions_at_rows": self._cpu_tensor(
-                input_anchor_pos[:dump_reqs]
-            ),
+            "input_batch_positions_at_rows": self._cpu_tensor(input_anchor_pos[:dump_reqs]),
             "capture_anchor_pos": self._cpu_tensor(capture_anchor_pos[:dump_reqs]),
             "used_anchor_pos": self._cpu_tensor(live_inputs["anchor_pos"][:dump_reqs]),
             "source_anchor_token_ids": first_reqs(
@@ -522,6 +525,12 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             "anchor_token_conditioning",
             "none",
         )
+        markov_head_enabled = bool(
+            getattr(self.model, "markov_head_enabled", False)
+        )
+        slot1_verifier_head_bypass = bool(
+            getattr(self.model.config, "slot1_verifier_head_bypass", False)
+        )
         first_draft_slot = self._first_draft_slot
         if first_draft_slot < 0 or first_draft_slot >= block_size:
             raise RuntimeError(
@@ -536,6 +545,12 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
                 f"got {self.num_speculative_steps}, max={max_draft_steps}, "
                 f"block_size={block_size}, first_draft_slot={first_draft_slot}, "
                 f"known_token_conditioning={known_token_conditioning!r}"
+            )
+        if markov_head_enabled and first_draft_slot != 1:
+            raise RuntimeError(
+                "CausalCascade Markov decoding requires first_draft_slot=1 so "
+                "the first transition is conditioned on the known verifier "
+                f"bonus token; got {first_draft_slot}"
             )
         configured_topk = getattr(self.model.config, "sparse_topk", None)
         valid_row_ends = (
@@ -558,31 +573,18 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             device=last_sampled.device,
             dtype=torch.long,
         )
-        sampled_bonus_token_ids = (
-            last_sampled.index_select(
-                0,
-                req_state_indices,
-            )
-            .to(device=input_batch.input_ids.device, dtype=torch.long)
-            .reshape(-1)
-        )
-        prefill_bonus_token_ids = (
-            next_prefill_tokens.index_select(
-                0,
-                req_state_indices.to(device=next_prefill_tokens.device),
-            )
-            .to(device=input_batch.input_ids.device, dtype=torch.long)
-            .reshape(-1)
-        )
-        has_sampled_token = (
-            num_sampled[:num_reqs]
-            .to(
-                device=input_batch.input_ids.device,
-                dtype=torch.long,
-            )
-            .reshape(-1)
-            > 0
-        )
+        sampled_bonus_token_ids = last_sampled.index_select(
+            0,
+            req_state_indices,
+        ).to(device=input_batch.input_ids.device, dtype=torch.long).reshape(-1)
+        prefill_bonus_token_ids = next_prefill_tokens.index_select(
+            0,
+            req_state_indices.to(device=next_prefill_tokens.device),
+        ).to(device=input_batch.input_ids.device, dtype=torch.long).reshape(-1)
+        has_sampled_token = num_sampled[:num_reqs].to(
+            device=input_batch.input_ids.device,
+            dtype=torch.long,
+        ).reshape(-1) > 0
         verifier_bonus_token_ids = torch.where(
             has_sampled_token,
             sampled_bonus_token_ids[:num_reqs],
@@ -612,19 +614,13 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             dtype=torch.bool,
         )
         if anchor_token_ids_valid is not None:
-            valid_anchor_tokens = (
-                anchor_token_ids_valid[:num_reqs]
-                .to(
-                    device=input_anchor_token_ids.device,
-                    dtype=torch.bool,
-                )
-                .reshape(-1)
-            )
-            capture_anchor_token_ids = (
-                live_inputs["anchor_token_ids"][:num_reqs]
-                .to(device=input_anchor_token_ids.device, dtype=torch.long)
-                .reshape(-1)
-            )
+            valid_anchor_tokens = anchor_token_ids_valid[:num_reqs].to(
+                device=input_anchor_token_ids.device,
+                dtype=torch.bool,
+            ).reshape(-1)
+            capture_anchor_token_ids = live_inputs["anchor_token_ids"][
+                :num_reqs
+            ].to(device=input_anchor_token_ids.device, dtype=torch.long).reshape(-1)
             input_anchor_token_ids = input_anchor_token_ids.reshape(-1)
             source_anchor_token_ids = torch.where(
                 valid_anchor_tokens,
@@ -690,7 +686,9 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         )
         self._debug_position_mismatch(capture_anchor_pos, input_anchor_pos)
         anchor_pos = (
-            capture_anchor_pos if self._use_capture_positions else input_anchor_pos
+            capture_anchor_pos
+            if self._use_capture_positions
+            else input_anchor_pos
         )
         block_offsets = torch.arange(
             block_size,
@@ -714,7 +712,7 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             dtype=torch.bool,
         )
         known_token_ids = None
-        if known_token_conditioning != "none":
+        if known_token_conditioning != "none" or markov_head_enabled:
             known_token_ids = verifier_bonus_token_ids.reshape(-1)[:num_reqs]
 
         mla_cache_valid_mask = live_inputs.get("mla_cache_valid_mask")
@@ -736,83 +734,96 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         ].contiguous()
 
         if self.draft_logits is None:
-            self.draft_tokens[:num_reqs] = step_logits.argmax(dim=-1)
-            self._maybe_dump_live_inputs(
-                num_reqs=num_reqs,
-                row_indices=aux_row_indices,
-                capture_row_indices=capture_row_indices,
-                valid_row_ends=valid_row_ends,
-                live_inputs=live_inputs,
-                capture_anchor_pos=capture_anchor_pos,
-                input_anchor_pos=input_anchor_pos,
-                capture_position_ids=capture_position_ids,
-                input_position_ids=input_position_ids,
-                anchor_hidden_state=anchor_hidden_state,
-                aux_anchor_hidden_state=aux_anchor_hidden_state,
-                captured_anchor_hidden_state=captured_anchor_hidden_state,
-                logits=logits,
-                step_logits=step_logits,
-                known_token_ids=known_token_ids,
-                verifier_bonus_token_ids=verifier_bonus_token_ids,
-                hidden_source=hidden_source,
-                hidden_max_abs_diff=hidden_max_abs_diff,
-                num_rejected=num_rejected,
-                num_sampled=num_sampled,
-                last_sampled=last_sampled,
-                next_prefill_tokens=next_prefill_tokens,
-                temperature=temperature,
-                input_batch=input_batch,
-                first_draft_slot=first_draft_slot,
-            )
-            self._debug_success(
+            if markov_head_enabled:
+                assert known_token_ids is not None
+                previous_token_ids = known_token_ids
+                corrected_step_logits: list[torch.Tensor] = []
+                for draft_step in range(self.num_speculative_steps):
+                    if draft_step == 0 and slot1_verifier_head_bypass:
+                        current_logits = step_logits[:, draft_step]
+                    else:
+                        current_logits = self.model.apply_markov_head(
+                            step_logits[:, draft_step],
+                            previous_token_ids,
+                        )
+                    previous_token_ids = current_logits.argmax(dim=-1)
+                    corrected_step_logits.append(current_logits)
+                    self.draft_tokens[:num_reqs, draft_step] = previous_token_ids
+                step_logits = torch.stack(corrected_step_logits, dim=1)
+            else:
+                self.draft_tokens[:num_reqs] = step_logits.argmax(dim=-1)
+        else:
+            self._copy_request_inputs(
                 num_reqs,
-                live_inputs,
-                anchor_hidden_state,
-                first_draft_slot,
-                hidden_source,
-                hidden_max_abs_diff,
+                input_batch.idx_mapping,
+                temperature,
+                seeds,
             )
-            return self._finish_proposal(num_reqs)
-
-        self._copy_request_inputs(
-            num_reqs,
-            input_batch.idx_mapping,
-            temperature,
-            seeds,
-        )
-        flat_logits = step_logits.view(-1, step_logits.shape[-1])
-        expanded_idx_mapping = self.idx_mapping[:num_reqs].repeat_interleave(
-            self.num_speculative_steps
-        )
-        positions = live_inputs["position_ids"][
-            :num_reqs,
-            first_draft_slot : first_draft_slot + self.num_speculative_steps,
-        ].reshape(-1)
-        draft_step = (
-            torch.arange(
-                self.num_speculative_steps,
-                device=step_logits.device,
-                dtype=torch.int32,
-            )
-            .unsqueeze(0)
-            .expand(num_reqs, -1)
-            .reshape(-1)
-        )
-        sampled = gumbel_sample(
-            flat_logits,
-            expanded_idx_mapping,
-            self.temperature,
-            self.seeds,
-            positions,
-            apply_temperature=True,
-            output_processed_logits=self.draft_logits,
-            output_processed_logits_col=draft_step,
-            use_fp64=self.use_fp64_gumbel,
-        )
-        self.draft_tokens[:num_reqs] = sampled.view(
-            num_reqs,
-            self.num_speculative_steps,
-        )
+            if markov_head_enabled:
+                assert known_token_ids is not None
+                previous_token_ids = known_token_ids
+                corrected_step_logits = []
+                for draft_step in range(self.num_speculative_steps):
+                    if draft_step == 0 and slot1_verifier_head_bypass:
+                        current_logits = step_logits[:, draft_step]
+                    else:
+                        current_logits = self.model.apply_markov_head(
+                            step_logits[:, draft_step],
+                            previous_token_ids,
+                        )
+                    current_positions = live_inputs["position_ids"][
+                        :num_reqs,
+                        first_draft_slot + draft_step,
+                    ]
+                    output_col = torch.full(
+                        (num_reqs,),
+                        draft_step,
+                        device=current_logits.device,
+                        dtype=torch.int32,
+                    )
+                    previous_token_ids = gumbel_sample(
+                        current_logits,
+                        self.idx_mapping[:num_reqs],
+                        self.temperature,
+                        self.seeds,
+                        current_positions,
+                        apply_temperature=True,
+                        output_processed_logits=self.draft_logits,
+                        output_processed_logits_col=output_col,
+                        use_fp64=self.use_fp64_gumbel,
+                    )
+                    corrected_step_logits.append(current_logits)
+                    self.draft_tokens[:num_reqs, draft_step] = previous_token_ids
+                step_logits = torch.stack(corrected_step_logits, dim=1)
+            else:
+                flat_logits = step_logits.view(-1, step_logits.shape[-1])
+                expanded_idx_mapping = self.idx_mapping[
+                    :num_reqs
+                ].repeat_interleave(self.num_speculative_steps)
+                positions = live_inputs["position_ids"][
+                    :num_reqs,
+                    first_draft_slot : first_draft_slot + self.num_speculative_steps,
+                ].reshape(-1)
+                draft_step = torch.arange(
+                    self.num_speculative_steps,
+                    device=step_logits.device,
+                    dtype=torch.int32,
+                ).unsqueeze(0).expand(num_reqs, -1).reshape(-1)
+                sampled = gumbel_sample(
+                    flat_logits,
+                    expanded_idx_mapping,
+                    self.temperature,
+                    self.seeds,
+                    positions,
+                    apply_temperature=True,
+                    output_processed_logits=self.draft_logits,
+                    output_processed_logits_col=draft_step,
+                    use_fp64=self.use_fp64_gumbel,
+                )
+                self.draft_tokens[:num_reqs] = sampled.view(
+                    num_reqs,
+                    self.num_speculative_steps,
+                )
         self._maybe_dump_live_inputs(
             num_reqs=num_reqs,
             row_indices=aux_row_indices,

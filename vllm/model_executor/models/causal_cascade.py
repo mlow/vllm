@@ -1322,6 +1322,26 @@ class SparseMLAAnchorInitializer(nn.Module):
         return hidden_states + delta
 
 
+class LowRankMarkovHead(nn.Module):
+    """Low-rank previous-token correction for block-parallel draft logits."""
+
+    def __init__(self, vocab_size: int, rank: int) -> None:
+        super().__init__()
+        if vocab_size <= 0:
+            raise ValueError(f"vocab_size must be > 0, got {vocab_size}")
+        if rank <= 0:
+            raise ValueError(f"rank must be > 0, got {rank}")
+        self.embedding = nn.Embedding(vocab_size, rank)
+        self.projection = nn.Linear(rank, vocab_size, bias=False)
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.projection.weight)
+
+    def forward(self, previous_token_ids: torch.Tensor) -> torch.Tensor:
+        return self.projection(self.embedding(previous_token_ids))
+
+
 def compute_sparse_mla_metrics(
     logits: torch.Tensor,
     target_token_ids: torch.Tensor,
@@ -1536,8 +1556,96 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
                 "known_token_conditioning must be 'none' or 'lm_head', got "
                 f"{known_token_conditioning!r}"
             )
+        markov_head_rank = int(getattr(config, "markov_head_rank", 0))
+        if markov_head_rank < 0:
+            raise ValueError(
+                f"markov_head_rank must be >= 0, got {markov_head_rank}"
+            )
+        if markov_head_rank > 0 and config.block_size <= 1:
+            raise ValueError("markov_head_rank requires block_size > 1")
+        self.markov_head = (
+            LowRankMarkovHead(config.draft_vocab_size, markov_head_rank)
+            if markov_head_rank > 0
+            else None
+        )
         self.post_init()
         self.anchor_initializer.reset_parameters()
+        if self.markov_head is not None:
+            self.markov_head.reset_parameters()
+
+    @property
+    def markov_head_enabled(self) -> bool:
+        return self.markov_head is not None
+
+    def apply_markov_head(
+        self,
+        base_logits: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.markov_head is None:
+            return base_logits
+        return base_logits + self.markov_head(previous_token_ids).to(base_logits.dtype)
+
+    def _apply_markov_teacher_forcing(
+        self,
+        base_logits: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        first_previous_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.markov_head is None:
+            return base_logits
+        if first_previous_token_ids is None:
+            first_previous_token_ids = target_token_ids[:, 0]
+        first_previous_token_ids = first_previous_token_ids.to(
+            device=target_token_ids.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        previous_token_ids = torch.cat(
+            [
+                first_previous_token_ids.unsqueeze(1),
+                target_token_ids[:, 1:-1],
+            ],
+            dim=1,
+        )
+        transition_bias = self.markov_head(previous_token_ids).to(base_logits.dtype)
+        if bool(getattr(self.config, "slot1_verifier_head_bypass", False)):
+            transition_bias = torch.cat(
+                [
+                    torch.zeros_like(transition_bias[:, :1]),
+                    transition_bias[:, 1:],
+                ],
+                dim=1,
+            )
+        return torch.cat(
+            [base_logits[:, :1], base_logits[:, 1:] + transition_bias],
+            dim=1,
+        )
+
+    def _markov_greedy_rollout(
+        self,
+        base_logits: torch.Tensor,
+        first_previous_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.markov_head is None:
+            return base_logits[:, 1:].argmax(dim=-1)
+        previous_token_ids = first_previous_token_ids.to(
+            device=base_logits.device,
+            dtype=torch.long,
+        ).reshape(-1)
+        selected: list[torch.Tensor] = []
+        for slot in range(1, base_logits.shape[1]):
+            if slot == 1 and bool(
+                getattr(self.config, "slot1_verifier_head_bypass", False)
+            ):
+                step_logits = base_logits[:, slot]
+            else:
+                step_logits = self.apply_markov_head(
+                    base_logits[:, slot],
+                    previous_token_ids,
+                )
+            previous_token_ids = step_logits.argmax(dim=-1)
+            selected.append(previous_token_ids)
+        return torch.stack(selected, dim=1)
 
     @staticmethod
     def _build_anchor_dropout_probs(
@@ -1990,6 +2098,7 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
             position_1_loss_weight_steps=kwargs.get(
                 "sparse_mla_position_1_loss_weight_steps", 0
             ),
+            markov_head_rank=kwargs.get("sparse_mla_markov_head_rank", 0),
             anchor_dropout_probs=kwargs.get("sparse_mla_anchor_dropout_probs") or [],
             anchor_dropout_start_probs=kwargs.get(
                 "sparse_mla_anchor_dropout_start_probs"
@@ -2688,8 +2797,16 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
             ablate_sparse_mla_cross_attention=ablate_sparse_mla_cross_attention,
         )
 
-        logits = self.lm_head(self.norm(hidden_states))
-        logits = self._apply_slot1_verifier_head_bypass(logits, anchor_context)
+        base_logits = self.lm_head(self.norm(hidden_states))
+        base_logits = self._apply_slot1_verifier_head_bypass(
+            base_logits,
+            anchor_context,
+        )
+        logits = self._apply_markov_teacher_forcing(
+            base_logits,
+            target_token_ids,
+            known_token_ids,
+        )
         position_1_loss_weight = _linear_schedule_value(
             self.config.position_1_loss_weight_start,
             self.config.position_1_loss_weight_end,
@@ -2708,7 +2825,18 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
         metrics.update(self._collect_gate_metrics())
         metrics.update(self._collect_branch_metrics())
         metrics.update(self._anchor_dropout_metrics(anchor_dropout_probs))
-        draft_tokens = torch.argmax(logits, dim=-1)
+        if self.markov_head is None:
+            draft_tokens = torch.argmax(logits, dim=-1)
+        else:
+            draft_tokens = target_token_ids.detach().clone()
+            draft_tokens[:, 1:] = self._markov_greedy_rollout(
+                base_logits,
+                (
+                    target_token_ids[:, 0]
+                    if known_token_ids is None
+                    else known_token_ids
+                ),
+            )
         return draft_tokens, loss, metrics
 
 
@@ -2749,6 +2877,17 @@ class CausalCascadeForCausalLM(nn.Module):
     @property
     def target_layer_ids(self) -> list[int]:
         return self.model.target_layer_ids
+
+    @property
+    def markov_head_enabled(self) -> bool:
+        return self.model.markov_head_enabled
+
+    def apply_markov_head(
+        self,
+        base_logits: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.model.apply_markov_head(base_logits, previous_token_ids)
 
     def forward_logits(
         self,
