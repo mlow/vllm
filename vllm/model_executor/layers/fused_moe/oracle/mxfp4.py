@@ -150,9 +150,10 @@ def backend_to_kernel_cls(
     backend: Mxfp4MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
     if backend == Mxfp4MoeBackend.B12X:
+        from vllm.model_executor.layers.fused_moe.b12x_ep_moe import B12xEPExperts
         from vllm.model_executor.layers.fused_moe.b12x_moe import B12xExperts
 
-        return [B12xExperts]
+        return [B12xEPExperts, B12xExperts]
 
     elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         from vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe import (

@@ -118,9 +118,10 @@ def backend_to_kernel_cls(
         return [FlashInferB12xExperts]
 
     elif backend == NvFp4MoeBackend.B12X:
+        from vllm.model_executor.layers.fused_moe.b12x_ep_moe import B12xEPExperts
         from vllm.model_executor.layers.fused_moe.b12x_moe import B12xExperts
 
-        return [B12xExperts]
+        return [B12xEPExperts, B12xExperts]
 
     elif backend == NvFp4MoeBackend.VLLM_CUTLASS:
         from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
