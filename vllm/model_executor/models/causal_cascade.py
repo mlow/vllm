@@ -2072,6 +2072,9 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
             )
             or [],
             anchor_only=kwargs.get("sparse_mla_anchor_only", False),
+            ablate_sparse_mla_cross_attention=kwargs.get(
+                "sparse_mla_ablate_cross_attention", False
+            ),
             anchor_delta_rank=kwargs.get("sparse_mla_anchor_delta_rank", 0),
             anchor_delta_kind=kwargs.get("sparse_mla_anchor_delta_kind", "dense"),
             anchor_delta_num_blocks=kwargs.get("sparse_mla_anchor_delta_num_blocks", 0),
@@ -2416,6 +2419,16 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
         global_step: int | None = None,
         ablate_sparse_mla_cross_attention: bool = False,
     ) -> torch.Tensor:
+        ablate_sparse_mla_cross_attention = (
+            ablate_sparse_mla_cross_attention
+            or bool(
+                getattr(
+                    self.config,
+                    "ablate_sparse_mla_cross_attention",
+                    False,
+                )
+            )
+        )
         if (
             not self.config.anchor_only
             and mla_cache_rows is None
@@ -2611,6 +2624,16 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
         **kwargs,
     ):
         del kwargs
+        ablate_sparse_mla_cross_attention = (
+            ablate_sparse_mla_cross_attention
+            or bool(
+                getattr(
+                    self.config,
+                    "ablate_sparse_mla_cross_attention",
+                    False,
+                )
+            )
+        )
         if anchor_hidden_state is None or target_token_ids is None or loss_mask is None:
             raise ValueError(
                 "Sparse-MLA DFlash forward requires anchor_hidden_state, "
