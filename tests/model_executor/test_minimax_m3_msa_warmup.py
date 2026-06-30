@@ -55,7 +55,6 @@ def test_minimax_m3_warmup_covers_dense_b12x_attention(monkeypatch) -> None:
     monkeypatch.setattr(msa_warmup, "MiniMaxM3SparseAttention", FakeSparseAttention)
     monkeypatch.setattr(msa_warmup, "_supports_minimax_m3_msa_warmup", lambda: True)
     monkeypatch.setattr(msa_warmup, "_warmup_slot_mapping", lambda *args: None)
-    monkeypatch.setattr(msa_warmup, "warmup_b12x_moe_dynamic", lambda *args, **k: None)
 
     msa_warmup.minimax_m3_msa_warmup(worker)
 

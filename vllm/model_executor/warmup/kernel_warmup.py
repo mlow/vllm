@@ -14,6 +14,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.mxfp8.b12x import warmup_b12x_mxfp8_linear
+from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
@@ -121,10 +122,17 @@ def _uses_flashinfer_compute_kernels(worker: "Worker") -> bool:
 
 
 def kernel_warmup(worker: "Worker"):
-    mhc_warmup_token_sizes = list(
-        worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
+    compilation_config = worker.vllm_config.compilation_config
+    cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+    compile_sizes = [
+        size
+        for size in (getattr(compilation_config, "compile_sizes", None) or [])
+        if isinstance(size, int)
+    ]
+    mhc_warmup_token_sizes = list(cudagraph_capture_sizes)
+    max_num_scheduled_tokens = getattr(
+        worker.scheduler_config, "max_num_scheduled_tokens", None
     )
-    max_num_scheduled_tokens = worker.scheduler_config.max_num_scheduled_tokens
     if max_num_scheduled_tokens is not None:
         mhc_warmup_token_sizes.append(max_num_scheduled_tokens)
 
@@ -156,9 +164,7 @@ def kernel_warmup(worker: "Worker"):
     warmed_mxfp8 = warmup_b12x_mxfp8_linear(
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
-        cudagraph_capture_sizes=(
-            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
-        ),
+        cudagraph_capture_sizes=cudagraph_capture_sizes,
         output_dtype=getattr(
             getattr(worker, "model_config", None),
             "dtype",
@@ -167,6 +173,19 @@ def kernel_warmup(worker: "Worker"):
     )
     if warmed_mxfp8:
         logger.info("Warmed up %d B12X MXFP8 linear GEMM signatures.", warmed_mxfp8)
+
+    moe_token_counts = [
+        worker.scheduler_config.max_num_batched_tokens,
+        *cudagraph_capture_sizes,
+        *compile_sizes,
+    ]
+    if max_num_scheduled_tokens is not None:
+        moe_token_counts.append(max_num_scheduled_tokens)
+    warmup_b12x_moe_dynamic(
+        worker.get_model(),
+        max_tokens=max(moe_token_counts),
+        token_counts=moe_token_counts,
+    )
 
     minimax_m3_msa_warmup(worker)
 

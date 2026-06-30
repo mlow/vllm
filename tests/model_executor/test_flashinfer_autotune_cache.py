@@ -8,8 +8,7 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm.model_executor.warmup import flashinfer_autotune_cache
-from vllm.model_executor.warmup import kernel_warmup
+from vllm.model_executor.warmup import flashinfer_autotune_cache, kernel_warmup
 
 
 def test_resolve_flashinfer_autotune_file_default_layout(
@@ -83,9 +82,15 @@ def _flashinfer_autotune_worker(model, *, attn_groups=None):
     return SimpleNamespace(
         get_model=lambda: model,
         model_runner=runner,
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=8,
+            max_num_scheduled_tokens=None,
+        ),
         vllm_config=SimpleNamespace(
-            compilation_config=SimpleNamespace(cudagraph_capture_sizes=[]),
+            compilation_config=SimpleNamespace(
+                cudagraph_capture_sizes=[],
+                compile_sizes=[],
+            ),
             kernel_config=SimpleNamespace(enable_flashinfer_autotune=True),
         ),
         model_config=SimpleNamespace(dtype=torch.bfloat16),
@@ -107,6 +112,7 @@ def _patch_flashinfer_autotune_deps(monkeypatch):
     )
     monkeypatch.setattr(kernel_warmup, "minimax_m3_msa_warmup", lambda *a, **k: None)
     monkeypatch.setattr(kernel_warmup, "warmup_b12x_mxfp8_linear", lambda *a, **k: 0)
+    monkeypatch.setattr(kernel_warmup, "warmup_b12x_moe_dynamic", lambda *a, **k: 0)
     monkeypatch.setattr(kernel_warmup, "has_flashinfer", lambda: True)
     monkeypatch.setattr(
         kernel_warmup.current_platform, "has_device_capability", lambda _: True
@@ -140,6 +146,7 @@ def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
         lambda *a, **k: None,
     )
     monkeypatch.setattr(kernel_warmup, "minimax_m3_msa_warmup", lambda *a, **k: None)
+    monkeypatch.setattr(kernel_warmup, "warmup_b12x_moe_dynamic", lambda *a, **k: 0)
     monkeypatch.setattr(
         kernel_warmup,
         "warmup_b12x_mxfp8_linear",
@@ -156,6 +163,48 @@ def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
         "cudagraph_capture_sizes": [1, 2, 4, 8],
         "output_dtype": torch.float16,
     }
+
+
+def test_kernel_warmup_runs_b12x_moe_warmup(monkeypatch) -> None:
+    calls = []
+    model = torch.nn.Linear(2, 2)
+    worker = _flashinfer_autotune_worker(model)
+    worker.scheduler_config.max_num_batched_tokens = 2048
+    worker.scheduler_config.max_num_scheduled_tokens = 3072
+    worker.vllm_config.compilation_config.cudagraph_capture_sizes = [1, 2, 4, 8]
+    worker.vllm_config.compilation_config.compile_sizes = [17, 4096]
+    worker.vllm_config.kernel_config.enable_flashinfer_autotune = False
+
+    monkeypatch.setattr(kernel_warmup, "deepseek_v4_mhc_warmup", lambda *a, **k: None)
+    monkeypatch.setattr(
+        kernel_warmup,
+        "flashinfer_sparse_mla_decode_autotune_warmup",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup,
+        "deepseek_v4_sparse_mla_attention_warmup",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(kernel_warmup, "minimax_m3_msa_warmup", lambda *a, **k: None)
+    monkeypatch.setattr(kernel_warmup, "warmup_b12x_mxfp8_linear", lambda *a, **k: 0)
+    monkeypatch.setattr(
+        kernel_warmup,
+        "warmup_b12x_moe_dynamic",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 4,
+    )
+
+    kernel_warmup.kernel_warmup(worker)
+
+    assert calls == [
+        (
+            (model,),
+            {
+                "max_tokens": 4096,
+                "token_counts": [2048, 1, 2, 4, 8, 17, 4096, 3072],
+            },
+        )
+    ]
 
 
 def test_kernel_warmup_skips_flashinfer_autotune_without_flashinfer_kernels(

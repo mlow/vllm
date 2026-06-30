@@ -13,6 +13,12 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 
 class _FakePlan:
+    def __init__(self, execution: object = "dynamic-m16") -> None:
+        self.launch_plan = SimpleNamespace(
+            implementation="dynamic",
+            execution=execution,
+        )
+
     @staticmethod
     def scratch_specs():
         return [SimpleNamespace(dtype=torch.uint8, shape=(64,))]
@@ -262,6 +268,11 @@ def test_b12x_moe_warmup_uses_minimax_swiglu_params(monkeypatch) -> None:
         run_calls.append(kwargs)
 
     monkeypatch.setattr(b12x_moe, "_plan_b12x_moe_fp4_scratch", fake_plan)
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_execution",
+        lambda **kwargs: _FakePlan().launch_plan,
+    )
     monkeypatch.setattr(b12x_moe, "_run_b12x_moe_fp4", fake_run)
     monkeypatch.setattr(
         b12x_moe,
@@ -277,8 +288,9 @@ def test_b12x_moe_warmup_uses_minimax_swiglu_params(monkeypatch) -> None:
         apply_router_weight_on_input=False,
     )
 
-    experts.warmup_dynamic_launch(layer, tokens=3)
+    warmed = experts.warmup_dynamic_launches(layer, token_counts=(3,))
 
+    assert warmed == 1
     assert len(plan_calls) == 1
     assert len(run_calls) == 1
     assert plan_calls[0]["tokens"] == 7
@@ -296,6 +308,61 @@ def test_b12x_moe_warmup_uses_minimax_swiglu_params(monkeypatch) -> None:
     assert run_calls[0]["scratch"].numel() == 64
     assert run_calls[0]["experts"] is experts._prepared_experts
     assert run_calls[0]["input_scales_static"] is True
+
+
+def test_b12x_moe_warmup_runs_one_launch_per_planner_regime(monkeypatch) -> None:
+    planned_tokens = []
+    scratch_tokens = []
+    run_tokens = []
+
+    def fake_execution_plan(**kwargs):
+        tokens = kwargs["tokens"]
+        planned_tokens.append(tokens)
+        execution = "dynamic-m16" if tokens < 8 else "dynamic-m32"
+        return _FakePlan(execution).launch_plan
+
+    def fake_scratch_plan(**kwargs):
+        scratch_tokens.append(kwargs["tokens"])
+        return _FakePlan()
+
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_execution",
+        fake_execution_plan,
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_plan_b12x_moe_fp4_scratch",
+        fake_scratch_plan,
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_run_b12x_moe_fp4",
+        lambda **kwargs: run_tokens.append(kwargs["a"].shape[0]),
+    )
+    monkeypatch.setattr(
+        b12x_moe,
+        "_dynamic_moe_warmup_tokens",
+        lambda *, topk, quant_mode, requested_tokens: requested_tokens,
+    )
+
+    experts = _make_fake_b12x_experts()
+    layer = SimpleNamespace(
+        w13_weight=torch.empty(8, 32, 32, dtype=torch.uint8),
+        w2_weight=torch.empty(8, 64, 8, dtype=torch.uint8),
+        activation=MoEActivation.SWIGLUOAI_UNINTERLEAVE,
+        apply_router_weight_on_input=False,
+    )
+
+    warmed = experts.warmup_dynamic_launches(
+        layer,
+        token_counts=(3, 4, 8, 16),
+    )
+
+    assert warmed == 2
+    assert planned_tokens == [3, 4, 8, 16]
+    assert scratch_tokens == [3, 8]
+    assert run_tokens == [3, 8]
 
 
 def test_b12x_force_a16_nvfp4_selects_w4a16(monkeypatch) -> None:
@@ -544,8 +611,9 @@ def test_warmup_b12x_moe_dynamic_dedupes_signatures(monkeypatch) -> None:
     def fake_signature(self, layer):
         return ("same-signature",)
 
-    def fake_warmup(self, layer, *, tokens):
-        calls.append((self, layer, tokens))
+    def fake_warmup(self, layer, *, token_counts):
+        calls.append((self, layer, token_counts))
+        return 3
 
     monkeypatch.setattr(
         b12x_moe.B12xExperts,
@@ -554,7 +622,7 @@ def test_warmup_b12x_moe_dynamic_dedupes_signatures(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         b12x_moe.B12xExperts,
-        "warmup_dynamic_launch",
+        "warmup_dynamic_launches",
         fake_warmup,
     )
 
@@ -578,8 +646,19 @@ def test_warmup_b12x_moe_dynamic_dedupes_signatures(monkeypatch) -> None:
     ]
     model = SimpleNamespace(modules=lambda: iter(modules))
 
-    warmed = b12x_moe.warmup_b12x_moe_dynamic(model, tokens=5)
+    warmed = b12x_moe.warmup_b12x_moe_dynamic(
+        model,
+        max_tokens=5,
+        token_counts=(3,),
+    )
 
-    assert warmed == 1
+    assert warmed == 3
     assert len(calls) == 1
-    assert calls[0][2] == 5
+    assert calls[0][2] == (1, 2, 3, 4, 5)
+
+
+def test_b12x_moe_warmup_token_counts_cover_serving_range() -> None:
+    assert b12x_moe._b12x_moe_warmup_token_counts(
+        max_tokens=10,
+        token_counts=(3, 8, 12, 0),
+    ) == (1, 2, 3, 4, 8, 10)

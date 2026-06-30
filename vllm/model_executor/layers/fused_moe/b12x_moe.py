@@ -4,6 +4,7 @@
 
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -423,6 +424,33 @@ def _plan_b12x_moe_fp4_scratch(
     )
 
 
+def _plan_b12x_moe_execution(
+    *,
+    tokens: int,
+    topk: int,
+    device: torch.device,
+    quant_mode: str,
+    experts: Any,
+    apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
+    swiglu_alpha: float | None = None,
+    swiglu_beta: float | None = None,
+):
+    from b12x.integration.tp_moe import plan_tp_moe_execution
+
+    return plan_tp_moe_execution(
+        num_tokens=max(int(tokens), 1),
+        num_topk=int(topk),
+        device=device,
+        weight_plan=experts.plan,
+        quant_mode=quant_mode,
+        apply_router_weight_on_input=apply_router_weight_on_input,
+        swiglu_limit=swiglu_limit,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+    )
+
+
 def _b12x_scratch_nbytes(plan: Any) -> int:
     specs = plan.scratch_specs()
     if len(specs) != 1:
@@ -458,6 +486,34 @@ def _dynamic_moe_warmup_tokens(
     raise RuntimeError(
         "could not find a B12X dynamic MoE warmup token count for "
         f"topk={topk}, quant_mode={quant_mode!r}"
+    )
+
+
+def _b12x_moe_warmup_token_counts(
+    *,
+    max_tokens: int,
+    token_counts: Iterable[int] = (),
+) -> tuple[int, ...]:
+    """Probe powers of two plus serving sizes supplied by vLLM."""
+    max_tokens = max(int(max_tokens), 1)
+    counts = {
+        int(token_count)
+        for token_count in token_counts
+        if 0 < int(token_count) <= max_tokens
+    }
+    token_count = 1
+    while token_count < max_tokens:
+        counts.add(token_count)
+        token_count *= 2
+    counts.add(max_tokens)
+    return tuple(sorted(counts))
+
+
+def _b12x_moe_warmup_plan_signature(launch_plan: Any) -> tuple[Any, ...]:
+    """Fields through which the planner selects a compiled kernel regime."""
+    return (
+        launch_plan.implementation,
+        launch_plan.execution,
     )
 
 
@@ -1236,22 +1292,17 @@ class B12xExperts(mk.FusedMoEExpertsModular):
         )
 
     @torch.inference_mode()
-    def warmup_dynamic_launch(
+    def warmup_dynamic_launches(
         self,
         layer: torch.nn.Module,
         *,
-        tokens: int = 1,
-    ) -> None:
-        """Compile the b12x dynamic MoE launch before serving starts."""
+        token_counts: Iterable[int],
+    ) -> int:
+        """Compile one representative of every planned dynamic MoE regime."""
         meta = self._warmup_metadata(layer)
         if meta is None:
-            return
+            return 0
 
-        tokens = _dynamic_moe_warmup_tokens(
-            topk=meta.topk,
-            quant_mode=meta.quant_mode,
-            requested_tokens=tokens,
-        )
         prepared = self._get_or_prepare_experts(
             w1=meta.w1,
             w2=meta.w2,
@@ -1269,56 +1320,85 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 num_experts=num_experts,
             )
 
-        hidden_states = torch.zeros(
-            (tokens, meta.k),
-            dtype=meta.dtype,
-            device=meta.device,
-        )
-        output = torch.empty_like(hidden_states)
-        topk_ids = (
-            torch.arange(meta.topk, device=meta.device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(tokens, -1)
-            .contiguous()
-        )
-        if num_experts > 0:
-            topk_ids.remainder_(num_experts)
-        topk_weights = torch.full(
-            (tokens, meta.topk),
-            1.0 / max(meta.topk, 1),
-            dtype=torch.float32,
-            device=meta.device,
-        )
-        plan = _plan_b12x_moe_fp4_scratch(
-            tokens=tokens,
-            topk=meta.topk,
-            device=meta.device,
-            quant_mode=meta.quant_mode,
-            experts=prepared,
-            apply_router_weight_on_input=meta.apply_router_weight_on_input,
-            swiglu_limit=meta.swiglu_limit,
-            swiglu_alpha=meta.swiglu_alpha,
-            swiglu_beta=meta.swiglu_beta,
-            collect_activation_amax=meta.collect_activation_amax,
-        )
-        scratch = torch.empty(
-            (_b12x_scratch_nbytes(plan),),
-            dtype=torch.uint8,
-            device=meta.device,
-        )
-        _run_b12x_moe_fp4(
-            a=hidden_states,
-            experts=prepared,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            output=output,
-            input_scales_static=input_scales_static,
-            unit_scale_contract=unit_scale_contract,
-            plan=plan,
-            scratch=scratch,
-            activation_amax=activation_amax,
-            layer_idx=activation_layer_idx,
-        )
+        # Execution planning is allocation- and compilation-free. Probe the
+        # serving range, then retain the smallest token count selecting each
+        # execution plan so large prefill regimes are compiled without
+        # allocating max-batch inputs.
+        launch_tokens: dict[tuple[Any, ...], int] = {}
+        for requested_tokens in sorted(set(int(count) for count in token_counts)):
+            tokens = _dynamic_moe_warmup_tokens(
+                topk=meta.topk,
+                quant_mode=meta.quant_mode,
+                requested_tokens=requested_tokens,
+            )
+            launch_plan = _plan_b12x_moe_execution(
+                tokens=tokens,
+                topk=meta.topk,
+                device=meta.device,
+                quant_mode=meta.quant_mode,
+                experts=prepared,
+                apply_router_weight_on_input=meta.apply_router_weight_on_input,
+                swiglu_limit=meta.swiglu_limit,
+                swiglu_alpha=meta.swiglu_alpha,
+                swiglu_beta=meta.swiglu_beta,
+            )
+            launch_tokens.setdefault(
+                _b12x_moe_warmup_plan_signature(launch_plan),
+                tokens,
+            )
+
+        for tokens in launch_tokens.values():
+            plan = _plan_b12x_moe_fp4_scratch(
+                tokens=tokens,
+                topk=meta.topk,
+                device=meta.device,
+                quant_mode=meta.quant_mode,
+                experts=prepared,
+                apply_router_weight_on_input=meta.apply_router_weight_on_input,
+                swiglu_limit=meta.swiglu_limit,
+                swiglu_alpha=meta.swiglu_alpha,
+                swiglu_beta=meta.swiglu_beta,
+                collect_activation_amax=meta.collect_activation_amax,
+            )
+            hidden_states = torch.zeros(
+                (tokens, meta.k),
+                dtype=meta.dtype,
+                device=meta.device,
+            )
+            output = torch.empty_like(hidden_states)
+            topk_ids = (
+                torch.arange(meta.topk, device=meta.device, dtype=torch.int32)
+                .unsqueeze(0)
+                .expand(tokens, -1)
+                .contiguous()
+            )
+            if num_experts > 0:
+                topk_ids.remainder_(num_experts)
+            topk_weights = torch.full(
+                (tokens, meta.topk),
+                1.0 / max(meta.topk, 1),
+                dtype=torch.float32,
+                device=meta.device,
+            )
+            scratch = torch.empty(
+                (_b12x_scratch_nbytes(plan),),
+                dtype=torch.uint8,
+                device=meta.device,
+            )
+            _run_b12x_moe_fp4(
+                a=hidden_states,
+                experts=prepared,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                output=output,
+                input_scales_static=input_scales_static,
+                unit_scale_contract=unit_scale_contract,
+                plan=plan,
+                scratch=scratch,
+                activation_amax=activation_amax,
+                layer_idx=activation_layer_idx,
+            )
+        return len(launch_tokens)
 
     def _release_source_parameters(self, layer: torch.nn.Module) -> None:
         """Leave the planner-selected expert owner as the sole allocation."""
@@ -1516,9 +1596,14 @@ class B12xExperts(mk.FusedMoEExpertsModular):
 def warmup_b12x_moe_dynamic(
     model: torch.nn.Module,
     *,
-    tokens: int = 1,
+    max_tokens: int,
+    token_counts: Iterable[int] = (),
 ) -> int:
-    """Warm unique b12x dynamic MoE launch signatures in a loaded model."""
+    """Warm unique b12x dynamic MoE planner regimes in a loaded model."""
+    candidates = _b12x_moe_warmup_token_counts(
+        max_tokens=max_tokens,
+        token_counts=token_counts,
+    )
     seen: set[tuple[Any, ...]] = set()
     warmed = 0
     for module in model.modules():
@@ -1535,9 +1620,16 @@ def warmup_b12x_moe_dynamic(
         if signature is None or signature in seen:
             continue
         seen.add(signature)
-        fused_experts.warmup_dynamic_launch(routed_experts, tokens=tokens)
-        warmed += 1
+        warmed += fused_experts.warmup_dynamic_launches(
+            routed_experts,
+            token_counts=candidates,
+        )
 
     if warmed:
-        logger.info("Warmed up %d B12X MoE dynamic launch signature(s).", warmed)
+        logger.info(
+            "Warmed up %d B12X MoE dynamic launch variant(s) across %d "
+            "expert signature(s).",
+            warmed,
+            len(seen),
+        )
     return warmed

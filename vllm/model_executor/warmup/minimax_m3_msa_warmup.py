@@ -9,9 +9,6 @@ import torch
 import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe.b12x_moe import (
-    warmup_b12x_moe_dynamic,
-)
 from vllm.models.minimax_m3.nvidia.model import MiniMaxM3SparseAttention
 from vllm.platforms import current_platform
 from vllm.tracing import instrument
@@ -94,9 +91,7 @@ def minimax_m3_msa_warmup(worker: "Worker") -> None:
         else ""
     )
     num_tokens = (
-        worker.scheduler_config.max_num_batched_tokens
-        if dense_backend_names
-        else 16
+        worker.scheduler_config.max_num_batched_tokens if dense_backend_names else 16
     )
 
     logger.info(
@@ -105,12 +100,10 @@ def minimax_m3_msa_warmup(worker: "Worker") -> None:
         num_tokens,
     )
     _warmup_slot_mapping(worker, num_tokens)
-    warmup_b12x_moe_dynamic(worker.get_model(), tokens=1)
 
     if dense_backend_names:
         logger.info(
-            "Warming up MiniMax M3 single-request prefill attention "
-            "with %d tokens.",
+            "Warming up MiniMax M3 single-request prefill attention with %d tokens.",
             num_tokens,
         )
         worker.model_runner._dummy_run(
