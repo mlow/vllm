@@ -8,6 +8,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 
 @dataclass
@@ -27,6 +28,7 @@ class MLAModules:
     is_sparse: bool
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
+    indexer_aux_stream: torch.cuda.Stream | None = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -87,6 +89,19 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.indexer = mla_modules.indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
+        self.indexer_aux_stream = mla_modules.indexer_aux_stream
+        self.indexer_start_event: torch.cuda.Event | None = None
+        self.indexer_done_event: torch.cuda.Event | None = None
+        if self.indexer_aux_stream is not None:
+            if self.indexer is None:
+                raise ValueError("indexer_aux_stream requires an indexer")
+            if self.q_lora_rank is None:
+                raise ValueError("indexer_aux_stream requires a latent Q projection")
+            # Streams are shared by the owning model, while events are per layer.
+            # All objects are created before compilation/capture and reused on
+            # every invocation so the fork/join topology is graph stable.
+            self.indexer_start_event = torch.cuda.Event()
+            self.indexer_done_event = torch.cuda.Event()
 
         # Whether to skip top-k token selection computation in this layer.
         # When True, the indexer will not be called, and the layer will reuse
@@ -125,6 +140,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
     ) -> torch.Tensor:
         q_c = None
         kv_lora = None
+        run_indexer = self.indexer is not None and self.is_sparse and not self.skip_topk
+        overlap_indexer = self.indexer_aux_stream is not None and run_indexer
 
         if self.q_lora_rank is not None:
             assert self.fused_qkv_a_proj is not None, (
@@ -143,7 +160,8 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
                 dim=-1,
             )
             q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
+            if not overlap_indexer:
+                q = self.q_b_proj(q_c)[0]
         else:
             assert self.kv_a_proj_with_mqa is not None, (
                 "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -154,20 +172,58 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
             q = self.q_proj(hidden_states)[0]
 
-        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c)
+        assert kv_lora is not None
 
-        q = q.view(-1, self.num_heads, self.qk_head_dim)
-        # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
+        if overlap_indexer:
+            assert self.indexer is not None
+            assert q_c is not None
+            assert self.indexer_start_event is not None
+            assert self.indexer_done_event is not None
 
-        if self.rotary_emb is not None:
-            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-                positions, q[..., self.qk_nope_head_dim :], k_pe
+            def prepare_main_attention() -> tuple[
+                torch.Tensor, torch.Tensor, torch.Tensor
+            ]:
+                assert self.q_b_proj is not None
+                q = self.q_b_proj(q_c)[0]
+                kv_c, k_pe = kv_lora.split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                )
+                kv_c_normed = self.kv_a_layernorm(kv_c)
+                q = q.view(-1, self.num_heads, self.qk_head_dim)
+                k_pe = k_pe.unsqueeze(1)
+                if self.rotary_emb is not None:
+                    q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                        positions, q[..., self.qk_nope_head_dim :], k_pe
+                    )
+                return q, kv_c_normed, k_pe
+
+            (q, kv_c_normed, k_pe), _ = maybe_execute_in_parallel(
+                prepare_main_attention,
+                lambda: self.indexer(
+                    hidden_states, q_c, positions, self.indexer_rope_emb
+                ),
+                self.indexer_start_event,
+                self.indexer_done_event,
+                self.indexer_aux_stream,
             )
+        else:
+            kv_c, k_pe = kv_lora.split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
+            kv_c_normed = self.kv_a_layernorm(kv_c)
 
-        if self.indexer and self.is_sparse and not self.skip_topk:
-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+            q = q.view(-1, self.num_heads, self.qk_head_dim)
+            # Add head dim of 1 to k_pe.
+            k_pe = k_pe.unsqueeze(1)
+
+            if self.rotary_emb is not None:
+                q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                    positions, q[..., self.qk_nope_head_dim :], k_pe
+                )
+
+            if run_indexer:
+                assert self.indexer is not None
+                self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
 
         if llama_4_scaling is not None:
             q *= llama_4_scaling

@@ -118,6 +118,15 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _should_overlap_glm_b12x_indexer(config: typing.Any) -> bool:
+    """Use a persistent side stream for GLM's b12x sparse-indexer branch."""
+    return (
+        getattr(config, "model_type", None) == "glm_moe_dsa"
+        and getattr(config, "index_topk", 0) > 0
+        and use_b12x_sparse_indexer()
+    )
+
+
 class DeepseekAttention(nn.Module):
     """Normal MHA implementation used by Deepseek v1."""
 
@@ -1060,6 +1069,7 @@ class DeepseekV2MLAAttention(nn.Module):
         topk_scores_buffer: torch.Tensor | None = None,
         input_size: int | None = None,
         layer_idx: int | None = None,
+        indexer_aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1218,6 +1228,7 @@ class DeepseekV2MLAAttention(nn.Module):
             indexer_rotary_emb=self.indexer_rope_emb,
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
+            indexer_aux_stream=indexer_aux_stream if self.indexer is not None else None,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(
@@ -1256,6 +1267,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         layer_idx_override: int | None = None,
         is_nextn: bool = False,
+        indexer_aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
 
@@ -1317,6 +1329,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         if attn_cls is DeepseekV2MLAAttention:
             attn_kwargs["layer_idx"] = layer_idx
+            attn_kwargs["indexer_aux_stream"] = indexer_aux_stream
         self.self_attn = attn_cls(**attn_kwargs)
 
         if _should_use_nextn_moe_layer(config, layer_idx, moe_layer_freq, is_nextn):
@@ -1427,6 +1440,10 @@ class DeepseekV2Model(nn.Module):
             topk_indices_buffer = None
             topk_scores_buffer = None
 
+        indexer_aux_stream = (
+            torch.cuda.Stream() if _should_overlap_glm_b12x_indexer(config) else None
+        )
+
         if get_pp_group().is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -1443,6 +1460,7 @@ class DeepseekV2Model(nn.Module):
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
                 topk_scores_buffer=topk_scores_buffer,
+                indexer_aux_stream=indexer_aux_stream,
             ),
             prefix=f"{prefix}.layers",
         )
