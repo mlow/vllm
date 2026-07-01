@@ -422,6 +422,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
     """b12x compressed sparse-MLA attention layer for DeepSeek-V4 (SM120)."""
 
     backend_cls: ClassVar[type[AttentionBackend]] = DeepseekV4B12xMLASparseBackend
+    enqueue_default_before_indexer: ClassVar[bool] = True
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -447,7 +448,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         views = getattr(self, "_b12x_cache_page_views", None)
         if views is None:
             views = {}
-            setattr(self, "_b12x_cache_page_views", views)
+            self._b12x_cache_page_views = views
         key = _b12x_cache_page_view_key(cache, page_size)
         view = views.get(key)
         if view is None:

@@ -118,6 +118,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
     # a single attention class dispatches across arch-specific layouts.
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    # Backends whose sparse-indexer auxiliary branch contains a long host-side
+    # launch loop can enqueue the independent default-stream Q branch first.
+    # The stream/event dependency graph remains identical.
+    enqueue_default_before_indexer: ClassVar[bool] = False
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
@@ -663,6 +667,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 [self.ln_events[1], self.ln_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
                 enable=aux_streams is not None,
+                enqueue_default_first=self.enqueue_default_before_indexer,
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
