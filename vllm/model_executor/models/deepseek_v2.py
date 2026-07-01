@@ -676,6 +676,16 @@ class Indexer(nn.Module):
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
         self.topk_scores_buffer = topk_scores_buffer
+        attention_backend = vllm_config.attention_config.backend
+        attention_backend_name = (
+            attention_backend
+            if isinstance(attention_backend, str)
+            else getattr(attention_backend, "name", None)
+        )
+        # The GLM b12x MLA backend and its non-compressed paged indexer share a
+        # native flat-physical-slot contract. Keep this explicit: DSV4's
+        # compressed indexer uses the same low-level op but a different contract.
+        self.output_physical_slots = attention_backend_name == "B12X_MLA_SPARSE"
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
@@ -701,6 +711,7 @@ class Indexer(nn.Module):
             self.max_total_seq_len,
             self.topk_indices_buffer,
             topk_scores_buffer=self.topk_scores_buffer,
+            output_physical_slots=self.output_physical_slots,
         )
 
         self.is_inplace_rope = is_inplace_rope

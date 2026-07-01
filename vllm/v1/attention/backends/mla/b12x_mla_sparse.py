@@ -38,7 +38,6 @@ from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
 from vllm.platforms.interface import DeviceCapability
-from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -50,11 +49,6 @@ from vllm.v1.attention.backend import (
     MultipleOf,
     SparseMLAAttentionImpl,
 )
-from vllm.v1.attention.backends.mla.sparse_utils import (
-    triton_convert_dcp_global_index_to_local_index,
-    triton_convert_req_index_to_global_index,
-)
-from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -69,7 +63,7 @@ logger = init_logger(__name__)
 # wave-balanced planner picks num_splits <= this cap.
 _DECODE_SPLIT_TILE = 64
 _HEAD_ALIGNMENT = 8
-_EXTEND_PREWARM_DONE: set[tuple[int | None, int, int, int, int, int, bool]] = set()
+_EXTEND_PREWARM_DONE: set[tuple[int | None, int, int, int, int, int]] = set()
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -89,96 +83,6 @@ def _env_int(name: str, default: int) -> int:
         logger.warning("Ignoring non-positive %s=%r; using %d", name, value, default)
         return default
     return parsed
-
-
-@triton.jit
-def _mask_page_table_after_nsa_len_kernel(
-    page_table_ptr,
-    nsa_len_ptr,
-    page_stride0,
-    page_stride1,
-    width: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    row = tl.program_id(0)
-    tile = tl.program_id(1)
-    offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
-    valid = offs < width
-    nsa_len = tl.load(nsa_len_ptr + row)
-    tl.store(
-        page_table_ptr + row * page_stride0 + offs * page_stride1,
-        -1,
-        mask=valid & (offs >= nsa_len),
-    )
-
-
-def _mask_page_table_after_nsa_len(
-    page_table: torch.Tensor,
-    nsa_cache_seqlens: torch.Tensor,
-) -> None:
-    width = page_table.shape[1]
-    if width == 0 or page_table.shape[0] == 0:
-        return
-    block_n = 128
-    _mask_page_table_after_nsa_len_kernel[
-        (page_table.shape[0], triton.cdiv(width, block_n))
-    ](
-        page_table,
-        nsa_cache_seqlens,
-        page_table.stride(0),
-        page_table.stride(1),
-        width,
-        BLOCK_N=block_n,
-    )
-
-
-@triton.jit
-def _compact_page_table_valid_prefix_kernel(
-    page_table_ptr,
-    nsa_len_ptr,
-    page_stride0,
-    page_stride1,
-    width: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_N)
-    valid_col = offs < width
-    vals = tl.load(
-        page_table_ptr + row * page_stride0 + offs * page_stride1,
-        mask=valid_col,
-        other=-1,
-    )
-    # B12X consumes page_table_1 as a dense prefix of length nsa_cache_seqlens.
-    is_valid = valid_col & (vals >= 0)
-    compact_pos = tl.cumsum(is_valid.to(tl.int32), 0) - 1
-    valid_count = tl.sum(is_valid.to(tl.int32), axis=0)
-    row_base = page_table_ptr + row * page_stride0
-    tl.store(row_base + compact_pos * page_stride1, vals, mask=is_valid)
-    tl.store(
-        row_base + offs * page_stride1,
-        -1,
-        mask=valid_col & (offs >= valid_count),
-    )
-    tl.store(nsa_len_ptr + row, valid_count)
-
-
-def _compact_page_table_valid_prefix(
-    page_table: torch.Tensor,
-    nsa_cache_seqlens: torch.Tensor,
-) -> None:
-    width = page_table.shape[1]
-    if width == 0 or page_table.shape[0] == 0:
-        return
-    block_n = triton.next_power_of_2(width)
-    _compact_page_table_valid_prefix_kernel[(page_table.shape[0],)](
-        page_table,
-        nsa_cache_seqlens,
-        page_table.stride(0),
-        page_table.stride(1),
-        width,
-        BLOCK_N=block_n,
-    )
 
 
 class B12xMLASparseBackend(AttentionBackend):
@@ -287,15 +191,12 @@ class B12xMLASparseMetadata(AttentionMetadata):
     query_start_loc: torch.Tensor
     slot_mapping: torch.Tensor
     block_table: torch.Tensor
-    req_id_per_token: torch.Tensor
     # Per-request computed KV length (decode cache_seqlens_int32).
     seq_lens: torch.Tensor
     cache_seq_lens_per_req: torch.Tensor
-    # Per-token causal KV length; clamped to topk to form nsa_cache_seqlens.
+    # Per-token causal KV length consumed directly by the sparse MLA kernel.
     # For pure decode this equals ``seq_lens`` (one token per request).
     cache_seq_lens_per_token: torch.Tensor
-    page_table_1: torch.Tensor
-    nsa_cache_seqlens: torch.Tensor
 
     block_size: int = 64
     topk_tokens: int = 2048
@@ -322,37 +223,22 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = vllm_config.model_config.hf_config.index_topk
-        self.dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
-        self.dcp_rank = 0
-        if self.dcp_world_size > 1:
-            from vllm.distributed.parallel_state import get_dcp_group
-
-            self.dcp_rank = get_dcp_group().rank_in_group
-        self.cp_kv_cache_interleave_size = (
-            vllm_config.parallel_config.cp_kv_cache_interleave_size
-        )
+        dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_world_size != 1:
+            raise NotImplementedError(
+                "B12X_MLA_SPARSE's native physical-slot contract does not "
+                "support decode context parallelism"
+            )
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_seqs = vllm_config.scheduler_config.max_num_seqs
         # Max-batched-token scratch buffers so cudagraph capture sees stable
         # allocations (sliced per build()).
-        self.req_id_per_token_buffer = torch.empty(
-            (max_tokens,), dtype=torch.int32, device=device
-        )
         self.cache_seq_lens_per_token_buffer = torch.empty(
             (max_tokens,), dtype=torch.int32, device=device
         )
         self.cache_seq_lens_per_req_buffer = torch.empty(
             (max_seqs,), dtype=torch.int32, device=device
-        )
-        self.page_table_1_buffer = torch.empty(
-            (max_tokens, self.topk_tokens), dtype=torch.int32, device=device
-        )
-        self.nsa_cache_seqlens_buffer = torch.empty(
-            (max_tokens,), dtype=torch.int32, device=device
-        )
-        self.req_ids_arange = torch.arange(
-            max_tokens, dtype=torch.int32, device=device
         )
 
     def build(
@@ -364,33 +250,21 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
 
-        seq_lens_for_req = (
-            cm.dcp_local_seq_lens
-            if cm.dcp_local_seq_lens is not None
-            else cm.seq_lens
-        )
+        seq_lens_for_req = cm.seq_lens
 
-        # Per-token causal KV length. Hot path (pure decode, one token per req)
-        # stays entirely on device and uses stable preallocated buffers.
+        # Per-token causal KV length. In pure decode the common metadata already
+        # has exactly the graph-stable tensor both b12x consumers need, so bind it
+        # directly instead of staging two identical D2D copies.
         if cm.max_query_len <= 1 and num_tokens == cm.num_reqs:
-            req_id_per_token_tensor = self.req_ids_arange[:num_tokens]
-            self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
-                seq_lens_for_req[:num_tokens], non_blocking=True
-            )
-            self.cache_seq_lens_per_req_buffer[: cm.num_reqs].copy_(
-                seq_lens_for_req[: cm.num_reqs], non_blocking=True
-            )
+            cache_seq_lens_per_token = seq_lens_for_req[:num_tokens]
+            cache_seq_lens_per_req = seq_lens_for_req[: cm.num_reqs]
         else:
             if cm.batch_topology is not None:
                 starts = cm.batch_topology.query_start_loc_np[: cm.num_reqs + 1]
                 query_lens = cm.batch_topology.query_lens_np
-                req_id_per_token_np = cm.batch_topology.req_id_per_token_np
             else:
                 starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
                 query_lens = np.diff(starts)
-                req_id_per_token_np = np.repeat(
-                    np.arange(cm.num_reqs, dtype=np.int32), query_lens
-                )
             num_query_tokens = int(starts[-1])
             if num_query_tokens > num_tokens:
                 raise RuntimeError(
@@ -399,19 +273,14 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                     f"{num_tokens}"
                 )
 
-            req_ids = np.zeros((num_tokens,), dtype=np.int32)
-            if num_query_tokens:
-                req_ids[:num_query_tokens] = req_id_per_token_np
-
             # Avoid the blocking seq_lens device->host sync. cm.seq_lens_cpu is a
             # lazy `.to("cpu")`; under --async-scheduling the runner keeps the GPU
             # tensor authoritative (_seq_lens_cpu=None), so reading it here forces a
             # full D2H copy every (MTP) decode step and serializes the pipeline that
             # async scheduling exists to overlap. The indexer that selects the
             # top-k for this same step already reads seq_lens_cpu_upper_bound; mirror
-            # it. The per-token context length only feeds cache_seq_lens_per_token,
-            # which forward_mqa clamps via torch.minimum(nsa, per_token_cache) and
-            # the kernel masks past nsa_len, so an optimistic (>=) bound is safe.
+            # it. The indexer writes -1 for invalid tail entries and MLA clamps the
+            # dynamic length to topk, so an optimistic (>=) bound remains safe.
             seq_lens_cpu_src = (
                 cm.seq_lens_cpu_upper_bound
                 if cm.seq_lens_cpu_upper_bound is not None
@@ -425,44 +294,23 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 start = int(starts[req_id])
                 end = int(starts[req_id + 1])
                 context_len = int(seq_lens_cpu[req_id]) - int(q_len)
-                if cm.dcp_local_seq_lens is not None:
-                    global_per_token_lens = torch.arange(
-                        context_len + 1,
-                        context_len + int(q_len) + 1,
-                        dtype=torch.int32,
-                    )
-                    per_token_lens[start:end] = get_dcp_local_seq_lens(
-                        global_per_token_lens,
-                        self.dcp_world_size,
-                        self.dcp_rank,
-                        self.cp_kv_cache_interleave_size,
-                    ).numpy()
-                else:
-                    per_token_lens[start:end] = np.arange(
-                        context_len + 1,
-                        context_len + int(q_len) + 1,
-                        dtype=np.int32,
-                    )
+                per_token_lens[start:end] = np.arange(
+                    context_len + 1,
+                    context_len + int(q_len) + 1,
+                    dtype=np.int32,
+                )
 
-            req_ids_t = torch.from_numpy(req_ids)
             per_token_lens_t = torch.from_numpy(per_token_lens)
-            if req_ids_t.device.type == "cpu":
-                req_ids_t = req_ids_t.pin_memory()
             if per_token_lens_t.device.type == "cpu":
                 per_token_lens_t = per_token_lens_t.pin_memory()
-            self.req_id_per_token_buffer[:num_tokens].copy_(
-                req_ids_t, non_blocking=True
-            )
             self.cache_seq_lens_per_token_buffer[:num_tokens].copy_(
                 per_token_lens_t, non_blocking=True
             )
             self.cache_seq_lens_per_req_buffer[: cm.num_reqs].copy_(
                 seq_lens_for_req[: cm.num_reqs], non_blocking=True
             )
-            req_id_per_token_tensor = self.req_id_per_token_buffer[:num_tokens]
-
-        cache_seq_lens_per_token = self.cache_seq_lens_per_token_buffer[:num_tokens]
-        cache_seq_lens_per_req = self.cache_seq_lens_per_req_buffer[: cm.num_reqs]
+            cache_seq_lens_per_token = self.cache_seq_lens_per_token_buffer[:num_tokens]
+            cache_seq_lens_per_req = self.cache_seq_lens_per_req_buffer[: cm.num_reqs]
 
         return B12xMLASparseMetadata(
             num_reqs=cm.num_reqs,
@@ -472,12 +320,9 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             query_start_loc=cm.query_start_loc,
             slot_mapping=cm.slot_mapping,
             block_table=cm.block_table_tensor,
-            req_id_per_token=req_id_per_token_tensor,
             seq_lens=cache_seq_lens_per_req,
             cache_seq_lens_per_req=cache_seq_lens_per_req,
             cache_seq_lens_per_token=cache_seq_lens_per_token,
-            page_table_1=self.page_table_1_buffer[:num_tokens],
-            nsa_cache_seqlens=self.nsa_cache_seqlens_buffer[:num_tokens],
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
         )
@@ -537,6 +382,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self.topk_indices_buffer: torch.Tensor | None = (
             indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
         )
+        if indexer is not None and not indexer.output_physical_slots:
+            raise RuntimeError(
+                "B12X_MLA_SPARSE requires its indexer to emit native physical "
+                "cache slots"
+            )
         assert self.topk_indices_buffer is not None, (
             "B12X_MLA_SPARSE requires sparse-MLA top-k indices "
             "(model with index_topk in its config)."
@@ -548,19 +398,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
-        self.dcp_rank = 0
-        if self.dcp_world_size > 1:
-            from vllm.distributed.parallel_state import get_dcp_group
-
-            self.dcp_rank = get_dcp_group().rank_in_group
-        self.cp_kv_cache_interleave_size = (
-            parallel_config.cp_kv_cache_interleave_size
-        )
-        self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
-        self.need_to_return_lse_for_decode = (
-            self.dcp_world_size > 1 and self.can_return_lse_for_decode
-        )
+        if self.dcp_world_size != 1:
+            raise NotImplementedError(
+                "B12X_MLA_SPARSE's native physical-slot contract does not "
+                "support decode context parallelism"
+            )
+        self.need_to_return_lse_for_decode = False
 
         scheduler_config = vllm_config.scheduler_config
         self.device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -616,12 +459,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # workspace-manager scratch tensor into a plain B12XSparseMLAScratch views
         # CONTAINER via plan.bind(). The unified SM120 sparse-MLA decode/extend
         # kernels duck-type the container's tmp_output/tmp_lse/output_buffer/
-        # final_lse/num_chunks_ptr/set_split_chunk_config fields, so no kernel
-        # signature change is needed. The container also pre-seeds a stable,
-        # width-derived split count (so the merge's num_chunks is well-defined and
-        # CUDA-graph-stable; run_unified_decode pins the same value via
-        # forced_num_splits below) and pre-materializes final_lse as a view (so the
-        # legacy lazy torch.empty(final_lse) never fires inside a captured graph).
+        # final_lse fields. The planner fixes the split count for each captured
+        # graph and the merge specializes on that count, so no device-side control
+        # scalar initialization is needed. final_lse is pre-materialized as a view
+        # so the legacy lazy torch.empty(final_lse) never fires during capture.
         def _make_plan(
             mode: str, max_q_rows: int, num_q_heads: int, max_batch: int
         ) -> Any:
@@ -681,21 +522,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
 
-    def _sync_dcp_warmup(self) -> None:
+    def _sync_warmup(self) -> None:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
-        if self.dcp_world_size <= 1:
-            return
-        try:
-            from vllm.distributed.parallel_state import get_dcp_group
-
-            dcp_group = get_dcp_group()
-            dcp_group.barrier()
-        except Exception:
-            return
-        finally:
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
 
     def _prewarm_extend_kernels_once(self, max_batched: int) -> None:
         if self.device.type != "cuda":
@@ -707,7 +536,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             self._kernel_num_heads,
             int(self.topk_tokens),
             int(self.block_size),
-            bool(self.need_to_return_lse_for_decode),
         )
         if key in _EXTEND_PREWARM_DONE:
             return
@@ -773,7 +601,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     sm_scale=self.scale,
                     v_head_dim=self.kv_lora_rank,
                 )
-            self._sync_dcp_warmup()
+            self._sync_warmup()
 
     def forward_mqa(
         self,
@@ -834,47 +662,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             q_all.copy_(q_input)
 
         assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
-
-        # Per-request topk indices -> physical cache slot ids. B12X consumes the
-        # selected KV rows as a dense valid prefix of length nsa_cache_seqlens, so
-        # reuse graph-stable metadata buffers and compact holes before launch.
-        page_table_1 = attn_metadata.page_table_1[
-            :num_actual_toks, : topk_indices.shape[1]
-        ]
-        nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[:num_actual_toks]
-        if self.dcp_world_size > 1:
-            triton_convert_dcp_global_index_to_local_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                topk_indices,
-                dcp_world_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                out=page_table_1,
-                valid_counts=nsa_cache_seqlens,
-            )
-        else:
-            triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token[:num_actual_toks],
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_indices.shape[1],
-                return_valid_counts=True,
-                out=page_table_1,
-                valid_counts=nsa_cache_seqlens,
-            )
-            _compact_page_table_valid_prefix(page_table_1, nsa_cache_seqlens)
-        per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
-        torch.minimum(
-            nsa_cache_seqlens,
-            per_token_cache,
-            out=nsa_cache_seqlens,
-        )
-        _mask_page_table_after_nsa_len(page_table_1, nsa_cache_seqlens)
+        # Closed producer/consumer contract: b12x's GLM indexer writes flat
+        # physical cache slots directly into the shared top-k buffer. Invalid
+        # tail entries remain -1; the MLA gather redirects those transactions to
+        # slot zero while retaining the sentinel for its consumer mask.
+        selected_indices = self.topk_indices_buffer[:num_actual_toks]
+        nsa_cache_seqlens = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
 
         # KV cache -> paged rank-3 uint8. B12X unified SM120 kernels consume
         # flat slot ids in selected_indices, but compute raw byte offsets as:
@@ -900,7 +693,10 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 f"{tuple(kv_u8.shape)}"
             )
         if not kv_cache.is_contiguous():
-            kv_cache = kv_cache.contiguous()
+            raise ValueError(
+                "B12X_MLA_SPARSE requires a contiguous native paged KV cache; "
+                f"got stride={tuple(kv_cache.stride())}"
+            )
 
         use_decode_kernel = attn_metadata.max_query_len <= 1 or (
             self.spec_extend_as_decode
@@ -918,14 +714,13 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             if self._pad_heads:
                 decode_q = q_buffer[:, : self._kernel_num_heads]
                 decode_q[:, self.num_heads :, :].zero_()
-            # Eager bind: map the caller scratch into a views container (no
-            # workspace) and call the kernel with binding=. forced_num_splits pins
-            # a stable, width-derived split count so the merge's num_chunks matches
-            # across every captured graph (the container seeds the same value).
+            # Eager bind maps caller-owned scratch into views. forced_num_splits
+            # pins the planner choice for this captured graph; the merge kernel is
+            # specialized on that count and needs no device-side control fill.
             binding = self._decode_plan.bind(
                 scratch=scratch_storage,
                 q=decode_q,
-                selected_indices=page_table_1,
+                selected_indices=selected_indices,
                 cache_seqlens_int32=cache_seqlens,
                 nsa_cache_seqlens_int32=nsa_cache_seqlens,
             )
@@ -980,7 +775,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             binding = self._extend_plan.bind(
                 scratch=scratch_storage,
                 q=prefill_q,
-                selected_indices=page_table_1,
+                selected_indices=selected_indices,
                 cache_seqlens_int32=cache_seqlens,
                 nsa_cache_seqlens_int32=nsa_cache_seqlens,
             )

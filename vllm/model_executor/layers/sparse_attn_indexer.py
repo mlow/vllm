@@ -652,9 +652,7 @@ def _ensure_b12x_sparse_indexer_supported() -> None:
     if not current_platform.is_cuda():
         raise RuntimeError("B12X sparse indexer/top-k requires CUDA.")
     if not current_platform.is_device_capability_family(120):
-        raise RuntimeError(
-            "B12X sparse indexer/top-k currently requires an SM120 GPU."
-        )
+        raise RuntimeError("B12X sparse indexer/top-k currently requires an SM120 GPU.")
 
 
 def _use_b12x_sparse_indexer(enabled: bool | None = None) -> bool:
@@ -880,6 +878,7 @@ def _run_b12x_paged_topk(
     topk_scores: torch.Tensor | None = None,
     active_width: torch.Tensor | None = None,
     shared_page_table: bool = False,
+    output_physical_slots: bool = False,
 ) -> torch.Tensor:
     """Run b12x paged indexer top-k with caller-owned scratch.
 
@@ -920,9 +919,7 @@ def _run_b12x_paged_topk(
     )
     if shared_page_table:
         _assert_b12x_prefill_paged_route(plan, owner="scratch plan")
-    scratch = current_workspace_manager().get_simultaneous(
-        *plan.shapes_and_dtypes()
-    )
+    scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
     binding = plan.bind(
         scratch=scratch,
         real_page_table=block_table,
@@ -931,6 +928,7 @@ def _run_b12x_paged_topk(
         schedule_metadata=schedule_metadata,
         expected_num_q_heads=expected_num_q_heads,
         shared_page_table=shared_page_table,
+        output_physical_slots=output_physical_slots,
     )
     if shared_page_table:
         _assert_b12x_prefill_paged_route(binding, owner="binding")
@@ -1067,6 +1065,7 @@ def _prewarm_b12x_paged_indexer_prefill(
     profile_q_rows: int,
     profile_k_rows: int,
     page_table_k_rows: int | None = None,
+    output_physical_slots: bool = False,
 ) -> None:
     q_rows = max(1, int(profile_q_rows))
     k_rows = max(1, int(profile_k_rows))
@@ -1123,6 +1122,7 @@ def _prewarm_b12x_paged_indexer_prefill(
         topk_indices=topk_indices,
         topk_tokens=int(topk_tokens),
         shared_page_table=True,
+        output_physical_slots=output_physical_slots,
     )
 
 
@@ -1164,12 +1164,9 @@ def _prewarm_b12x_contiguous_prefill_variants(
         _B12X_CONTIGUOUS_PREFILL_BLOCK_K,
         _B12X_CONTIGUOUS_PREFILL512_BLOCK_K,
     ):
-        if (
-            block_k == _B12X_CONTIGUOUS_PREFILL512_BLOCK_K
-            and (
-                q_rows < _B12X_CONTIGUOUS_PREFILL512_MIN_Q_ROWS
-                or num_q_heads not in _B12X_CONTIGUOUS_PREFILL512_SUPPORTED_HEADS
-            )
+        if block_k == _B12X_CONTIGUOUS_PREFILL512_BLOCK_K and (
+            q_rows < _B12X_CONTIGUOUS_PREFILL512_MIN_Q_ROWS
+            or num_q_heads not in _B12X_CONTIGUOUS_PREFILL512_SUPPORTED_HEADS
         ):
             continue
         k_rows = max(block_k, topk, 1)
@@ -1194,12 +1191,7 @@ def _prewarm_b12x_contiguous_prefill_variants(
         ) // _B12X_PAGED_INDEX_TILE_BLOCK_Q
         num_k_tiles = (k_rows + block_k - 1) // block_k
         tile_logits = torch.empty(
-            (
-                num_q_tiles
-                * num_k_tiles
-                * _B12X_PAGED_INDEX_TILE_BLOCK_Q
-                * block_k,
-            ),
+            (num_q_tiles * num_k_tiles * _B12X_PAGED_INDEX_TILE_BLOCK_Q * block_k,),
             dtype=torch.float32,
             device=q_quant.device,
         )
@@ -1297,6 +1289,7 @@ def sparse_attn_indexer(
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
     use_b12x_sparse_indexer: bool = False,
+    output_physical_slots: bool = False,
     topk_scores_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
@@ -1330,6 +1323,7 @@ def sparse_attn_indexer(
                 skip_k_cache_insert,
                 use_fp4_cache,
                 use_b12x_sparse_indexer,
+                output_physical_slots,
             )
 
         values_spec, scales_spec = _gather_workspace_shapes(
@@ -1376,6 +1370,7 @@ def sparse_attn_indexer(
                 profile_q_rows=profile_q_rows,
                 profile_k_rows=warmup_k_rows,
                 page_table_k_rows=profile_k_rows,
+                output_physical_slots=output_physical_slots,
             )
             if dcp_world_size > 1:
                 dcp_profile_k_rows = _get_dcp_local_k_rows(
@@ -1396,6 +1391,7 @@ def sparse_attn_indexer(
                         profile_q_rows=profile_q_rows,
                         profile_k_rows=dcp_warmup_k_rows,
                         page_table_k_rows=dcp_profile_k_rows,
+                        output_physical_slots=output_physical_slots,
                     )
             _prewarm_b12x_dcp_topk_merge(
                 q_rows=profile_q_rows,
@@ -1444,6 +1440,7 @@ def sparse_attn_indexer(
             skip_k_cache_insert,
             use_fp4_cache,
             use_b12x_sparse_indexer,
+            output_physical_slots,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -1455,6 +1452,16 @@ def sparse_attn_indexer(
     dcp_rank = attn_metadata_narrowed.dcp_rank
     cp_kv_cache_interleave_size = attn_metadata_narrowed.cp_interleave_size
     dcp_global_topk = _dcp_global_topk_requested() and dcp_world_size > 1
+    if output_physical_slots:
+        if not _use_b12x_sparse_indexer(use_b12x_sparse_indexer):
+            raise RuntimeError(
+                "physical sparse-indexer output requires the b12x paged indexer"
+            )
+        if dcp_world_size != 1:
+            raise RuntimeError(
+                "physical sparse-indexer output does not support decode context "
+                "parallelism"
+            )
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -1482,7 +1489,8 @@ def sparse_attn_indexer(
             scale_fmt,
         )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    if not _use_b12x_sparse_indexer(use_b12x_sparse_indexer):
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -1584,6 +1592,7 @@ def sparse_attn_indexer(
                     topk_tokens=topk_tokens,
                     topk_scores=topk_scores,
                     shared_page_table=True,
+                    output_physical_slots=output_physical_slots,
                 )
                 if dcp_global_topk:
                     _merge_b12x_dcp_topk(
@@ -1602,7 +1611,6 @@ def sparse_attn_indexer(
                         dcp_rank=dcp_rank,
                         cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                     )
-                topk_indices.masked_fill_(row_has_no_kv[:, None], -1)
                 continue
 
             k_quant = k_quant_full[: chunk.total_seq_lens]
@@ -1736,6 +1744,7 @@ def sparse_attn_indexer(
                 topk_indices=topk_indices,
                 topk_tokens=topk_tokens,
                 topk_scores=topk_scores,
+                output_physical_slots=output_physical_slots,
             )
             if dcp_global_topk:
                 _merge_b12x_dcp_topk(
@@ -1931,9 +1940,10 @@ def sparse_attn_indexer_fake(
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
     use_b12x_sparse_indexer: bool = False,
+    output_physical_slots: bool = False,
     topk_scores_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    del topk_scores_buffer
+    del topk_scores_buffer, output_physical_slots
     return topk_indices_buffer
 
 
@@ -1972,6 +1982,7 @@ class SparseAttnIndexer(CustomOp):
         skip_k_cache_insert: bool = False,
         use_fp4_cache: bool = False,
         topk_scores_buffer: torch.Tensor | None = None,
+        output_physical_slots: bool = False,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -1983,9 +1994,14 @@ class SparseAttnIndexer(CustomOp):
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
         self.topk_scores_buffer = topk_scores_buffer
+        self.output_physical_slots = bool(output_physical_slots)
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         self.use_b12x_sparse_indexer = use_b12x_sparse_indexer()
+        if self.output_physical_slots and not self.use_b12x_sparse_indexer:
+            raise RuntimeError(
+                "physical sparse-indexer output requires the b12x paged indexer"
+            )
         if self.use_b12x_sparse_indexer:
             if self.use_fp4_cache:
                 raise RuntimeError(
@@ -2046,6 +2062,7 @@ class SparseAttnIndexer(CustomOp):
             self.skip_k_cache_insert,
             self.use_fp4_cache,
             self.use_b12x_sparse_indexer,
+            self.output_physical_slots,
             self.topk_scores_buffer,
         )
 

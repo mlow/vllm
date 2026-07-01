@@ -98,6 +98,7 @@ def _install_fake_b12x_indexer(
                     kwargs["expected_num_q_heads"],
                     kwargs["shared_page_table"],
                     kwargs["active_width"] is not None,
+                    kwargs["output_physical_slots"],
                 )
             )
             return types.SimpleNamespace(scratch=scratch, route=route, **kwargs)
@@ -144,9 +145,7 @@ def _install_fake_b12x_indexer(
     indexer_mod.plan_indexer_scratch = plan_indexer_scratch
     indexer_mod.index_topk_fp8 = index_topk_fp8
     indexer_mod.uses_paged_mqa_schedule = uses_paged_mqa_schedule
-    indexer_mod.build_paged_mqa_schedule_metadata = (
-        build_paged_mqa_schedule_metadata
-    )
+    indexer_mod.build_paged_mqa_schedule_metadata = build_paged_mqa_schedule_metadata
 
     monkeypatch.setitem(sys.modules, "b12x", b12x_mod)
     monkeypatch.setitem(sys.modules, "b12x.attention", attention_mod)
@@ -184,9 +183,9 @@ def test_b12x_decode_indexer_is_non_shared_for_fused_route(
         dtype=torch.uint8,
     )
     seq_lens = torch.tensor([600, 640], dtype=torch.int32)
-    block_table = torch.arange(
-        q_rows * page_table_width, dtype=torch.int32
-    ).reshape(q_rows, page_table_width)
+    block_table = torch.arange(q_rows * page_table_width, dtype=torch.int32).reshape(
+        q_rows, page_table_width
+    )
     topk_indices = torch.empty((q_rows, topk), dtype=torch.int32)
     active_width = torch.tensor([8, 10], dtype=torch.int32)
 
@@ -226,6 +225,7 @@ def test_b12x_decode_indexer_is_non_shared_for_fused_route(
             num_heads,
             False,
             True,
+            False,
         ),
         (
             "paged_index_topk",
@@ -271,6 +271,7 @@ def test_b12x_prefill_indexer_marks_shared_page_table(monkeypatch):
         topk_indices=topk_indices,
         topk_tokens=topk,
         shared_page_table=True,
+        output_physical_slots=True,
     )
 
     assert result is topk_indices
@@ -296,6 +297,7 @@ def test_b12x_prefill_indexer_marks_shared_page_table(monkeypatch):
             num_heads,
             True,
             False,
+            True,
         ),
         (
             "paged_index_topk",
@@ -325,9 +327,11 @@ def test_b12x_prefill_indexer_requires_packed_contiguous_route(monkeypatch):
     weights = torch.empty((q_rows, num_heads, 1), dtype=torch.float32)
     kv_cache = torch.empty((page_table_width, 64, 132), dtype=torch.uint8)
     seq_lens = torch.tensor([600, 640], dtype=torch.int32)
-    block_table = torch.arange(page_table_width, dtype=torch.int32).reshape(
-        1, page_table_width
-    ).expand(q_rows, page_table_width)
+    block_table = (
+        torch.arange(page_table_width, dtype=torch.int32)
+        .reshape(1, page_table_width)
+        .expand(q_rows, page_table_width)
+    )
     topk_indices = torch.empty((q_rows, topk), dtype=torch.int32)
 
     with pytest.raises(RuntimeError, match="packed_contiguous.*scratch plan"):
@@ -397,9 +401,9 @@ def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
     topk = 4
     page_table_width = 10
     seq_lens = torch.tensor([600, 640], dtype=torch.int32)
-    block_table = torch.arange(
-        q_rows * page_table_width, dtype=torch.int32
-    ).reshape(q_rows, page_table_width)
+    block_table = torch.arange(q_rows * page_table_width, dtype=torch.int32).reshape(
+        q_rows, page_table_width
+    )
     active_width = torch.tensor([10], dtype=torch.int32)
     metadata = DeepseekV32IndexerMetadata(
         seq_lens=seq_lens,
@@ -478,6 +482,7 @@ def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
             num_heads,
             False,
             True,
+            False,
         ),
         (
             "paged_index_topk",
@@ -509,6 +514,7 @@ def test_b12x_dcp_decode_requests_score_output(monkeypatch):
         "_ensure_b12x_sparse_indexer_supported",
         lambda: None,
     )
+
     def fake_merge(**kwargs):
         merge_calls.append(
             (
@@ -534,9 +540,9 @@ def test_b12x_dcp_decode_requests_score_output(monkeypatch):
     topk = 4
     page_table_width = 10
     seq_lens = torch.tensor([600, 640], dtype=torch.int32)
-    block_table = torch.arange(
-        q_rows * page_table_width, dtype=torch.int32
-    ).reshape(q_rows, page_table_width)
+    block_table = torch.arange(q_rows * page_table_width, dtype=torch.int32).reshape(
+        q_rows, page_table_width
+    )
     metadata = DeepseekV32IndexerMetadata(
         seq_lens=seq_lens,
         max_seq_len=640,
@@ -732,18 +738,24 @@ def test_dcp_warmup_params_use_group_when_config_missing(monkeypatch):
 
 
 def test_dcp_local_k_rows_matches_interleaved_split():
-    assert indexer_mod._get_dcp_local_k_rows(
-        k_rows=17,
-        dcp_world_size=4,
-        dcp_rank=0,
-        cp_kv_cache_interleave_size=2,
-    ) == 5
-    assert indexer_mod._get_dcp_local_k_rows(
-        k_rows=17,
-        dcp_world_size=4,
-        dcp_rank=1,
-        cp_kv_cache_interleave_size=2,
-    ) == 4
+    assert (
+        indexer_mod._get_dcp_local_k_rows(
+            k_rows=17,
+            dcp_world_size=4,
+            dcp_rank=0,
+            cp_kv_cache_interleave_size=2,
+        )
+        == 5
+    )
+    assert (
+        indexer_mod._get_dcp_local_k_rows(
+            k_rows=17,
+            dcp_world_size=4,
+            dcp_rank=1,
+            cp_kv_cache_interleave_size=2,
+        )
+        == 4
+    )
 
 
 def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
@@ -856,6 +868,7 @@ def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
             (q_rows,),
             1,
             True,
+            False,
             False,
         ),
         (
@@ -1023,6 +1036,7 @@ def test_b12x_profile_uses_max_model_len_for_paged_prefill_warm(monkeypatch):
             1,
             True,
             False,
+            False,
         ),
         (
             "paged_index_topk",
@@ -1104,6 +1118,7 @@ def test_b12x_profile_prewarms_dcp_local_paged_prefill_width(monkeypatch):
         1,
         True,
         False,
+        False,
     ) in calls
     assert (
         "paged_bind",
@@ -1112,6 +1127,7 @@ def test_b12x_profile_prewarms_dcp_local_paged_prefill_width(monkeypatch):
         1,
         True,
         False,
+        False,
     ) in calls
 
 
@@ -1119,13 +1135,9 @@ def test_b12x_paged_profile_rows_follow_logits_budget(monkeypatch):
     monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
     monkeypatch.delenv("B12X_PAGED_INDEX_SUPERTILE_K", raising=False)
 
-    assert (
-        indexer_mod._get_b12x_paged_indexer_profile_q_rows(q_rows=65536) == 4096
-    )
+    assert indexer_mod._get_b12x_paged_indexer_profile_q_rows(q_rows=65536) == 4096
 
-    assert (
-        indexer_mod._get_b12x_paged_indexer_profile_q_rows(q_rows=1024) == 1024
-    )
+    assert indexer_mod._get_b12x_paged_indexer_profile_q_rows(q_rows=1024) == 1024
 
 
 def test_b12x_schedule_metadata_uses_canonical_indexer_import(monkeypatch):

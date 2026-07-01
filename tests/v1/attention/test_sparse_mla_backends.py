@@ -137,9 +137,6 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
     q_rope = torch.zeros((1, num_heads, 64), dtype=torch.bfloat16, device=DEVICE_TYPE)
     kv_cache = torch.zeros((1, 64, 656), dtype=torch.uint8, device=DEVICE_TYPE)
     metadata = SimpleNamespace(
-        page_table_1=torch.empty((2, 2048), dtype=torch.int32, device=DEVICE_TYPE),
-        nsa_cache_seqlens=torch.empty((2,), dtype=torch.int32, device=DEVICE_TYPE),
-        req_id_per_token=torch.zeros((1,), dtype=torch.int32, device=DEVICE_TYPE),
         block_table=torch.zeros((1, 1), dtype=torch.int32, device=DEVICE_TYPE),
         block_size=64,
         cache_seq_lens_per_token=torch.full(
@@ -169,9 +166,6 @@ def test_b12x_sparse_glm_uses_8_head_alignment(
         )
         q_rope = torch.zeros(
             (2, num_heads, 64), dtype=torch.bfloat16, device=DEVICE_TYPE
-        )
-        metadata.req_id_per_token = torch.zeros(
-            (2,), dtype=torch.int32, device=DEVICE_TYPE
         )
         metadata.cache_seq_lens_per_token = torch.full(
             (2,), 64, dtype=torch.int32, device=DEVICE_TYPE
@@ -371,7 +365,10 @@ def test_sparse_backend_decode_correctness(
     qk_rope_head_dim = 64
     v_head_dim = 128
     head_size = kv_lora_rank + qk_rope_head_dim
-    topk_tokens = 128
+    # GLM 5.2 selects 2048 rows. Keep the shared backend test small for other
+    # implementations, but validate b12x at the model's real contract instead of
+    # relying on a smaller kernel-supported regime.
+    topk_tokens = 2048 if backend_cls is B12xMLASparseBackend else 128
 
     max_seqlen = max(batch_spec.seq_lens)
     total_cache_tokens = sum(batch_spec.seq_lens)
@@ -587,8 +584,27 @@ def test_sparse_backend_decode_correctness(
         common_prefix_len=0, common_attn_metadata=common_attn_metadata
     )
 
-    # Use the pre-computed sparse_indices for the mock indexer
-    mock_indexer = SimpleNamespace(topk_indices_buffer=sparse_indices)
+    # B12X owns both ends of the GLM sparse-attention pipeline, so its indexer
+    # buffer already contains native physical cache slots. Other backends retain
+    # the request-relative sparse-index contract exercised by this shared test.
+    backend_sparse_indices = sparse_indices
+    output_physical_slots = backend_cls is B12xMLASparseBackend
+    if output_physical_slots:
+        req_ids = torch.repeat_interleave(
+            torch.arange(batch_spec.batch_size, dtype=torch.int32, device=device),
+            torch.tensor(query_lens, dtype=torch.int64, device=device),
+        )
+        backend_sparse_indices = triton_convert_req_index_to_global_index(
+            req_ids,
+            common_attn_metadata.block_table_tensor,
+            sparse_indices,
+            BLOCK_SIZE=block_size,
+            NUM_TOPK_TOKENS=topk_tokens,
+        )
+    mock_indexer = SimpleNamespace(
+        topk_indices_buffer=backend_sparse_indices,
+        output_physical_slots=output_physical_slots,
+    )
 
     kv_b_proj_weight = torch.cat([W_UK, W_UV], dim=-1)
     kv_b_proj_weight = kv_b_proj_weight.view(
