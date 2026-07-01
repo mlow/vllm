@@ -68,7 +68,7 @@ logger = init_logger(__name__)
 # mid_out/mid_lse scratch and the workspace ``max_chunks_per_row`` cap; b12x's
 # wave-balanced planner picks num_splits <= this cap.
 _DECODE_SPLIT_TILE = 64
-_PREFILL_HEADS_PER_BLOCK = 16
+_HEAD_ALIGNMENT = 8
 _EXTEND_PREWARM_DONE: set[tuple[int | None, int, int, int, int, int, bool]] = set()
 
 
@@ -89,13 +89,6 @@ def _env_int(name: str, default: int) -> int:
         logger.warning("Ignoring non-positive %s=%r; using %d", name, value, default)
         return default
     return parsed
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return value.lower() not in ("0", "false", "no", "off")
 
 
 @triton.jit
@@ -574,38 +567,14 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         max_batched = int(scheduler_config.max_num_batched_tokens)
         max_num_seqs = int(scheduler_config.max_num_seqs)
         self.block_size = 64
-        self._workspace_num_heads = self.num_heads * max(1, self.dcp_world_size)
 
         # Split-K cap: ceil(topk / tile). Bounds the borrowed mid_out/mid_lse
         # chunk dim and the workspace max_chunks_per_row.
         self._num_splits_cap = max(1, _cdiv(self.topk_tokens, _DECODE_SPLIT_TILE))
-        self._prefill_hpb8_enabled = _env_flag("VLLM_B12X_MLA_PREFILL_HPB8")
-        self._decode_num_heads = (
-            _cdiv(self._workspace_num_heads, _PREFILL_HEADS_PER_BLOCK)
-            * _PREFILL_HEADS_PER_BLOCK
+        self._kernel_num_heads = (
+            _cdiv(self.num_heads, _HEAD_ALIGNMENT) * _HEAD_ALIGNMENT
         )
-        self._prefill_num_heads = self._round_prefill_num_heads(
-            self._workspace_num_heads
-        )
-        self._q_workspace_num_heads = max(
-            self.num_heads,
-            self._decode_num_heads,
-            self._prefill_num_heads,
-        )
-        if self._prefill_num_heads != self._workspace_num_heads:
-            logger.info_once(
-                "Padding B12X_MLA_SPARSE heads from %d to %d for B12X kernels.",
-                self._workspace_num_heads,
-                self._prefill_num_heads,
-            )
-        elif (
-            self._prefill_hpb8_enabled
-            and self._workspace_num_heads < _PREFILL_HEADS_PER_BLOCK
-        ):
-            logger.info_once(
-                "Using B12X_MLA_SPARSE prefill hpb8 path with %d heads.",
-                self._workspace_num_heads,
-            )
+        self._pad_heads = self._kernel_num_heads != self.num_heads
 
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
         # The decode kernel handles independent one-token query rows. MTP
@@ -676,11 +645,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         self._decode_plan = _make_plan(
             "decode",
             self._decode_max_rows,
-            self._decode_num_heads,
+            self._kernel_num_heads,
             self._decode_max_rows,
         )
         self._extend_plan = _make_plan(
-            "extend", max_batched, self._prefill_num_heads, max_num_seqs
+            "extend", max_batched, self._kernel_num_heads, max_num_seqs
         )
         # One caller-owned uint8 scratch tensor covers either path (the larger
         # layout); the per-mode materializer carves its views from the prefix.
@@ -695,33 +664,22 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # get_simultaneous call -> distinct, non-overlapping offsets. The manager
         # packs every call from offset 0, so borrowing q and the scratch the kernel
         # writes in separate calls would alias them.
-        current_workspace_manager().get_simultaneous(
+        workspace_specs = [
             (
-                (max_batched, self._q_workspace_num_heads, self.q_head_dim),
+                (max_batched, self._kernel_num_heads, self.q_head_dim),
                 torch.bfloat16,
-            ),
-            (
-                (max_batched, self._q_workspace_num_heads, self.kv_lora_rank),
-                torch.bfloat16,
-            ),
-            ((self._scratch_nbytes,), torch.uint8),
-        )
+            )
+        ]
+        if self._pad_heads:
+            workspace_specs.append(
+                ((max_batched, self.num_heads, self.kv_lora_rank), torch.bfloat16)
+            )
+        workspace_specs.append(((self._scratch_nbytes,), torch.uint8))
+        current_workspace_manager().get_simultaneous(*workspace_specs)
         self._prewarm_extend_kernels_once(max_batched)
 
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
-
-    def _round_prefill_num_heads(self, num_heads: int) -> int:
-        num_heads = int(num_heads)
-        if (
-            self._prefill_hpb8_enabled
-            and num_heads == _PREFILL_HEADS_PER_BLOCK // 2
-        ):
-            return num_heads
-        return (
-            _cdiv(num_heads, _PREFILL_HEADS_PER_BLOCK)
-            * _PREFILL_HEADS_PER_BLOCK
-        )
 
     def _sync_dcp_warmup(self) -> None:
         if self.device.type == "cuda":
@@ -746,7 +704,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             self.device.index,
             self.q_head_dim,
             self.kv_lora_rank,
-            self._prefill_num_heads,
+            self._kernel_num_heads,
             int(self.topk_tokens),
             int(self.block_size),
             bool(self.need_to_return_lse_for_decode),
@@ -776,7 +734,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 continue
             seen_rows.add(rows)
             q = torch.zeros(
-                (rows, self._prefill_num_heads, self.q_head_dim),
+                (rows, self._kernel_num_heads, self.q_head_dim),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -832,25 +790,32 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
         # manager packs every call from offset 0, so separate calls would alias q
         # with the scratch and corrupt the result.
         manager = current_workspace_manager()
-        q_workspace, dense_out_workspace, scratch_storage = manager.get_simultaneous(
+        workspace_specs = [
             (
-                (self._max_batched, self._q_workspace_num_heads, self.q_head_dim),
+                (self._max_batched, self._kernel_num_heads, self.q_head_dim),
                 torch.bfloat16,
-            ),
-            (
-                (self._max_batched, self._q_workspace_num_heads, self.kv_lora_rank),
-                torch.bfloat16,
-            ),
-            ((self._scratch_nbytes,), torch.uint8),
-        )
+            )
+        ]
+        if self._pad_heads:
+            workspace_specs.append(
+                (
+                    (self._max_batched, self.num_heads, self.kv_lora_rank),
+                    torch.bfloat16,
+                )
+            )
+        workspace_specs.append(((self._scratch_nbytes,), torch.uint8))
+        workspace_tensors = manager.get_simultaneous(*workspace_specs)
+        q_workspace = workspace_tensors[0]
+        dense_out_workspace = workspace_tensors[1] if self._pad_heads else None
+        scratch_storage = workspace_tensors[-1]
         if isinstance(q, tuple):
             ql_nope, q_pe = q
             num_actual_toks = ql_nope.shape[0]
             num_input_heads = ql_nope.shape[1]
-            if num_input_heads > self._q_workspace_num_heads:
+            if num_input_heads != self.num_heads:
                 raise ValueError(
-                    "B12X_MLA_SPARSE received more query heads than planned: "
-                    f"{num_input_heads} > {self._q_workspace_num_heads}."
+                    "B12X_MLA_SPARSE query heads do not match the planned "
+                    f"head count: {num_input_heads} != {self.num_heads}."
                 )
             q_buffer = q_workspace[:num_actual_toks]
             q_all = q_buffer[:, :num_input_heads]
@@ -859,16 +824,14 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             q_input = q.contiguous()
             num_actual_toks = q_input.shape[0]
             num_input_heads = q_input.shape[1]
-            if num_input_heads > self._q_workspace_num_heads:
+            if num_input_heads != self.num_heads:
                 raise ValueError(
-                    "B12X_MLA_SPARSE received more query heads than planned: "
-                    f"{num_input_heads} > {self._q_workspace_num_heads}."
+                    "B12X_MLA_SPARSE query heads do not match the planned "
+                    f"head count: {num_input_heads} != {self.num_heads}."
                 )
             q_buffer = q_workspace[:num_actual_toks]
             q_all = q_buffer[:, :num_input_heads]
             q_all.copy_(q_input)
-
-        num_actual_heads = q_all.shape[1]
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
@@ -952,9 +915,9 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 else attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
             )
             decode_q = q_all
-            if self._decode_num_heads != num_actual_heads:
-                decode_q = q_buffer[:, : self._decode_num_heads]
-                decode_q[:, num_actual_heads : self._decode_num_heads, :].zero_()
+            if self._pad_heads:
+                decode_q = q_buffer[:, : self._kernel_num_heads]
+                decode_q[:, self.num_heads :, :].zero_()
             # Eager bind: map the caller scratch into a views container (no
             # workspace) and call the kernel with binding=. forced_num_splits pins
             # a stable, width-derived split count so the merge's num_chunks matches
@@ -979,13 +942,12 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         lse_scale="natural",
                     ),
                 )
-                if self._decode_num_heads != num_actual_heads:
-                    dense_out = dense_out_workspace[
-                        :num_actual_toks, :num_actual_heads, :
-                    ]
-                    dense_out.copy_(out[:, :num_actual_heads, :])
+                if self._pad_heads:
+                    assert dense_out_workspace is not None
+                    dense_out = dense_out_workspace[:num_actual_toks]
+                    dense_out.copy_(out[:, : self.num_heads, :])
                     out = dense_out
-                    lse = lse[:, :num_actual_heads]
+                    lse = lse[:, : self.num_heads]
                 return out, lse
             out = cast(
                 torch.Tensor,
@@ -997,24 +959,21 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                     forced_num_splits=self._num_splits_cap,
                 ),
             )
-            if self._decode_num_heads != num_actual_heads:
-                dense_out = dense_out_workspace[:num_actual_toks, :num_actual_heads, :]
-                dense_out.copy_(out[:, :num_actual_heads, :])
+            if self._pad_heads:
+                assert dense_out_workspace is not None
+                dense_out = dense_out_workspace[:num_actual_toks]
+                dense_out.copy_(out[:, : self.num_heads, :])
                 out = dense_out
             return out, None
         else:
             # Extend / prefill -> single-pass unified prefill (no split-K
-            # scratch needed; only output_buffer is read). By default b12x
-            # prefill uses 16-head blocks. An opt-in hpb8 path lets high-TP
-            # GLM shards with 8 local heads pass the real head count through to
-            # b12x, which avoids the padded Q tensor and output slice.
+            # scratch needed; only output_buffer is read). b12x supports 8-head
+            # granularity, so only a non-aligned local tail is padded here.
             cache_seqlens = attn_metadata.cache_seq_lens_per_req
-            prefill_num_heads = self._round_prefill_num_heads(num_actual_heads)
-            if prefill_num_heads == num_actual_heads:
-                prefill_q = q_all
-            else:
-                prefill_q = q_buffer[:, :prefill_num_heads]
-                prefill_q[:, num_actual_heads:prefill_num_heads, :].zero_()
+            prefill_q = q_all
+            if self._pad_heads:
+                prefill_q = q_buffer[:, : self._kernel_num_heads]
+                prefill_q[:, self.num_heads :, :].zero_()
 
             # Eager bind into the extend views container (single-pass prefill;
             # no split-K, output_buffer is the only scratch the kernel writes).
@@ -1048,10 +1007,11 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                         v_head_dim=self.kv_lora_rank,
                     ),
                 )
-            if prefill_num_heads != num_actual_heads:
-                dense_out = dense_out_workspace[:num_actual_toks, :num_actual_heads, :]
-                dense_out.copy_(out[:, :num_actual_heads, :])
+            if self._pad_heads:
+                assert dense_out_workspace is not None
+                dense_out = dense_out_workspace[:num_actual_toks]
+                dense_out.copy_(out[:, : self.num_heads, :])
                 out = dense_out
                 if lse is not None:
-                    lse = lse[:, :num_actual_heads]
+                    lse = lse[:, : self.num_heads]
         return out, lse
