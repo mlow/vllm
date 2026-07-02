@@ -23,6 +23,8 @@ export B12X_MLA_SM120_UNIFIED=1
 
 export B12X_DENSE_SPLITK_TURBO=1
 export B12X_W4A16_TC_DECODE=1
+export B12X_MOE_FORCE_A8=1
+export CUDA_VISIBLE_DEVICES=8,9
 
 if [[ -z "${HF_HOME:-}" && -L "${HOME}/.cache/huggingface" && ! -e "${HOME}/.cache/huggingface" ]]; then
   if [[ -d /data && -w /data ]]; then
@@ -34,14 +36,14 @@ if [[ -z "${HF_HOME:-}" && -L "${HOME}/.cache/huggingface" && ! -e "${HOME}/.cac
 fi
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-model_path="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash}"
+model_path="${MODEL_PATH:-deepseek-ai/DeepSeek-V4-Flash-DSpark}"
 served_model_name="${SERVED_MODEL_NAME:-DeepSeek-V4-Flash}"
-tp_size="${TP_SIZE:-4}"
+tp_size="${TP_SIZE:-2}"
 dcp_size="${DCP_SIZE:-1}"
 dcp_comm_backend="${DCP_COMM_BACKEND:-a2a}"
 port="${PORT:-8000}"
 gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.88}"
-max_model_len="${MAX_MODEL_LEN:-256000}"
+max_model_len="${MAX_MODEL_LEN:-auto}"
 max_num_seqs="${MAX_NUM_SEQS:-32}"
 max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-4096}"
 max_cudagraph_capture_size="${MAX_CUDAGRAPH_CAPTURE_SIZE:-256}"
@@ -100,7 +102,7 @@ exec .venv/bin/python -m vllm.entrypoints.cli.main serve \
   --no-scheduler-reserve-full-isl \
   --max-num-batched-tokens "${max_num_batched_tokens}" \
   --max_cudagraph_capture_size "${max_cudagraph_capture_size}" \
-  --attention-backend B12X_MLA_SPARSE \
+  --attention-backend "${ATTN_BACKEND:-B12X_MLA_SPARSE}" \
   --enable-chunked-prefill \
   --enable-prefix-caching \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
