@@ -40,7 +40,6 @@ from .deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
     DeepseekV2MoE,
-    _should_overlap_glm_b12x_indexer,
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
@@ -322,12 +321,7 @@ class SharedHead(nn.Module):
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str,
-        indexer_aux_stream: torch.cuda.Stream | None = None,
-    ) -> None:
+    def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
 
         config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -378,7 +372,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             layer_idx_override=0,
             is_nextn=True,
-            indexer_aux_stream=indexer_aux_stream,
         )
 
     def forward(
@@ -418,20 +411,12 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         config = vllm_config.model_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
         self.num_mtp_layers = config.num_nextn_predict_layers
-        draft_config = vllm_config.speculative_config.draft_model_config.hf_config
-        indexer_aux_stream = (
-            torch.cuda.Stream()
-            if _should_overlap_glm_b12x_indexer(draft_config)
-            else None
-        )
         # to map the exact layer index from weights
 
         self.layers = torch.nn.ModuleDict(
             {
                 str(idx): DeepSeekMultiTokenPredictorLayer(
-                    vllm_config,
-                    f"{prefix}.layers.{idx}",
-                    indexer_aux_stream=indexer_aux_stream,
+                    vllm_config, f"{prefix}.layers.{idx}"
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
