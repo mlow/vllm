@@ -60,6 +60,7 @@ class BaseSpeculator(ABC):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        num_speculative_tokens: int | None = None,
         num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
@@ -210,9 +211,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 query_start_loc_cpu = query_start_loc_cpu.cpu()
             required_len = num_reqs_padded + 1
             if query_start_loc_cpu.numel() < required_len:
-                padded_query_start_loc_cpu = query_start_loc_cpu.new_empty(
-                    required_len
-                )
+                padded_query_start_loc_cpu = query_start_loc_cpu.new_empty(required_len)
                 padded_query_start_loc_cpu[: query_start_loc_cpu.numel()] = (
                     query_start_loc_cpu
                 )
@@ -248,12 +247,8 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.block_tables.cp_rank,
                 self.block_tables.cp_interleave,
             )
-            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
-                :num_reqs_padded
-            ]
-        with record_function_or_nullcontext(
-            "vllm:v2/speculator/build_attn_metadata"
-        ):
+            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[:num_reqs_padded]
+        with record_function_or_nullcontext("vllm:v2/speculator/build_attn_metadata"):
             attn_metadata = build_attn_metadata(
                 attn_groups=self.attn_groups,
                 num_reqs=num_reqs_padded,

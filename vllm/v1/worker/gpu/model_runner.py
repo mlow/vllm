@@ -112,7 +112,10 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
-from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
+from vllm.v1.worker.gpu.spec_decode.utils import (
+    DraftTokensHandler,
+    limit_draft_tokens,
+)
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -1418,6 +1421,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            num_spec_tokens_to_schedule=(
+                scheduler_output.resolve_num_spec_tokens_to_schedule(
+                    self.num_speculative_steps
+                )
+            ),
         )
 
         if not self.is_last_pp_rank:
@@ -1434,12 +1442,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # The prior execute_model call must have failed.
             return None
 
-        input_batch = self.execute_model_state.input_batch
-        attn_metadata = self.execute_model_state.attn_metadata
-        slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
-        hidden_states = self.execute_model_state.hidden_states
-        aux_hidden_states = self.execute_model_state.aux_hidden_states
-        finished_req_ids = self.execute_model_state.finished_req_ids
+        execute_model_state = self.execute_model_state
+        input_batch = execute_model_state.input_batch
+        attn_metadata = execute_model_state.attn_metadata
+        slot_mappings_by_layer = execute_model_state.slot_mappings_by_layer
+        hidden_states = execute_model_state.hidden_states
+        aux_hidden_states = execute_model_state.aux_hidden_states
+        finished_req_ids = execute_model_state.finished_req_ids
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1460,6 +1469,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
             _maybe_save_b12x_moe_activation_amax()
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+
+        num_spec_tokens_to_schedule = execute_model_state.num_spec_tokens_to_schedule
 
         # Last rank: sample tokens
         phase = _profile_batch_phase(input_batch)
@@ -1566,29 +1577,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.next_prefill_tokens,
                     self.sampler.sampling_states.temperature.gpu,
                     self.sampler.sampling_states.seeds.gpu,
+                    num_speculative_tokens=num_spec_tokens_to_schedule,
                     mm_inputs=mm_inputs,
+                )
+                draft_tokens = limit_draft_tokens(
+                    draft_tokens,
+                    num_spec_tokens_to_schedule,
+                    self.num_speculative_steps,
                 )
             with record_function_or_nullcontext(
                 f"vllm:v2/speculator/{phase}/store_draft_tokens"
             ):
-                if draft_tokens.shape[1] == self.num_speculative_steps:
-                    self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+                num_draft_tokens = draft_tokens.shape[1]
+                if num_draft_tokens > 0:
+                    self.req_states.draft_tokens[
+                        input_batch.idx_mapping, :num_draft_tokens
+                    ] = draft_tokens
                     draft_tokens_for_next_step = self.req_states.draft_tokens[
-                        input_batch.idx_mapping
+                        input_batch.idx_mapping, :num_draft_tokens
                     ]
-                elif draft_tokens.shape[1] == 0:
+                else:
                     # Some block speculators can intentionally decline to draft
                     # on the next step (for example after a full rejection while
                     # their private KV state is being realigned). Keep the
                     # persistent fixed-width buffer untouched, but report an
                     # empty draft list to the scheduler for the next iteration.
                     draft_tokens_for_next_step = draft_tokens
-                else:
-                    raise RuntimeError(
-                        "Speculator returned unsupported draft shape "
-                        f"{tuple(draft_tokens.shape)}; expected "
-                        f"(*, {self.num_speculative_steps}) or (*, 0)."
-                    )
 
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
@@ -1721,3 +1735,4 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    num_spec_tokens_to_schedule: int

@@ -8,6 +8,7 @@ its own position. Context comes from the target model's auxiliary hidden
 states, which are fc-combined, normed, projected to K/V by every draft
 layer, and written into the draft KV cache.
 """
+
 import os
 from typing import Any
 
@@ -312,6 +313,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        num_speculative_tokens: int | None = None,
         num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,

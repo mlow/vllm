@@ -101,6 +101,14 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X_MLA_SPARSE}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 GLM51_PROFILE="${GLM51_PROFILE:-0}"
 GLM52_CAUSAL_CASCADE="${GLM52_CAUSAL_CASCADE:-0}"
+ADAPTIVE_SPEC_WINDOW="${GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW:-}"
+
+if [[ -n "${ADAPTIVE_SPEC_WINDOW}" \
+  && ! "${ADAPTIVE_SPEC_WINDOW}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW must be a positive" \
+    "integer; got '${ADAPTIVE_SPEC_WINDOW}'" >&2
+  exit 1
+fi
 
 DEFAULT_CAUSAL_CASCADE_MODEL="/data/datasets/glmflash/runs/train/mtp-v10-clean-p1r256-dualstream2-markov-tv-20260701-161620-prefixgrad01-bufferfix-fromstep5000/checkpoints/latest"
 CAUSAL_CASCADE_MODEL="${CAUSAL_CASCADE_MODEL:-${DEFAULT_CAUSAL_CASCADE_MODEL}}"
@@ -122,6 +130,12 @@ SPEC_ARGS=()
 CAUSAL_CASCADE_ARGS=()
 GLM52_CAUSAL_CASCADE_JSON="$(json_bool GLM52_CAUSAL_CASCADE "${GLM52_CAUSAL_CASCADE}")"
 if [[ "${GLM52_CAUSAL_CASCADE_JSON}" == "true" ]]; then
+  if [[ -n "${ADAPTIVE_SPEC_WINDOW}" ]]; then
+    echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW requires the MTP" \
+      "speculative path; disable GLM52_CAUSAL_CASCADE" >&2
+    exit 1
+  fi
+
   NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-${CAUSAL_CASCADE_NUM_SPECULATIVE_TOKENS}}"
   SPEC_CONFIG="${SPEC_CONFIG:-$(printf '{"model":"%s","method":"causal_cascade","num_speculative_tokens":%s,"draft_sample_method":"%s"}' "${CAUSAL_CASCADE_MODEL}" "${NUM_SPECULATIVE_TOKENS}" "${CAUSAL_CASCADE_DRAFT_SAMPLE_METHOD}")}"
   SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
@@ -133,9 +147,36 @@ if [[ "${GLM52_CAUSAL_CASCADE_JSON}" == "true" ]]; then
     CAUSAL_CASCADE_ARGS+=(--enforce-eager)
   fi
 elif [[ "${GLM51_DISABLE_MTP:-0}" != "1" ]]; then
-  NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
-  SPEC_CONFIG="${SPEC_CONFIG:-$(printf '{"model":"%s","method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","draft_sample_method":"probabilistic"}' "${MTP_MODEL}" "${NUM_SPECULATIVE_TOKENS}" "${MOE_SPEC_BACKEND}")}"
+  if [[ -n "${ADAPTIVE_SPEC_WINDOW}" && -n "${SPEC_CONFIG:-}" ]]; then
+    echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW cannot be combined" \
+      "with an explicit SPEC_CONFIG" >&2
+    exit 1
+  fi
+
+  NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
+  ADAPTIVE_SPEC_CONFIG=""
+  if [[ -n "${ADAPTIVE_SPEC_WINDOW}" ]]; then
+    ADAPTIVE_SPEC_CONFIG="$(
+      printf ',"adaptive_speculative_tokens_window":%s' \
+        "${ADAPTIVE_SPEC_WINDOW}"
+    )"
+    echo "Adaptive speculative depth enabled with a ${ADAPTIVE_SPEC_WINDOW}-step" \
+      "window and maximum depth ${NUM_SPECULATIVE_TOKENS}." >&2
+  fi
+  DEFAULT_SPEC_CONFIG="$(
+    printf \
+      '{"model":"%s","method":"mtp","num_speculative_tokens":%s,"moe_backend":"%s","draft_sample_method":"probabilistic"%s}' \
+      "${MTP_MODEL}" \
+      "${NUM_SPECULATIVE_TOKENS}" \
+      "${MOE_SPEC_BACKEND}" \
+      "${ADAPTIVE_SPEC_CONFIG}"
+  )"
+  SPEC_CONFIG="${SPEC_CONFIG:-${DEFAULT_SPEC_CONFIG}}"
   SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
+elif [[ -n "${ADAPTIVE_SPEC_WINDOW}" ]]; then
+  echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW requires MTP; remove" \
+    "--no-mtp or unset GLM51_DISABLE_MTP" >&2
+  exit 1
 fi
 
 PROFILER_ARGS=()
@@ -207,7 +248,6 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --max-cudagraph-capture-size "${MAX_CUDAGRAPH_CAPTURE_SIZE}" \
   --long-prefill-token-threshold 2048 \
   --quantization modelopt_fp4 \
-  --quantization-config.shared_experts.weight mxfp8 \
   --moe-backend "${MOE_BACKEND}" \
   --attention-backend "${ATTENTION_BACKEND}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
