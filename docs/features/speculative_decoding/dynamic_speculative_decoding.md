@@ -74,9 +74,9 @@ VLLM_USE_V2_MODEL_RUNNER=1 vllm serve meta-llama/Llama-3.1-8B-Instruct \
   }'
 ```
 
-The logged vLLM mean acceptance length includes the target-model bonus token.
-The speculative-decoding metrics also log the mean accepted draft length used
-by the controller and the current speculative depth.
+The logged vLLM mean acceptance length includes the target-model bonus token,
+so it is numerically equal to the controller target before rounding. The
+speculative-decoding metrics also log the current speculative depth.
 
 ## Online Examples
 

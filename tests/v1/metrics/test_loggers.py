@@ -69,5 +69,4 @@ def test_spec_decoding_log_reports_current_speculative_depth():
     log_args = log_fn.call_args.args
     message = log_args[0] % log_args[1:]
     assert "Mean acceptance length: 2.00" in message
-    assert "Mean accepted draft length: 1.00" in message
     assert "Current speculative depth: 2" in message

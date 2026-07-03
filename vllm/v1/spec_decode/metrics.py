@@ -114,9 +114,8 @@ class SpecDecodingLogging:
             else float("nan")
         )
 
-        mean_accepted_draft_length = num_accepted_tokens / num_drafts
         # Conventionally, mean acceptance length includes the bonus token.
-        mean_acceptance_length = 1 + mean_accepted_draft_length
+        mean_acceptance_length = 1 + (num_accepted_tokens / num_drafts)
 
         pos_matrix = np.array(self.accepted_tokens_per_pos_lists)
         acceptance_rates = np.sum(pos_matrix, axis=0) / num_drafts
@@ -126,7 +125,6 @@ class SpecDecodingLogging:
         log_fn(
             "SpecDecoding metrics: "
             "Mean acceptance length: %.2f, "
-            "Mean accepted draft length: %.2f, "
             "Current speculative depth: %d, "
             "Accepted throughput: %.2f tokens/s, "
             "Drafted throughput: %.2f tokens/s, "
@@ -135,7 +133,6 @@ class SpecDecodingLogging:
             "Per-position acceptance rate: %s, "
             "Avg Draft acceptance rate: %.1f%%",
             mean_acceptance_length,
-            mean_accepted_draft_length,
             self.current_num_spec_tokens,
             accepted_throughput,
             draft_throughput,
