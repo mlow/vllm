@@ -39,6 +39,7 @@ from vllm.model_executor.layers.quantization.online.int8 import (
 from vllm.model_executor.layers.quantization.online.mxfp8 import (
     Mxfp8OnlineLinearMethod,
     Mxfp8OnlineMoEMethod,
+    is_shared_expert_projection,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -80,11 +81,11 @@ class OnlineQuantizationConfig(QuantizationConfig):
         args: QuantizationConfigArgs,
     ) -> None:
         super().__init__()
-        if args.linear is None and args.moe is None:
+        if args.linear is None and args.moe is None and args.shared_experts is None:
             raise ValueError(
                 "OnlineQuantizationConfig requires at least one of "
-                "quantization_config.linear or quantization_config.moe "
-                "to be set."
+                "quantization_config.linear, quantization_config.moe, or "
+                "quantization_config.shared_experts to be set."
             )
         self.args = args
         self.ignored_layers: list[str] = args.ignore
@@ -152,7 +153,13 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
-            method = self._dispatch(self.args.linear, _ONLINE_LINEAR_METHODS, layer)
+            spec = (
+                self.args.shared_experts
+                if self.args.shared_experts is not None
+                and is_shared_expert_projection(prefix)
+                else self.args.linear
+            )
+            method = self._dispatch(spec, _ONLINE_LINEAR_METHODS, layer)
             return method if method is not None else UnquantizedLinearMethod()
         elif isinstance(layer, RoutedExperts):
             if should_ignore_layer(

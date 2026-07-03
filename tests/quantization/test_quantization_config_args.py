@@ -70,6 +70,11 @@ def test_args_accepts_dict_form():
     assert args.moe == QuantSpec(weight=None, activation=kMxfp8Dynamic)
 
 
+def test_args_shared_experts_string_resolves_weight():
+    args = QuantizationConfigArgs(shared_experts="mxfp8")
+    assert args.shared_experts == QuantSpec(weight=kMxfp8Dynamic)
+
+
 # ---- resolve_quantization_config -----------------------------------------
 
 
@@ -104,6 +109,24 @@ def test_resolve_merges_explicit_over_shorthand():
     )
     assert args.linear == QuantSpec(weight=kFp8Static128BlockSym)
     assert args.moe == QuantSpec(weight=kFp8StaticTensorSym)
+
+
+def test_resolve_merges_shared_experts_over_shorthand():
+    args = resolve_quantization_config(
+        "fp8_per_tensor",
+        {"shared_experts": "mxfp8"},
+    )
+    assert args.linear == QuantSpec(weight=kFp8StaticTensorSym)
+    assert args.moe == QuantSpec(weight=kFp8StaticTensorSym)
+    assert args.shared_experts == QuantSpec(weight=kMxfp8Dynamic)
+
+
+def test_resolve_allows_modelopt_shared_expert_overlay():
+    args = resolve_quantization_config(
+        "modelopt_fp4",
+        {"shared_experts": "mxfp8"},
+    )
+    assert args == QuantizationConfigArgs(shared_experts="mxfp8")
 
 
 def test_resolve_rejects_quantization_config_with_non_shorthand_quant():

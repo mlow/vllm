@@ -207,6 +207,7 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --max-cudagraph-capture-size "${MAX_CUDAGRAPH_CAPTURE_SIZE}" \
   --long-prefill-token-threshold 2048 \
   --quantization modelopt_fp4 \
+  --quantization-config.shared_experts.weight mxfp8 \
   --moe-backend "${MOE_BACKEND}" \
   --attention-backend "${ATTENTION_BACKEND}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
