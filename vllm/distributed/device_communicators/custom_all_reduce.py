@@ -90,6 +90,15 @@ def _load_b12x_pcie_oneshot_pool() -> Any | None:
     return PCIeOneshotAllReducePool
 
 
+@lru_cache(maxsize=1)
+def _load_b12x_pcie_dma() -> Any | None:
+    try:
+        from b12x.distributed import PCIeDmaAllReduce
+    except Exception:
+        return None
+    return PCIeDmaAllReduce
+
+
 def _get_physical_device_numa_node(physical_device_id: int) -> int | None:
     try:
         import pynvml
@@ -230,9 +239,11 @@ class CustomAllreduce:
         self._IS_CAPTURING = False
         self.disabled = True
         self._pcie_runtime = None
+        self._pcie_dma = None
         self._pcie_capture_stream: torch.cuda.Stream | None = None
         self._pcie_allreduce_max_size: int | None = None
         self._pcie_fused_add_rms_norm_max_size: int | None = None
+        self._pcie_logged_first_dma = False
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
         self._pcie_cpp_backend = False
@@ -391,25 +402,27 @@ class CustomAllreduce:
                     "b12x.distributed.PCIeOneshotAllReducePool is unavailable."
                 )
                 return
-            pcie_allreduce_max_size = min(
-                max_size,
-                _parse_byte_size(
-                    os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB")
-                ),
-            )
-            pcie_fused_add_rms_norm_max_size = min(
-                max_size,
-                _parse_byte_size(
-                    os.getenv(
-                        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE",
-                        "72KB",
-                    )
-                ),
-            )
-            pcie_buffer_size = max(
-                pcie_allreduce_max_size,
-                pcie_fused_add_rms_norm_max_size,
-            )
+            # Everything is fact-derived: the largest allreduce the model can
+            # issue (prefill chunk x hidden) bounds the buffers, and the
+            # startup sweep with the real kernels sets both dispatch
+            # crossovers. No hardcoded sizes or env limits.
+            try:
+                from vllm.config import get_current_vllm_config
+
+                vllm_config = get_current_vllm_config()
+                autotune_hidden = vllm_config.model_config.get_hidden_size()
+                autotune_max_rows = vllm_config.scheduler_config.max_num_batched_tokens
+            except Exception:
+                autotune_hidden = 6144
+                autotune_max_rows = 8192
+                logger.warning(
+                    "vLLM config unavailable during CustomAllreduce init; "
+                    "autotune sweeps hidden=%d, rows<=%d instead of model "
+                    "shapes.",
+                    autotune_hidden,
+                    autotune_max_rows,
+                )
+            pcie_buffer_size = autotune_max_rows * autotune_hidden * 2
             pcie_single_channel = _env_flag(
                 "VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", default=True
             )
@@ -420,8 +433,8 @@ class CustomAllreduce:
                 )
                 return
             self.max_size = pcie_buffer_size
-            self._pcie_allreduce_max_size = pcie_allreduce_max_size
-            self._pcie_fused_add_rms_norm_max_size = pcie_fused_add_rms_norm_max_size
+            self._pcie_allreduce_max_size = 0
+            self._pcie_fused_add_rms_norm_max_size = 0
             self.rank = rank
             self.world_size = world_size
             self.fully_connected = False
@@ -461,43 +474,63 @@ class CustomAllreduce:
                 return
             assert pcie_runtime is not None
             self._pcie_runtime = pcie_runtime
-            if _env_flag("VLLM_PCIE_ONESHOT_AUTOTUNE"):
-                autotune_kwargs = {}
-                ceiling = os.getenv("VLLM_PCIE_ONESHOT_AUTOTUNE_CEILING")
-                if ceiling is not None:
-                    autotune_kwargs["ceiling_bytes"] = _parse_byte_size(ceiling)
-                fine_step = os.getenv("VLLM_PCIE_ONESHOT_AUTOTUNE_FINE_STEP")
-                if fine_step is not None:
-                    autotune_kwargs["fine_step_bytes"] = _parse_byte_size(fine_step)
-                warmup = os.getenv("VLLM_PCIE_ONESHOT_AUTOTUNE_WARMUP")
-                if warmup is not None:
-                    autotune_kwargs["warmup"] = int(warmup)
-                iters = os.getenv("VLLM_PCIE_ONESHOT_AUTOTUNE_ITERS")
-                if iters is not None:
-                    autotune_kwargs["iters"] = int(iters)
-                autotune_group = (
-                    self.nccl_group if self.nccl_group is not None else group
+            # Prefill-size DMA allreduce alongside the oneshot; a single
+            # startup sweep over the real kernels sets both crossovers.
+            dma_cls = _load_b12x_pcie_dma()
+            if dma_cls is None:
+                logger.warning(
+                    "b12x PCIe DMA allreduce unavailable "
+                    "(b12x.distributed.PCIeDmaAllReduce not importable); "
+                    "large allreduces stay on PyNCCL."
                 )
-                default_channel = self._pcie_runtime.for_stream()
-                tuned_size = default_channel.find_crossover_size(
-                    autotune_group, **autotune_kwargs
+            else:
+                dma = None
+                dma_error: Exception | None = None
+                try:
+                    dma = dma_cls(
+                        exchange_group=self.nccl_group,
+                        device=self.device,
+                        max_bytes=pcie_buffer_size,
+                    )
+                except Exception as exc:
+                    dma_error = exc
+                dma_failed = torch.tensor(
+                    [int(dma_error is not None)], dtype=torch.int, device="cpu"
                 )
-                self._pcie_allreduce_max_size = min(
-                    tuned_size,
-                    pcie_allreduce_max_size,
-                )
-                # The plain and fused paths have separate crossovers but share
-                # staging buffers. Restore the allocation limit after the
-                # plain-allreduce tuner temporarily changes the channel limit.
-                default_channel.max_size = pcie_buffer_size
-                self._pcie_runtime.max_size = pcie_buffer_size
-                logger.info(
-                    "Autotuned b12x PCIe oneshot allreduce max_size=%d "
-                    "(requested=%d, crossover=%d).",
-                    self._pcie_allreduce_max_size,
-                    pcie_allreduce_max_size,
-                    tuned_size,
-                )
+                dist.all_reduce(dma_failed, op=dist.ReduceOp.MAX, group=self.group)
+                if int(dma_failed.item()) != 0:
+                    if dma is not None:
+                        dma.close()
+                    logger.warning(
+                        "b12x PCIe DMA allreduce initialization failed "
+                        "(rank %d error: %s); large allreduces stay on PyNCCL.",
+                        rank,
+                        dma_error,
+                    )
+                else:
+                    self._pcie_dma = dma
+
+            # One quick sweep from 1 row to the prefill chunk size using the
+            # real kernels (fused AR+RMSNorm, the DMA allreduce, and NCCL +
+            # RMSNorm as the fallback); both crossovers come from the table.
+            from b12x.distributed import autotune_crossovers
+
+            channel = self._pcie_runtime.for_stream()
+            oneshot_max, dma_min = autotune_crossovers(
+                channel,
+                self._pcie_dma,
+                self.nccl_group,
+                hidden_size=autotune_hidden,
+                max_rows=autotune_max_rows,
+                rms_norm_op=ops.fused_add_rms_norm,
+            )
+            self._pcie_allreduce_max_size = oneshot_max
+            self._pcie_fused_add_rms_norm_max_size = oneshot_max
+            logger.info(
+                "Autotuned b12x PCIe crossovers: oneshot/fused max=%d, DMA min=%d.",
+                oneshot_max,
+                dma_min,
+            )
             self.disabled = False
             logger.info(
                 "Using b12x PCIe oneshot allreduce backend "
@@ -647,6 +680,20 @@ class CustomAllreduce:
                     self._pcie_runtime_stream()
                 ).should_allreduce(inp)
             )
+            if not use_custom and self._pcie_dma is not None:
+                use_ring = self._pcie_dma.should_allreduce(inp)
+                if use_ring and not self._pcie_logged_first_dma:
+                    self._pcie_logged_first_dma = True
+                    logger.info(
+                        "b12x PCIe DMA allreduce accepted tensor: "
+                        "shape=%s dtype=%s bytes=%d min_bytes=%d.",
+                        tuple(inp.shape),
+                        inp.dtype,
+                        inp_size,
+                        self._pcie_dma.min_bytes,
+                    )
+                if use_ring:
+                    return True
             if use_custom and not self._pcie_logged_first_accept:
                 self._pcie_logged_first_accept = True
                 logger.info(
@@ -694,6 +741,8 @@ class CustomAllreduce:
 
     def backend_name(self) -> str:
         if self._pcie_runtime is not None:
+            if self._pcie_dma is not None:
+                return "B12X_PCIE_ONESHOT_DMA"
             return "B12X_PCIE_ONESHOT"
         if self._pcie_cpp_backend:
             return "CUSTOM_CPP_PCIE"
@@ -709,6 +758,21 @@ class CustomAllreduce:
         buffer.
         """
         if self._pcie_runtime is not None:
+            inp_size = inp.numel() * inp.element_size()
+            oneshot_eligible = (
+                self._pcie_allreduce_max_size is not None
+                and inp_size <= self._pcie_allreduce_max_size
+            )
+            if (
+                not oneshot_eligible
+                and self._pcie_dma is not None
+                and self._pcie_dma.should_allreduce(inp)
+            ):
+                stream = self._pcie_runtime_stream()
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        return self._pcie_dma.all_reduce(inp, out=out)
+                return self._pcie_dma.all_reduce(inp, out=out)
             if not self._pcie_logged_first_allreduce:
                 self._pcie_logged_first_allreduce = True
                 logger.info(
@@ -816,6 +880,9 @@ class CustomAllreduce:
             return self.all_reduce(input, registered=False)
 
     def close(self):
+        if self._pcie_dma is not None:
+            self._pcie_dma.close()
+            self._pcie_dma = None
         if self._pcie_runtime is not None:
             self._pcie_runtime.close()
             self._pcie_runtime = None
