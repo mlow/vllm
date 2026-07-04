@@ -29,10 +29,12 @@ from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4FlashMLAAttention,
     DeepseekV4FlashMLABackend,
 )
-from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_a2a_lse_reduce,
+    dcp_b12x_all_gather_heads,
+)
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
@@ -159,8 +161,7 @@ def _validate_index_matrix_for_b12x(
     lens_max = int(lens.max().item()) if rows else 0
     if lens_min < 0 or lens_max > width:
         raise RuntimeError(
-            f"{name} lens out of range: min={lens_min}, max={lens_max}, "
-            f"width={width}"
+            f"{name} lens out of range: min={lens_min}, max={lens_max}, width={width}"
         )
 
     if rows == 0 or width == 0:
@@ -303,9 +304,7 @@ def _run_compressed_mla(
             max_chunks_per_row=num_splits_cap,
         )
     )
-    scratch = current_workspace_manager().get_simultaneous(
-        *plan.shapes_and_dtypes()
-    )
+    scratch = current_workspace_manager().get_simultaneous(*plan.shapes_and_dtypes())
 
     binding = plan.bind(
         scratch=scratch,
@@ -351,6 +350,7 @@ def _run_dcp_compressed_mla(
     attn_sink: torch.Tensor,
     scale: float,
     dcp_comm_backend: str,
+    dcp_max_batch_size: int,
     swa_k_cache: torch.Tensor,
     swa_indices: torch.Tensor,
     swa_lens: torch.Tensor,
@@ -364,7 +364,15 @@ def _run_dcp_compressed_mla(
     from vllm.distributed.parallel_state import get_dcp_group
 
     dcp_group = get_dcp_group()
-    q_all = dcp_group.all_gather(q.contiguous(), dim=1)
+    if dcp_comm_backend == "a2a":
+        q_all = dcp_b12x_all_gather_heads(
+            q,
+            dcp_group,
+            max_batch_size=dcp_max_batch_size,
+            output_head_dim=_DSV4_V_HEAD_DIM,
+        )
+    else:
+        q_all = dcp_group.all_gather(q.contiguous(), dim=1)
     local_heads = int(q.shape[1])
     gathered_sink = dcp_group.all_gather(attn_sink[:local_heads].contiguous(), dim=0)
     sink = gathered_sink if dcp_group.rank_in_group == 0 else None
@@ -395,6 +403,9 @@ def _run_dcp_compressed_mla(
             lse,
             dcp_group,
             is_lse_base_on_e=True,
+            use_b12x=True,
+            b12x_max_batch_size=dcp_max_batch_size,
+            b12x_query_head_dim=int(q.shape[-1]),
         )
     else:
         reduced = cp_lse_ag_out_rs(
@@ -422,7 +433,9 @@ class DeepseekV4B12xMLASparseBackend(DeepseekV4FlashMLABackend):
 class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
     """b12x compressed sparse-MLA attention layer for DeepSeek-V4 (SM120)."""
 
-    backend_cls: ClassVar[type[AttentionBackend]] = DeepseekV4B12xMLASparseBackend
+    backend_cls: ClassVar[type[DeepseekV4FlashMLABackend]] = (
+        DeepseekV4B12xMLASparseBackend
+    )
     enqueue_default_before_indexer: ClassVar[bool] = True
 
     @classmethod
@@ -551,7 +564,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
 
         if num_prefills > 0:
             prefill_end = num_decode_tokens + num_prefill_tokens
-            self._forward_prefill(
+            self._forward_b12x_prefill(
                 q=q[num_decode_tokens:prefill_end],
                 compressed_k_cache=self_kv_cache,
                 swa_k_cache=swa_kv_cache,
@@ -565,7 +578,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 vllm_config=vllm_config,
             )
         if num_decodes > 0:
-            self._forward_decode(
+            self._forward_b12x_decode(
                 q=q[:num_decode_tokens],
                 kv_cache=self_kv_cache,
                 swa_kv_cache=swa_kv_cache,
@@ -580,7 +593,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 vllm_config=vllm_config,
             )
 
-    def _forward_decode(
+    def _forward_b12x_decode(
         self,
         q: torch.Tensor,
         kv_cache: torch.Tensor | None,  # only used when compress_ratio > 1
@@ -650,6 +663,9 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 attn_sink=attn_sink,
                 scale=scale,
                 dcp_comm_backend=vllm_config.parallel_config.dcp_comm_backend,
+                dcp_max_batch_size=(
+                    vllm_config.scheduler_config.max_num_batched_tokens
+                ),
                 swa_k_cache=swa_k_cache,
                 swa_indices=swa_indices,
                 swa_lens=swa_lens,
@@ -677,7 +693,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                 mode="decode",
             )
 
-    def _forward_prefill(
+    def _forward_b12x_prefill(
         self,
         q: torch.Tensor,
         compressed_k_cache: torch.Tensor | None,
@@ -798,10 +814,11 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                     attn_sink=attn_sink,
                     scale=scale,
                     dcp_comm_backend=vllm_config.parallel_config.dcp_comm_backend,
+                    dcp_max_batch_size=(
+                        vllm_config.scheduler_config.max_num_batched_tokens
+                    ),
                     swa_k_cache=swa_k_cache,
-                    swa_indices=swa_metadata.prefill_swa_indices[
-                        query_start:query_end
-                    ],
+                    swa_indices=swa_metadata.prefill_swa_indices[query_start:query_end],
                     swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
                     swa_page_size=swa_metadata.block_size,
                     indexed_k_cache=indexed_k_cache,
@@ -817,9 +834,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
                     attn_sink=attn_sink,
                     scale=scale,
                     swa_k_cache=swa_k_cache,
-                    swa_indices=swa_metadata.prefill_swa_indices[
-                        query_start:query_end
-                    ],
+                    swa_indices=swa_metadata.prefill_swa_indices[query_start:query_end],
                     swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
                     swa_page_size=swa_metadata.block_size,
                     indexed_k_cache=indexed_k_cache,

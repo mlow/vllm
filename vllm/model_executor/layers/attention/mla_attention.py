@@ -271,7 +271,10 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_a2a_lse_reduce,
+    dcp_b12x_all_gather_heads,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
@@ -548,6 +551,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             _vllm_config is not None
             and _vllm_config.parallel_config.decode_context_parallel_size > 1
             and _vllm_config.parallel_config.dcp_comm_backend == "a2a"
+        )
+        self.dcp_b12x = (
+            self.dcp_a2a
+            and envs.VLLM_USE_B12X_DCP_A2A
+            and self.attn_backend.get_name() == "B12X_MLA_SPARSE"
+        )
+        self.dcp_max_batch_size = (
+            int(_vllm_config.scheduler_config.max_num_batched_tokens)
+            if _vllm_config is not None
+            else 0
         )
 
         # Initialize q/k/v range constants.
@@ -874,7 +887,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                     mqa_q = torch.cat(mqa_q, dim=-1)
                 # mqa_q do allgather in head dim.
-                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                if self.dcp_b12x:
+                    mqa_q = dcp_b12x_all_gather_heads(
+                        mqa_q,
+                        get_dcp_group(),
+                        max_batch_size=self.dcp_max_batch_size,
+                        output_head_dim=self.kv_lora_rank,
+                    )
+                else:
+                    mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
             # call decode attn
             if not is_sparse_impl:
@@ -894,6 +915,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         lse,
                         get_dcp_group(),
                         is_lse_base_on_e=True,
+                        use_b12x=self.dcp_b12x,
+                        b12x_max_batch_size=self.dcp_max_batch_size,
+                        b12x_query_head_dim=(self.kv_lora_rank + self.qk_rope_head_dim),
                     )
                 else:
                     attn_out = cp_lse_ag_out_rs(
@@ -2317,7 +2341,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert prefill_metadata.chunked_context is not None
         assert prefill_metadata.chunked_context.padded_local_chunk_seq_lens is not None
         assert prefill_metadata.chunked_context.local_context_lens_allranks is not None
-        assert prefill_metadata.chunked_context.padded_local_cu_seq_lens is not None
+        padded_local_cu_seq_lens = (
+            prefill_metadata.chunked_context.padded_local_cu_seq_lens
+        )
+        assert padded_local_cu_seq_lens is not None
         assert prefill_metadata.chunked_context.cu_seq_lens_lst is not None
         assert prefill_metadata.chunked_context.chunk_size is not None
 
@@ -2329,29 +2356,27 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         # Quantized KV caches store bytes while the gather workspace is in the
         # model dtype; route through the dequantizing gather in that case.
         needs_dequant_gather = kv_c_and_k_pe_cache.dtype != workspace.dtype
+        padded_local_token_to_seq = (
+            prefill_metadata.chunked_context.padded_local_token_to_seq
+        )
         if needs_dequant_gather:
             assert is_quantized_kv_cache(self.kv_cache_dtype), (
                 "DCP context prefill only supports dtype-mismatched KV cache "
                 "when the KV cache is quantized."
             )
             assert k_scale is not None
-            assert (
-                prefill_metadata.chunked_context.padded_local_token_to_seq is not None
-            )
+            assert padded_local_token_to_seq is not None
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
             if needs_dequant_gather:
+                assert padded_local_token_to_seq is not None
                 ops.gather_and_maybe_dequant_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
                     block_table=prefill_metadata.block_table,
-                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
-                        i
-                    ],
-                    token_to_seq=(
-                        prefill_metadata.chunked_context.padded_local_token_to_seq[i]
-                    ),
+                    cu_seq_lens=padded_local_cu_seq_lens[i],
+                    token_to_seq=padded_local_token_to_seq[i],
                     num_tokens=toks,
                     kv_cache_dtype=self.kv_cache_dtype,
                     scale=k_scale,
@@ -2362,9 +2387,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
                     block_table=prefill_metadata.block_table,
-                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
-                        i
-                    ],
+                    cu_seq_lens=padded_local_cu_seq_lens[i],
                     batch_size=attn_metadata.num_prefills,
                     seq_starts=prefill_metadata.chunked_context.starts[i],
                 )

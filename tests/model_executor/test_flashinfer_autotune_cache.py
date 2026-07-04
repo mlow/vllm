@@ -125,6 +125,65 @@ def _patch_flashinfer_autotune_deps(monkeypatch):
     return calls
 
 
+def test_b12x_dcp_warmup_finds_generic_mla_attention(monkeypatch) -> None:
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    attention = MLAAttention.__new__(MLAAttention)
+    torch.nn.Module.__init__(attention)
+    attention.register_parameter(
+        "device_probe",
+        torch.nn.Parameter(torch.empty(1)),
+    )
+    attention.dcp_b12x = True
+    attention.num_heads = 16
+    attention.kv_lora_rank = 512
+    attention.qk_rope_head_dim = 64
+
+    model = torch.nn.Module()
+    model.add_module("attention", attention)
+    compilation_config = SimpleNamespace(
+        static_forward_context={"model.layers.0.attn": attention}
+    )
+    worker = SimpleNamespace(
+        get_model=lambda: model,
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                decode_context_parallel_size=2,
+                dcp_comm_backend="a2a",
+            ),
+            compilation_config=compilation_config,
+        ),
+    )
+    group = object()
+    calls = []
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: group)
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "warmup_b12x_dcp_a2a",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    assert kernel_warmup._warmup_b12x_dcp_a2a(worker) == 1
+    assert calls == [
+        (
+            (group,),
+            {
+                "device": torch.device("cpu"),
+                "dtype": torch.bfloat16,
+                "max_batch_size": 4096,
+                "total_heads": 32,
+                "head_dim": 512,
+                "query_head_dim": 576,
+            },
+        )
+    ]
+
+
 def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
     calls = []
     model = torch.nn.Linear(2, 2)

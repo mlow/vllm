@@ -8,7 +8,9 @@ Tests cover:
 3. LSE-weighted combination correctness
 """
 
+import importlib.util
 import math
+from typing import Any
 
 import multiprocess as mp
 import pytest
@@ -24,9 +26,15 @@ mp.set_start_method("spawn", force=True)
 
 
 class _FakeCPGroup:
-    def __init__(self, world_size: int, device_group: dist.ProcessGroup):
+    def __init__(
+        self,
+        world_size: int,
+        device_group: dist.ProcessGroup,
+        cpu_group: dist.ProcessGroup | None = None,
+    ):
         self.world_size = world_size
         self.device_group = device_group
+        self.cpu_group = cpu_group
 
 
 def _dtype_from_name(dtype_name: str) -> torch.dtype:
@@ -110,15 +118,13 @@ class TestDCPCommBackendConfig:
         config = ParallelConfig()
         assert config.dcp_comm_backend == "ag_rs"
 
-    def test_a2a_requires_dcp_greater_than_1(self):
-        """A2A backend requires decode_context_parallel_size > 1."""
-        with pytest.raises(
-            ValueError, match="requires decode_context_parallel_size > 1"
-        ):
-            ParallelConfig(
-                dcp_comm_backend="a2a",
-                decode_context_parallel_size=1,
-            )
+    def test_a2a_is_ignored_without_dcp(self):
+        """The DCP backend is inert when decode context parallelism is off."""
+        config = ParallelConfig(
+            dcp_comm_backend="a2a",
+            decode_context_parallel_size=1,
+        )
+        assert config.dcp_comm_backend == "ag_rs"
 
     def test_a2a_with_dcp_valid(self):
         """A2A backend is valid when DCP > 1."""
@@ -319,6 +325,119 @@ class TestLSEWeightedCombine:
         assert _dcp_a2a_lse_pack_dim(torch.float32) == 1
 
 
+def test_b12x_dispatch_bypasses_packed_nccl(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    partial_output = torch.zeros(1, 16, 64, dtype=torch.bfloat16)
+    partial_lse = torch.zeros(1, 16, dtype=torch.float32)
+    expected = torch.ones(1, 8, 64, dtype=torch.bfloat16)
+    captured: dict[str, Any] = {}
+
+    def fake_b12x(
+        cp_attn_out,
+        cp_attn_lse,
+        cp_group,
+        *,
+        return_lse,
+        is_lse_base_on_e,
+        max_batch_size,
+        query_head_dim,
+    ):
+        captured.update(
+            output=cp_attn_out,
+            lse=cp_attn_lse,
+            group=cp_group,
+            return_lse=return_lse,
+            is_lse_base_on_e=is_lse_base_on_e,
+            max_batch_size=max_batch_size,
+            query_head_dim=query_head_dim,
+        )
+        return expected
+
+    monkeypatch.setattr(dcp_alltoall, "_try_b12x_dcp_lse_reduce", fake_b12x)
+    group = _FakeCPGroup(2, None)  # type: ignore[arg-type]
+    actual = dcp_alltoall.dcp_a2a_lse_reduce(
+        partial_output,
+        partial_lse,
+        group,  # type: ignore[arg-type]
+        use_b12x=True,
+        b12x_max_batch_size=8192,
+    )
+
+    assert actual is expected
+    assert captured == {
+        "output": partial_output,
+        "lse": partial_lse,
+        "group": group,
+        "return_lse": False,
+        "is_lse_base_on_e": True,
+        "max_batch_size": 8192,
+        "query_head_dim": None,
+    }
+
+
+def test_b12x_query_gather_dispatch_bypasses_group(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    local_query = torch.zeros(2, 8, 64, dtype=torch.bfloat16)
+    expected = torch.ones(2, 16, 64, dtype=torch.bfloat16)
+    captured: dict[str, Any] = {}
+
+    def fake_b12x(local_input, cp_group, *, max_batch_size, output_head_dim):
+        captured.update(
+            local_input=local_input,
+            group=cp_group,
+            max_batch_size=max_batch_size,
+            output_head_dim=output_head_dim,
+        )
+        return expected
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_try_b12x_dcp_all_gather_heads",
+        fake_b12x,
+    )
+    group = _FakeCPGroup(2, None)  # type: ignore[arg-type]
+    actual = dcp_alltoall.dcp_b12x_all_gather_heads(
+        local_query,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8192,
+    )
+
+    assert actual is expected
+    assert captured == {
+        "local_input": local_query,
+        "group": group,
+        "max_batch_size": 8192,
+        "output_head_dim": None,
+    }
+
+
+def test_b12x_query_gather_requires_env(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.delenv("VLLM_USE_B12X_DCP_A2A", raising=False)
+    local_query = torch.zeros(2, 8, 64, dtype=torch.bfloat16)
+    expected = torch.ones(2, 16, 64, dtype=torch.bfloat16)
+    group = _FakeCPGroup(2, None)  # type: ignore[arg-type]
+    group.all_gather = lambda value, dim: expected  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_try_b12x_dcp_all_gather_heads",
+        lambda *args, **kwargs: pytest.fail("B12X path must remain disabled"),
+    )
+
+    actual = dcp_alltoall.dcp_b12x_all_gather_heads(
+        local_query,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8192,
+    )
+
+    assert actual is expected
+
+
 class TestPackedA2AKernels:
     @pytest.mark.skipif(
         torch.accelerator.device_count() < 1, reason="CUDA is required."
@@ -466,6 +585,177 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
         dist.destroy_process_group()
 
 
+def _distributed_b12x_a2a_worker(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    local_rank = int(env["LOCAL_RANK"])
+    torch.accelerator.set_device_index(local_rank)
+    dist.init_process_group(backend="nccl")
+    try:
+        from vllm.v1.attention.ops import dcp_alltoall
+
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        batch, h_per_rank, head_dim, query_head_dim = 3, 8, 512, 576
+        total_heads = world_size * h_per_rank
+        group = _FakeCPGroup(world_size, dist.group.WORLD)
+
+        def make_inputs(step: int):
+            generator = torch.Generator(device=f"cuda:{local_rank}")
+            generator.manual_seed(1000 * step + rank)
+            output = torch.randn(
+                batch,
+                total_heads,
+                head_dim,
+                device=f"cuda:{local_rank}",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            lse = torch.randn(
+                batch,
+                total_heads,
+                device=f"cuda:{local_rank}",
+                dtype=torch.float32,
+                generator=generator,
+            )
+            return output, lse
+
+        def make_query(step: int) -> torch.Tensor:
+            generator = torch.Generator(device=f"cuda:{local_rank}")
+            generator.manual_seed(10000 * step + rank)
+            return torch.randn(
+                batch,
+                h_per_rank,
+                query_head_dim,
+                device=f"cuda:{local_rank}",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+
+        def expected_query(query: torch.Tensor) -> torch.Tensor:
+            gathered = [torch.empty_like(query) for _ in range(world_size)]
+            dist.all_gather(gathered, query)
+            return torch.cat(gathered, dim=1)
+
+        def expected(output: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+            gathered_output = [torch.empty_like(output) for _ in range(world_size)]
+            gathered_lse = [torch.empty_like(lse) for _ in range(world_size)]
+            dist.all_gather(gathered_output, output)
+            dist.all_gather(gathered_lse, lse)
+            outputs = torch.stack(
+                [
+                    value[:, rank * h_per_rank : (rank + 1) * h_per_rank]
+                    for value in gathered_output
+                ]
+            ).float()
+            lses = torch.stack(
+                [
+                    value[:, rank * h_per_rank : (rank + 1) * h_per_rank]
+                    for value in gathered_lse
+                ]
+            )
+            return dcp_alltoall._lse_weighted_combine(outputs, lses)
+
+        dcp_alltoall.warmup_b12x_dcp_a2a(
+            group,  # type: ignore[arg-type]
+            device=torch.device(f"cuda:{local_rank}"),
+            dtype=torch.bfloat16,
+            max_batch_size=4,
+            total_heads=total_heads,
+            head_dim=head_dim,
+            query_head_dim=query_head_dim,
+        )
+        assert dcp_alltoall._B12X_DCP_A2A_POOLS
+
+        query = make_query(0)
+        gathered_query = dcp_alltoall.dcp_b12x_all_gather_heads(
+            query,
+            group,  # type: ignore[arg-type]
+            max_batch_size=4,
+            output_head_dim=head_dim,
+        )
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(
+            gathered_query,
+            expected_query(query),
+            rtol=0,
+            atol=0,
+        )
+
+        partial_output, partial_lse = make_inputs(0)
+        actual = dcp_alltoall.dcp_a2a_lse_reduce(
+            partial_output,
+            partial_lse,
+            group,  # type: ignore[arg-type]
+            use_b12x=True,
+            b12x_max_batch_size=4,
+            b12x_query_head_dim=query_head_dim,
+        )
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(
+            actual.float(),
+            expected(partial_output, partial_lse),
+            rtol=3e-2,
+            atol=3e-2,
+        )
+
+        static_output = torch.empty_like(partial_output)
+        static_lse = torch.empty_like(partial_lse)
+        static_query = torch.empty_like(query)
+
+        def fail_packed_nccl(*args, **kwargs):
+            raise AssertionError("captured path fell back to packed NCCL A2A")
+
+        def fail_query_nccl(*args, **kwargs):
+            raise AssertionError("captured path fell back to NCCL all-gather")
+
+        dcp_alltoall._dcp_a2a_send_recv_buffers = fail_packed_nccl
+        group.all_gather = fail_query_nccl  # type: ignore[attr-defined]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_query = dcp_alltoall.dcp_b12x_all_gather_heads(
+                static_query,
+                group,  # type: ignore[arg-type]
+                max_batch_size=4,
+                output_head_dim=head_dim,
+            )
+            graph_output = dcp_alltoall.dcp_a2a_lse_reduce(
+                static_output,
+                static_lse,
+                group,  # type: ignore[arg-type]
+                use_b12x=True,
+                b12x_max_batch_size=4,
+                b12x_query_head_dim=query_head_dim,
+            )
+
+        for step in range(1, 4):
+            query = make_query(step)
+            output, lse = make_inputs(step)
+            static_query.copy_(query)
+            static_output.copy_(output)
+            static_lse.copy_(lse)
+            graph.replay()
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(
+                graph_query,
+                expected_query(static_query),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                graph_output.float(),
+                expected(static_output, static_lse),
+                rtol=3e-2,
+                atol=3e-2,
+            )
+    finally:
+        from vllm.v1.attention.ops import dcp_alltoall
+
+        for pool in dcp_alltoall._B12X_DCP_A2A_POOLS.values():
+            pool.close()
+        dcp_alltoall._B12X_DCP_A2A_POOLS.clear()
+        dist.destroy_process_group()
+
+
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs."
 )
@@ -495,6 +785,21 @@ def test_distributed_packed_a2a_with_workspace_matches_reference():
             "LSE_BASE_E": "1",
             "USE_WORKSPACE": "1",
         },
+    )
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2 or importlib.util.find_spec("b12x") is None,
+    reason="Need two GPUs and b12x.",
+)
+def test_distributed_b12x_a2a_eager_and_graph_matches_reference():
+    from b12x.distributed.pcie_dcp_a2a import _load_extension
+
+    _load_extension()
+    _distributed_run(
+        _distributed_b12x_a2a_worker,
+        world_size=2,
+        extra_env={"VLLM_USE_B12X_DCP_A2A": "1"},
     )
 
 

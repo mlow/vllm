@@ -35,11 +35,11 @@ export VLLM_USE_V2_MODEL_RUNNER="${VLLM_USE_V2_MODEL_RUNNER:-1}"
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 export VLLM_PCIE_ALLREDUCE_BACKEND="${GLM51_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE="${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-64KB}"
-export VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE="${VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE:-72KB}"
+export VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE="${VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE:-84KB}"
 
 export B12X_DENSE_SPLITK_TURBO="${B12X_DENSE_SPLITK_TURBO:-1}"
 export B12X_W4A16_TC_DECODE="${B12X_W4A16_TC_DECODE:-1}"
-export B12X_MOE_FORCE_A16=1
+export B12X_MOE_FORCE_A16=${B12X_MOE_FORCE_A16:-0}
 
 json_bool() {
   local name="$1"
@@ -154,7 +154,7 @@ elif [[ "${GLM51_DISABLE_MTP:-0}" != "1" ]]; then
     exit 1
   fi
 
-  NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-5}"
+  NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-3}"
   ADAPTIVE_SPEC_CONFIG=""
   if [[ -n "${ADAPTIVE_SPEC_WINDOW}" ]]; then
     ADAPTIVE_SPEC_CONFIG="$(
@@ -237,7 +237,7 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --tensor-parallel-size "${TP_SIZE}" \
   --pipeline-parallel-size 1 \
   --decode-context-parallel-size "${DCP_SIZE}" \
-  --dcp-comm-backend "${DCP_COMM_BACKEND:-ag_rs}" \
+  --dcp-comm-backend "${DCP_COMM_BACKEND:-a2a}" \
   --enable-chunked-prefill \
   --enable-prefix-caching \
   --load-format fastsafetensors \

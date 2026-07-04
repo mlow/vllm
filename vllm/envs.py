@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_WO_PROJECTION: bool = False
     VLLM_USE_B12X_MOE: bool = False
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
+    VLLM_USE_B12X_DCP_A2A: bool = False
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
@@ -201,7 +202,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "64KB"
-    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "72KB"
+    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -1035,6 +1036,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_B12X_MINIMAX_M3_MSA": lambda: bool(
         int(os.getenv("VLLM_USE_B12X_MINIMAX_M3_MSA", "0"))
     ),
+    # Use b12x PCIe collectives for DCP query gather and output reduction.
+    "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
     # Diagnostic flag retained for local experiments. MiniMax M3 compile is
     # fail-closed in the model until the no-break path is validated.
     "VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE": lambda: bool(
@@ -1614,7 +1617,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB"
     ),
     "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
-        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "72KB"
+        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
