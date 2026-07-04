@@ -559,9 +559,14 @@ def _get_b12x_paged_indexer_profile_k_rows(
     max_model_len: int,
     total_seq_lens: int,
 ) -> int:
-    known_k_rows = max(int(max_model_len), int(total_seq_lens), 0)
-    if known_k_rows > 0:
-        return known_k_rows
+    # The page table is per request, while total_seq_lens is the capacity of
+    # the flattened prefill workspace across requests (currently up to
+    # 40 * max_model_len).  Feeding that aggregate capacity to the B12X planner
+    # produces a kernel schedule for an impossible per-row context.
+    if int(max_model_len) > 0:
+        return int(max_model_len)
+    if int(total_seq_lens) > 0:
+        return int(total_seq_lens)
     return _get_b12x_indexer_paged_supertile_k()
 
 
@@ -575,23 +580,6 @@ def _get_b12x_paged_indexer_profile_warmup_k_rows(profile_k_rows: int) -> int:
         * _B12X_PAGED_INDEX_TILE_BLOCK_K
     )
     return min(max(1, int(profile_k_rows)), cap)
-
-
-def _get_dcp_local_k_rows(
-    k_rows: int,
-    dcp_world_size: int,
-    dcp_rank: int,
-    cp_kv_cache_interleave_size: int,
-) -> int:
-    if dcp_world_size <= 1:
-        return int(k_rows)
-    interleave = max(1, int(cp_kv_cache_interleave_size))
-    world_size = int(dcp_world_size)
-    rank = int(dcp_rank)
-    base = int(k_rows) // interleave // world_size * interleave
-    remainder = int(k_rows) - base * world_size
-    rank_remainder = min(max(remainder - rank * interleave, 0), interleave)
-    return base + rank_remainder
 
 
 def _b12x_profile_rows_or_empty(tensor: torch.Tensor, rows: int) -> torch.Tensor:
@@ -1372,27 +1360,6 @@ def sparse_attn_indexer(
                 page_table_k_rows=profile_k_rows,
                 output_physical_slots=output_physical_slots,
             )
-            if dcp_world_size > 1:
-                dcp_profile_k_rows = _get_dcp_local_k_rows(
-                    profile_k_rows,
-                    dcp_world_size,
-                    dcp_rank,
-                    cp_kv_cache_interleave_size,
-                )
-                dcp_warmup_k_rows = _get_b12x_paged_indexer_profile_warmup_k_rows(
-                    dcp_profile_k_rows
-                )
-                if dcp_warmup_k_rows != warmup_k_rows:
-                    _prewarm_b12x_paged_indexer_prefill(
-                        q_quant=q_quant,
-                        weights=weights,
-                        kv_cache=kv_cache,
-                        topk_tokens=int(topk_tokens),
-                        profile_q_rows=profile_q_rows,
-                        profile_k_rows=dcp_warmup_k_rows,
-                        page_table_k_rows=dcp_profile_k_rows,
-                        output_physical_slots=output_physical_slots,
-                    )
             _prewarm_b12x_dcp_topk_merge(
                 q_rows=profile_q_rows,
                 topk_tokens=int(topk_tokens),

@@ -737,27 +737,6 @@ def test_dcp_warmup_params_use_group_when_config_missing(monkeypatch):
     assert indexer_mod._get_dcp_warmup_params() == (4, 2, 1)
 
 
-def test_dcp_local_k_rows_matches_interleaved_split():
-    assert (
-        indexer_mod._get_dcp_local_k_rows(
-            k_rows=17,
-            dcp_world_size=4,
-            dcp_rank=0,
-            cp_kv_cache_interleave_size=2,
-        )
-        == 5
-    )
-    assert (
-        indexer_mod._get_dcp_local_k_rows(
-            k_rows=17,
-            dcp_world_size=4,
-            dcp_rank=1,
-            cp_kv_cache_interleave_size=2,
-        )
-        == 4
-    )
-
-
 def test_b12x_profile_skips_legacy_logits_dummy_allocation(monkeypatch):
     calls: list[tuple] = []
     _install_fake_b12x_indexer(monkeypatch, calls)
@@ -935,7 +914,7 @@ def test_b12x_profile_work_skips_piecewise_capture(monkeypatch):
     assert result is topk_indices_buffer
 
 
-def test_b12x_profile_uses_max_model_len_for_paged_prefill_warm(monkeypatch):
+def test_b12x_dcp_profile_uses_planner_page_table_width(monkeypatch):
     calls: list[tuple] = []
     _install_fake_b12x_indexer(monkeypatch, calls)
     workspace_manager = _FakeWorkspaceManager()
@@ -959,17 +938,20 @@ def test_b12x_profile_uses_max_model_len_for_paged_prefill_warm(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
+    monkeypatch.setattr(indexer_mod, "_get_dcp_warmup_params", lambda: (2, 0, 1))
+    monkeypatch.setattr(indexer_mod, "_prewarm_b12x_dcp_topk_merge", lambda **_: None)
 
     q_rows = 8192
     profile_q_rows = 4096
     topk = 4
-    total_seq_lens = 1024
     max_model_len = 32768
+    # This is an aggregate prefill-buffer capacity, not a per-request K width.
+    total_seq_lens = 40 * max_model_len
     page_table_width = max_model_len // 64
     hidden_states = torch.empty((q_rows, 128), dtype=torch.bfloat16)
     kv_cache = torch.empty((1, 64, 132), dtype=torch.uint8)
     q_quant = torch.empty((q_rows, 1, 128), dtype=torch.uint8)
-    k = torch.empty((total_seq_lens, 128), dtype=torch.uint8)
+    k = torch.empty((q_rows, 128), dtype=torch.uint8)
     weights = torch.empty((q_rows, 1), dtype=torch.float32)
     topk_indices_buffer = torch.empty((q_rows, topk), dtype=torch.int32)
 
@@ -1048,87 +1030,6 @@ def test_b12x_profile_uses_max_model_len_for_paged_prefill_warm(monkeypatch):
             False,
         ),
     ]
-
-
-def test_b12x_profile_prewarms_dcp_local_paged_prefill_width(monkeypatch):
-    calls: list[tuple] = []
-    _install_fake_b12x_indexer(monkeypatch, calls)
-    workspace_manager = _FakeWorkspaceManager()
-    monkeypatch.setattr(
-        indexer_mod, "current_workspace_manager", lambda: workspace_manager
-    )
-    monkeypatch.setattr(
-        indexer_mod,
-        "get_forward_context",
-        _profile_forward_context,
-    )
-    monkeypatch.setattr(
-        indexer_mod,
-        "_ensure_b12x_sparse_indexer_supported",
-        lambda: None,
-    )
-    monkeypatch.setattr(
-        indexer_mod.current_platform,
-        "fp8_dtype",
-        lambda: torch.uint8,
-        raising=False,
-    )
-    monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
-    monkeypatch.setattr(indexer_mod, "_get_dcp_warmup_params", lambda: (4, 0, 1))
-
-    q_rows = 8192
-    profile_q_rows = 4096
-    topk = 4
-    total_seq_lens = 1024
-    max_model_len = 32768
-    global_page_table_width = max_model_len // 64
-    local_page_table_width = max_model_len // 4 // 64
-    hidden_states = torch.empty((q_rows, 128), dtype=torch.bfloat16)
-    kv_cache = torch.empty((1, 64, 132), dtype=torch.uint8)
-    q_quant = torch.empty((q_rows, 1, 128), dtype=torch.uint8)
-    k = torch.empty((total_seq_lens, 128), dtype=torch.uint8)
-    weights = torch.empty((q_rows, 1), dtype=torch.float32)
-    topk_indices_buffer = torch.empty((q_rows, topk), dtype=torch.int32)
-
-    result = indexer_mod.sparse_attn_indexer(
-        hidden_states,
-        "layers.0.attn",
-        kv_cache,
-        q_quant,
-        None,
-        k,
-        weights,
-        128,
-        None,
-        topk_tokens=topk,
-        head_dim=128,
-        max_model_len=max_model_len,
-        total_seq_lens=total_seq_lens,
-        topk_indices_buffer=topk_indices_buffer,
-        skip_k_cache_insert=False,
-        use_fp4_cache=False,
-        use_b12x_sparse_indexer=True,
-    )
-
-    assert result is topk_indices_buffer
-    assert (
-        "paged_bind",
-        (profile_q_rows, global_page_table_width),
-        (profile_q_rows,),
-        1,
-        True,
-        False,
-        False,
-    ) in calls
-    assert (
-        "paged_bind",
-        (profile_q_rows, local_page_table_width),
-        (profile_q_rows,),
-        1,
-        True,
-        False,
-        False,
-    ) in calls
 
 
 def test_b12x_paged_profile_rows_follow_logits_budget(monkeypatch):
