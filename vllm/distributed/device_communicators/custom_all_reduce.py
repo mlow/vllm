@@ -513,7 +513,16 @@ class CustomAllreduce:
             # One quick sweep from 1 row to the prefill chunk size using the
             # real kernels (fused AR+RMSNorm, the DMA allreduce, and NCCL +
             # RMSNorm as the fallback); both crossovers come from the table.
+            # Surface the sweep's per-point progress in vLLM's logs.
+            import logging as _logging
+
             from b12x.distributed import autotune_crossovers
+
+            b12x_logger = _logging.getLogger("b12x.distributed.pcie_dma")
+            b12x_logger.setLevel(_logging.INFO)
+            if not b12x_logger.handlers:
+                for handler in _logging.getLogger("vllm").handlers:
+                    b12x_logger.addHandler(handler)
 
             channel = self._pcie_runtime.for_stream()
             oneshot_max, dma_min = autotune_crossovers(
