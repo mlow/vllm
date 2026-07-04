@@ -683,9 +683,13 @@ class Indexer(nn.Module):
             else getattr(attention_backend, "name", None)
         )
         # The GLM b12x MLA backend and its non-compressed paged indexer share a
-        # native flat-physical-slot contract. Keep this explicit: DSV4's
-        # compressed indexer uses the same low-level op but a different contract.
-        self.output_physical_slots = attention_backend_name == "B12X_MLA_SPARSE"
+        # native flat-physical-slot contract when the KV cache is not sharded.
+        # Under DCP, keep logical token ids until the attention backend can map
+        # the globally selected top-k to each rank's local physical cache slots.
+        self.output_physical_slots = (
+            attention_backend_name == "B12X_MLA_SPARSE"
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
 
         # NOTE: (zyongye) we use fp8 naive cache,
         #       where we store value in fp8 and scale in fp32
