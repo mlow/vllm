@@ -716,6 +716,7 @@ class Indexer(nn.Module):
             self.topk_indices_buffer,
             topk_scores_buffer=self.topk_scores_buffer,
             output_physical_slots=self.output_physical_slots,
+            num_q_heads=self.n_head,
         )
 
         self.is_inplace_rope = is_inplace_rope

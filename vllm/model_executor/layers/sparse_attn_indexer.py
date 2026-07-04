@@ -433,7 +433,7 @@ def _get_dcp_warmup_params() -> tuple[int, int, int]:
 def _sync_dcp_warmup() -> None:
     """Finish one-time DCP warmup on every rank before graph warmup proceeds."""
     if current_platform.is_cuda():
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
     try:
         from vllm.distributed.parallel_state import get_dcp_group
@@ -446,7 +446,7 @@ def _sync_dcp_warmup() -> None:
         return
     finally:
         if current_platform.is_cuda():
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
 
 
 def _prewarm_b12x_dcp_topk_merge(
@@ -1983,6 +1983,7 @@ class SparseAttnIndexer(CustomOp):
         use_fp4_cache: bool = False,
         topk_scores_buffer: torch.Tensor | None = None,
         output_physical_slots: bool = False,
+        num_q_heads: int | None = None,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -1995,6 +1996,7 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.topk_scores_buffer = topk_scores_buffer
         self.output_physical_slots = bool(output_physical_slots)
+        self.num_q_heads = num_q_heads
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
         self.use_b12x_sparse_indexer = use_b12x_sparse_indexer()

@@ -6,6 +6,7 @@ This is useful specifically for JIT'ed kernels as we don't want JIT'ing to
 happen during model execution.
 """
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 import torch
@@ -15,6 +16,9 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.mxfp8.b12x import warmup_b12x_mxfp8_linear
 from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
+from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
+    warmup_b12x_sparse_indexer,
+)
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
@@ -76,6 +80,7 @@ def _contains_flashinfer_object(
 
     if isinstance(obj, nn.Module):
         return False
+    values: Iterable[object]
     if isinstance(obj, dict):
         values = obj.values()
     elif isinstance(obj, (list, tuple, set, frozenset)):
@@ -173,6 +178,10 @@ def kernel_warmup(worker: "Worker"):
     )
     if warmed_mxfp8:
         logger.info("Warmed up %d B12X MXFP8 linear GEMM signatures.", warmed_mxfp8)
+
+    warmed_indexer = warmup_b12x_sparse_indexer(worker)
+    if warmed_indexer:
+        logger.info("Warmed up %d B12X sparse-indexer decode variants.", warmed_indexer)
 
     moe_token_counts = [
         worker.scheduler_config.max_num_batched_tokens,

@@ -147,10 +147,15 @@ def test_kernel_warmup_runs_b12x_mxfp8_linear_warmup(monkeypatch) -> None:
     )
     monkeypatch.setattr(kernel_warmup, "minimax_m3_msa_warmup", lambda *a, **k: None)
     monkeypatch.setattr(kernel_warmup, "warmup_b12x_moe_dynamic", lambda *a, **k: 0)
+
+    def fake_mxfp8_warmup(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 3
+
     monkeypatch.setattr(
         kernel_warmup,
         "warmup_b12x_mxfp8_linear",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or 3,
+        fake_mxfp8_warmup,
     )
 
     kernel_warmup.kernel_warmup(worker)
@@ -188,10 +193,15 @@ def test_kernel_warmup_runs_b12x_moe_warmup(monkeypatch) -> None:
     )
     monkeypatch.setattr(kernel_warmup, "minimax_m3_msa_warmup", lambda *a, **k: None)
     monkeypatch.setattr(kernel_warmup, "warmup_b12x_mxfp8_linear", lambda *a, **k: 0)
+
+    def fake_moe_warmup(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 4
+
     monkeypatch.setattr(
         kernel_warmup,
         "warmup_b12x_moe_dynamic",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or 4,
+        fake_moe_warmup,
     )
 
     kernel_warmup.kernel_warmup(worker)
@@ -205,6 +215,42 @@ def test_kernel_warmup_runs_b12x_moe_warmup(monkeypatch) -> None:
             },
         )
     ]
+
+
+def test_kernel_warmup_runs_b12x_sparse_indexer_warmup(monkeypatch) -> None:
+    calls = []
+    model = torch.nn.Linear(2, 2)
+    worker = _flashinfer_autotune_worker(model)
+    worker.vllm_config.kernel_config.enable_flashinfer_autotune = False
+
+    monkeypatch.setattr(kernel_warmup, "deepseek_v4_mhc_warmup", lambda *a, **k: None)
+    monkeypatch.setattr(
+        kernel_warmup,
+        "flashinfer_sparse_mla_decode_autotune_warmup",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        kernel_warmup,
+        "deepseek_v4_sparse_mla_attention_warmup",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(kernel_warmup, "minimax_m3_msa_warmup", lambda *a, **k: None)
+    monkeypatch.setattr(kernel_warmup, "warmup_b12x_mxfp8_linear", lambda *a, **k: 0)
+    monkeypatch.setattr(kernel_warmup, "warmup_b12x_moe_dynamic", lambda *a, **k: 0)
+
+    def fake_sparse_indexer_warmup(arg):
+        calls.append(arg)
+        return 16
+
+    monkeypatch.setattr(
+        kernel_warmup,
+        "warmup_b12x_sparse_indexer",
+        fake_sparse_indexer_warmup,
+    )
+
+    kernel_warmup.kernel_warmup(worker)
+
+    assert calls == [worker]
 
 
 def test_kernel_warmup_skips_flashinfer_autotune_without_flashinfer_kernels(
