@@ -42,10 +42,7 @@ def _get_pcie_allreduce_backend() -> str:
 
 
 def _b12x_pcie_allreduce_requested() -> bool:
-    return (
-        envs.VLLM_ENABLE_PCIE_ALLREDUCE
-        and _get_pcie_allreduce_backend() == "b12x"
-    )
+    return envs.VLLM_ENABLE_PCIE_ALLREDUCE and _get_pcie_allreduce_backend() == "b12x"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -117,9 +114,12 @@ def _get_physical_device_numa_node(physical_device_id: int) -> int | None:
 
 def _numa_node_has_cpus(node_id: int) -> bool:
     try:
-        return Path(f"/sys/devices/system/node/node{node_id}/cpulist").read_text(
-            encoding="utf-8"
-        ).strip() != ""
+        return (
+            Path(f"/sys/devices/system/node/node{node_id}/cpulist")
+            .read_text(encoding="utf-8")
+            .strip()
+            != ""
+        )
     except (OSError, ValueError):
         return False
 
@@ -231,6 +231,8 @@ class CustomAllreduce:
         self.disabled = True
         self._pcie_runtime = None
         self._pcie_capture_stream: torch.cuda.Stream | None = None
+        self._pcie_allreduce_max_size: int | None = None
+        self._pcie_fused_add_rms_norm_max_size: int | None = None
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
         self._pcie_cpp_backend = False
@@ -370,9 +372,9 @@ class CustomAllreduce:
             return
 
         if use_pcie_oneshot:
-            allow_cross_numa = os.getenv(
-                "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1"
-            ) != "0"
+            allow_cross_numa = (
+                os.getenv("VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1") != "0"
+            )
             if _is_cross_numa_topology(physical_device_ids) and not allow_cross_numa:
                 logger.warning(
                     "Custom allreduce is disabled because b12x PCIe oneshot "
@@ -389,11 +391,24 @@ class CustomAllreduce:
                     "b12x.distributed.PCIeOneshotAllReducePool is unavailable."
                 )
                 return
-            pcie_max_size = min(
+            pcie_allreduce_max_size = min(
                 max_size,
                 _parse_byte_size(
                     os.getenv("VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB")
                 ),
+            )
+            pcie_fused_add_rms_norm_max_size = min(
+                max_size,
+                _parse_byte_size(
+                    os.getenv(
+                        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE",
+                        "72KB",
+                    )
+                ),
+            )
+            pcie_buffer_size = max(
+                pcie_allreduce_max_size,
+                pcie_fused_add_rms_norm_max_size,
             )
             pcie_single_channel = _env_flag(
                 "VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", default=True
@@ -404,7 +419,9 @@ class CustomAllreduce:
                     "allreduce requires a CUDA/NCCL device process group."
                 )
                 return
-            self.max_size = pcie_max_size
+            self.max_size = pcie_buffer_size
+            self._pcie_allreduce_max_size = pcie_allreduce_max_size
+            self._pcie_fused_add_rms_norm_max_size = pcie_fused_add_rms_norm_max_size
             self.rank = rank
             self.world_size = world_size
             self.fully_connected = False
@@ -414,8 +431,8 @@ class CustomAllreduce:
                 pcie_runtime = pool_cls.from_exchange_group(
                     exchange_group=self.nccl_group,
                     device=self.device,
-                    eager_buffer_bytes=pcie_max_size,
-                    max_size=pcie_max_size,
+                    eager_buffer_bytes=pcie_buffer_size,
+                    max_size=pcie_buffer_size,
                     single_channel=pcie_single_channel,
                 )
                 pcie_runtime.for_stream()
@@ -465,20 +482,31 @@ class CustomAllreduce:
                 tuned_size = default_channel.find_crossover_size(
                     autotune_group, **autotune_kwargs
                 )
-                self._pcie_runtime.max_size = default_channel.max_size
-                self.max_size = default_channel.max_size
+                self._pcie_allreduce_max_size = min(
+                    tuned_size,
+                    pcie_allreduce_max_size,
+                )
+                # The plain and fused paths have separate crossovers but share
+                # staging buffers. Restore the allocation limit after the
+                # plain-allreduce tuner temporarily changes the channel limit.
+                default_channel.max_size = pcie_buffer_size
+                self._pcie_runtime.max_size = pcie_buffer_size
                 logger.info(
                     "Autotuned b12x PCIe oneshot allreduce max_size=%d "
                     "(requested=%d, crossover=%d).",
-                    self.max_size,
-                    pcie_max_size,
+                    self._pcie_allreduce_max_size,
+                    pcie_allreduce_max_size,
                     tuned_size,
                 )
             self.disabled = False
             logger.info(
                 "Using b12x PCIe oneshot allreduce backend "
-                "(world_size=%d, max_size=%d, single_channel=%s).",
+                "(world_size=%d, allreduce_max_size=%d, "
+                "fused_add_rms_norm_max_size=%d, buffer_size=%d, "
+                "single_channel=%s).",
                 world_size,
+                self._pcie_allreduce_max_size,
+                self._pcie_fused_add_rms_norm_max_size,
                 self.max_size,
                 pcie_single_channel,
             )
@@ -519,10 +547,13 @@ class CustomAllreduce:
         )
         if cpp_ar_cutoff:
             self._cpp_ar_cutoff_size = _parse_byte_size(cpp_ar_cutoff)
-        cpp_ar_ignore_rows = os.getenv(
-            "VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS",
-            "1" if self._pcie_cpp_backend else "0",
-        ) or "0"
+        cpp_ar_ignore_rows = (
+            os.getenv(
+                "VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS",
+                "1" if self._pcie_cpp_backend else "0",
+            )
+            or "0"
+        )
         self._cpp_ar_ignore_cutoff_max_rows = int(cpp_ar_ignore_rows)
         if (
             self._cpp_ar_cutoff_size is not None
@@ -608,9 +639,14 @@ class CustomAllreduce:
         if self.disabled:
             return False
         if self._pcie_runtime is not None:
-            use_custom = self._pcie_runtime.for_stream(
-                self._pcie_runtime_stream()
-            ).should_allreduce(inp)
+            inp_size = inp.numel() * inp.element_size()
+            use_custom = (
+                self._pcie_allreduce_max_size is not None
+                and inp_size <= self._pcie_allreduce_max_size
+                and self._pcie_runtime.for_stream(
+                    self._pcie_runtime_stream()
+                ).should_allreduce(inp)
+            )
             if use_custom and not self._pcie_logged_first_accept:
                 self._pcie_logged_first_accept = True
                 logger.info(
@@ -696,6 +732,66 @@ class CustomAllreduce:
             )
         return out
 
+    def supports_fused_add_rms_norm(self) -> bool:
+        """Return whether the B12X runtime provides fused AR + RMSNorm."""
+        return (
+            not self.disabled
+            and self._pcie_runtime is not None
+            and self._pcie_fused_add_rms_norm_max_size is not None
+            and self._pcie_fused_add_rms_norm_max_size > 0
+            and hasattr(
+                self._pcie_runtime,
+                "all_reduce_fused_add_rms_norm",
+            )
+        )
+
+    def try_fused_add_rms_norm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        epsilon: float,
+    ) -> bool:
+        """Run the B12X fused collective when all operands are supported."""
+        inp_size = inp.numel() * inp.element_size()
+        if (
+            not self.supports_fused_add_rms_norm()
+            or self._pcie_fused_add_rms_norm_max_size is None
+            or inp_size > self._pcie_fused_add_rms_norm_max_size
+        ):
+            return False
+        assert self._pcie_runtime is not None
+        if not self._pcie_runtime.for_stream(
+            self._pcie_runtime_stream()
+        ).should_allreduce(inp):
+            return False
+        if (
+            inp.ndim == 0
+            or residual.shape != inp.shape
+            or residual.dtype != inp.dtype
+            or residual.device != inp.device
+            or not is_weak_contiguous(residual)
+            or weight.shape != (inp.shape[-1],)
+            or weight.dtype != inp.dtype
+            or weight.device != inp.device
+            or not weight.is_contiguous()
+            or inp.shape[-1] * inp.element_size() % 16 != 0
+            or inp.data_ptr() == residual.data_ptr()
+            or epsilon < 0
+        ):
+            return False
+
+        self._pcie_runtime.all_reduce_fused_add_rms_norm(
+            inp,
+            residual,
+            weight,
+            epsilon,
+            out=inp,
+            residual_out=residual,
+            stream=self._pcie_runtime_stream(),
+        )
+        return True
+
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -764,3 +860,22 @@ class CustomAllreduce:
             rank = dist.get_rank(group=group)
         if ops is not None:
             ops.free_shared_buffer(pointers[rank])
+
+
+def get_b12x_pcie_allreduce() -> CustomAllreduce | None:
+    """Return the active TP B12X PCIe all-reduce runtime, if available."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        device_communicator = get_tp_group().device_communicator
+    except (AssertionError, RuntimeError):
+        return None
+    if device_communicator is None:
+        return None
+    custom_allreduce = getattr(device_communicator, "ca_comm", None)
+    if (
+        isinstance(custom_allreduce, CustomAllreduce)
+        and custom_allreduce.supports_fused_add_rms_norm()
+    ):
+        return custom_allreduce
+    return None

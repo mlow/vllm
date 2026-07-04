@@ -201,6 +201,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "64KB"
+    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "72KB"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -1611,6 +1612,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "64KB"
+    ),
+    "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "72KB"
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
