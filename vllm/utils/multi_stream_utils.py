@@ -65,6 +65,8 @@ def execute_in_parallel(
     done_events: list[torch.cuda.Event],
     aux_streams: list[torch.cuda.Stream] | None = None,
     enable: bool = False,
+    *,
+    enqueue_default_first: bool = False,
 ) -> tuple[Any, list[Any]]:
     """Run default_fn on the current stream and aux_fns concurrently on
     aux_streams.
@@ -92,6 +94,13 @@ def execute_in_parallel(
             so callers that pass aux_streams must also pass enable=True
             (typically gated by an env var) to actually overlap. When False,
             execution falls back to sequential on the current stream.
+        enqueue_default_first: Enqueue ``default_fn`` before walking the
+            auxiliary callables. The CUDA dependency graph is unchanged: all
+            branches still wait on ``start_event`` and the default stream joins
+            every launched auxiliary branch before returning. This option is
+            useful when an auxiliary callable performs many host-side launches;
+            it prevents that launch loop from withholding independent default-
+            stream work from the GPU.
 
     Returns:
         Tuple of (default_result, aux_results) where aux_results[i] is the
@@ -111,6 +120,7 @@ def execute_in_parallel(
     pending: list[torch.cuda.Event] = []
 
     start_event.record()
+    default_result = default_fn() if enqueue_default_first else None
     for i, fn in enumerate(aux_fns):
         if fn is None:
             continue
@@ -120,7 +130,8 @@ def execute_in_parallel(
             done_events[i].record()
         pending.append(done_events[i])
 
-    default_result = default_fn()
+    if not enqueue_default_first:
+        default_result = default_fn()
 
     for ev in pending:
         ev.wait()

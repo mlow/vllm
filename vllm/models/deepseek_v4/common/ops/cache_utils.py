@@ -23,6 +23,8 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
 
+HAS_CUTEDSL = has_cutedsl()
+
 
 @triton.jit
 def quantize_and_insert_k_kernel(
@@ -400,7 +402,7 @@ def dequantize_and_gather_k_cache(
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
     """
-    if has_cutedsl():
+    if HAS_CUTEDSL and not torch.compiler.is_compiling():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
             dequantize_and_gather_k_cache_cutedsl,
@@ -457,6 +459,40 @@ def compute_global_topk_indices_and_lens(
     return global_topk_indices, topk_lens
 
 
+def compute_dcp_global_topk_indices_and_lens(
+    topk_indices: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    is_valid_token: torch.Tensor,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map local topk indices to this DCP rank's dense global KV slot prefix."""
+    num_tokens = topk_indices.shape[0]
+    global_topk_indices = torch.empty_like(topk_indices)
+    topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+    _compute_dcp_global_topk_indices_and_lens_kernel[(num_tokens,)](
+        global_topk_indices,
+        global_topk_indices.stride(0),
+        topk_lens,
+        topk_indices,
+        topk_indices.stride(0),
+        topk_indices.shape[-1],
+        token_to_req_indices,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        is_valid_token,
+        DCP_WORLD_SIZE=dcp_world_size,
+        DCP_RANK=dcp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
+        TRITON_BLOCK_SIZE=1024,
+    )
+    return global_topk_indices, topk_lens
+
+
 @triton.jit
 def _compute_global_topk_indices_and_lens_kernel(
     global_topk_indices_ptr,
@@ -506,6 +542,69 @@ def _compute_global_topk_indices_and_lens_kernel(
 
     # Zero out length for padding tokens.
     tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
+
+
+@triton.jit
+def _compute_dcp_global_topk_indices_and_lens_kernel(
+    global_topk_indices_ptr,
+    global_topk_indices_stride,
+    topk_lens_ptr,
+    topk_indices_ptr,
+    topk_indices_stride,
+    topk,
+    token_to_req_indices_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    is_valid_token_ptr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    is_valid_token = tl.load(is_valid_token_ptr + token_idx)
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    count = tl.zeros((), dtype=tl.int32)
+    virtual_block_size = block_size * DCP_WORLD_SIZE
+    for i in range(0, topk, TRITON_BLOCK_SIZE):
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+        offset_mask = offset < topk
+
+        local_idx = tl.load(
+            topk_indices_ptr + token_idx * topk_indices_stride + offset,
+            mask=offset_mask,
+            other=-1,
+        )
+        valid_local = local_idx >= 0
+
+        block_indices = local_idx // virtual_block_size
+        block_numbers = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_indices,
+            mask=offset_mask & valid_local,
+        ).to(tl.int64)
+
+        virtual_block_offsets = local_idx - block_indices * virtual_block_size
+        is_local = (
+            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
+        ) % DCP_WORLD_SIZE == DCP_RANK
+        local_block_offsets = (
+            virtual_block_offsets
+            // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
+            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
+        )
+
+        slot_ids = block_numbers * block_size + local_block_offsets
+        valid = offset_mask & valid_local & is_local & is_valid_token
+        compact_pos = count + tl.cumsum(valid.to(tl.int32), 0) - 1
+        row_base = global_topk_indices_ptr + token_idx * global_topk_indices_stride
+        tl.store(row_base + offset, -1, mask=offset_mask)
+        tl.store(row_base + compact_pos, slot_ids, mask=valid)
+        count += tl.sum(valid.to(tl.int32), axis=0)
+
+    tl.store(topk_lens_ptr + token_idx, count)
 
 
 # FlashMLA sparse prefill asserts `params.topk % B_TOPK == 0` (see

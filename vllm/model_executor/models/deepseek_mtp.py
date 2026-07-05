@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import os
 import typing
 from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn as nn
+from safetensors import safe_open
 from transformers import PretrainedConfig
 
 from vllm._aiter_ops import rocm_aiter_ops
@@ -21,6 +24,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     scaled_dequantize,
 )
+from vllm.model_executor.layers.sparse_attn_indexer import use_b12x_sparse_indexer
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -39,9 +43,134 @@ from .deepseek_v2 import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
-from .utils import get_pp_missing_layer_names, maybe_prefix
+from .utils import get_draft_quant_config, get_pp_missing_layer_names, maybe_prefix
 
 logger = init_logger(__name__)
+
+
+def _resolve_cached_hf_model_path(model_path: str | None) -> str | None:
+    if not model_path or os.path.isdir(model_path):
+        return model_path
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        cached_index = try_to_load_from_cache(
+            model_path, "model.safetensors.index.json"
+        )
+        if isinstance(cached_index, str):
+            return os.path.dirname(cached_index)
+    except Exception:
+        return None
+    return None
+
+
+def _get_local_model_path(
+    config: PretrainedConfig, vllm_config: VllmConfig
+) -> str | None:
+    for attr in ("_name_or_path", "name_or_path"):
+        model_path = getattr(config, attr, None)
+        resolved_model_path = _resolve_cached_hf_model_path(model_path)
+        if resolved_model_path:
+            return resolved_model_path
+
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    model_config = getattr(vllm_config, "model_config", None)
+    for model_path in (
+        getattr(draft_model_config, "model", None),
+        getattr(draft_model_config, "model_path", None),
+        getattr(model_config, "model", None),
+        getattr(model_config, "model_path", None),
+    ):
+        resolved_model_path = _resolve_cached_hf_model_path(model_path)
+        if resolved_model_path:
+            return resolved_model_path
+    return None
+
+
+def _has_serialized_modelopt_fp4_nextn_experts(
+    config: PretrainedConfig, vllm_config: VllmConfig
+) -> bool:
+    model_path = _get_local_model_path(config, vllm_config)
+    if model_path is None:
+        return False
+
+    nextn_layer_id = getattr(config, "num_hidden_layers", None)
+    if nextn_layer_id is None:
+        return False
+
+    probe_prefix = f"model.layers.{nextn_layer_id}.mlp.experts.0.down_proj"
+    probe_weight = f"{probe_prefix}.weight"
+    required_keys = {
+        probe_weight,
+        f"{probe_prefix}.weight_scale",
+        f"{probe_prefix}.weight_scale_2",
+        f"{probe_prefix}.input_scale",
+    }
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    single_shard_path = os.path.join(model_path, "model.safetensors")
+
+    try:
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            if not required_keys.issubset(weight_map):
+                return False
+            shard_path = os.path.join(model_path, weight_map[probe_weight])
+        elif os.path.exists(single_shard_path):
+            shard_path = single_shard_path
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                if not required_keys.issubset(set(f.keys())):
+                    return False
+        else:
+            return False
+
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
+            return f.get_slice(probe_weight).get_dtype() == "U8"
+    except Exception as err:
+        logger.warning(
+            "Failed to inspect serialized NextN expert quantization metadata: %s",
+            err,
+        )
+        return False
+
+
+def _maybe_disable_unserialized_modelopt_fp4_nextn(
+    config: PretrainedConfig,
+    vllm_config: VllmConfig,
+    quant_config: QuantizationConfig | None,
+) -> QuantizationConfig | None:
+    if quant_config is None or quant_config.get_name() != "modelopt_fp4":
+        return quant_config
+
+    if not _has_serialized_modelopt_fp4_nextn_experts(config, vllm_config):
+        logger.warning_once(
+            "Disabling DeepSeek/GLM NextN modelopt_fp4 quant config because "
+            "serialized NextN FP4 expert weights were not found."
+        )
+        return None
+
+    # SpeculativeConfig.hf_config_override defensively adds whole-MTP-layer
+    # ignore entries for GLM checkpoints whose config does not explicitly target
+    # the MTP prefix. That is correct for BF16 MTP checkpoints, but serialized
+    # NVFP4 NextN experts must stay quantized. Remove only those synthetic
+    # whole-layer entries and keep the checkpoint's finer-grained ignores such
+    # as self_attn/indexer/shared_experts.
+    unquantized_prefixes = getattr(
+        config, "vllm_unquantized_mtp_layer_prefixes", None
+    )
+    exclude_modules = getattr(quant_config, "exclude_modules", None)
+    if isinstance(unquantized_prefixes, list) and isinstance(exclude_modules, list):
+        synthetic_ignores = {
+            pattern
+            for prefix in unquantized_prefixes
+            for pattern in (prefix, f"{prefix}.*")
+        }
+        quant_config.exclude_modules = [
+            pattern for pattern in exclude_modules if pattern not in synthetic_ignores
+        ]
+        config.vllm_unquantized_mtp_layer_prefixes = []
+    return quant_config
 
 
 def _maybe_remap_fp8_scale_inv_name(
@@ -197,7 +326,9 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
-        quant_config = vllm_config.quant_config
+        quant_config = _maybe_disable_unserialized_modelopt_fp4_nextn(
+            config, vllm_config, get_draft_quant_config(vllm_config)
+        )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -205,7 +336,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
         self.device = current_platform.device_type
 
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = getattr(config, "index_topk", 0) > 0
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -214,8 +345,20 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
                 dtype=torch.int32,
                 device=self.device,
             )
+            topk_scores_buffer = None
+            if (
+                vllm_config.parallel_config.decode_context_parallel_size > 1
+                and use_b12x_sparse_indexer()
+            ):
+                topk_scores_buffer = torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    topk_tokens,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
         else:
             topk_indices_buffer = None
+            topk_scores_buffer = None
 
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=quant_config
@@ -225,6 +368,10 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             prefix,
             config=self.config,
             topk_indices_buffer=topk_indices_buffer,
+            topk_scores_buffer=topk_scores_buffer,
+            quant_config=quant_config,
+            layer_idx_override=0,
+            is_nextn=True,
         )
 
     def forward(
@@ -349,14 +496,38 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         )
         return logits
 
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Vocab-parallel argmax without all-gathering full logits.
+
+        Avoids the per-draft NCCL AllGather inside `compute_logits` by
+        running the local lm_head + argmax + tiny (max_value, max_index)
+        AllReduce. Selects the right MTP layer's shared head based on
+        `spec_step_idx`, mirroring `compute_logits`. Returns full-vocab
+        token ids (the MTP head spans the full target vocab, no remap
+        needed).
+        """
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        return self.logits_processor.get_top_tokens(
+            mtp_layer.shared_head.head,
+            mtp_layer.shared_head(hidden_states),
+        )
+
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        self.quant_config = vllm_config.quant_config
+        self.quant_config = _maybe_disable_unserialized_modelopt_fp4_nextn(
+            self.config, vllm_config, get_draft_quant_config(vllm_config)
+        )
         self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
+        self._exclude_unquantized_mtp_layers_from_quant_config()
         self.model = DeepSeekMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -371,6 +542,27 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
             )
         )
+
+    def _exclude_unquantized_mtp_layers_from_quant_config(self) -> None:
+        unquantized_prefixes = getattr(
+            self.config, "vllm_unquantized_mtp_layer_prefixes", None
+        )
+        exclude_modules = getattr(self.quant_config, "exclude_modules", None)
+        if not unquantized_prefixes or not isinstance(exclude_modules, list):
+            return
+
+        added_patterns = []
+        for prefix in unquantized_prefixes:
+            for pattern in (prefix, f"{prefix}.*"):
+                if pattern not in exclude_modules:
+                    exclude_modules.append(pattern)
+                    added_patterns.append(pattern)
+
+        if added_patterns:
+            logger.info(
+                "Excluding MTP layers from checkpoint quantization: %s",
+                added_patterns,
+            )
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers
@@ -416,6 +608,19 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
+
+    def get_top_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Delegate to the inner predictor's vocab-parallel argmax.
+
+        Used by the spec-decode proposer's `_greedy_sample` when
+        `use_local_argmax_reduction=True`, replacing the full-vocab
+        AllGather with an O(2 * tp_size) reduction.
+        """
+        return self.model.get_top_tokens(hidden_states, spec_step_idx)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         rocm_aiter_moe_shared_expert_enabled = (

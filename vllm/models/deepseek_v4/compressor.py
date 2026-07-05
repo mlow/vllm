@@ -85,6 +85,7 @@ class CompressorMetadata:
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    supports_exact_metadata_reuse: bool = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -97,6 +98,11 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self.req_ids_arange = torch.arange(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            dtype=torch.int32,
+            device=self.device,
+        )
 
     def build(
         self,
@@ -104,9 +110,22 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> CompressorMetadata:
-        token_to_req_indices = common_attn_metadata.token_to_req_indices(
-            self.token_to_req_indices
-        )
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        if common_attn_metadata.max_query_len <= 1 and num_tokens == num_reqs:
+            token_to_req_indices = self.req_ids_arange[:num_tokens]
+        elif common_attn_metadata.batch_topology is not None:
+            x = torch.from_numpy(
+                common_attn_metadata.batch_topology.req_id_per_token_np
+            ).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
+        else:
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            x = torch.repeat_interleave(torch.arange(num_reqs), query_lens).pin_memory()
+            token_to_req_indices = self.token_to_req_indices[: x.shape[0]]
+            token_to_req_indices.copy_(x, non_blocking=True)
         return CompressorMetadata(
             block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
             slot_mapping=common_attn_metadata.slot_mapping,
@@ -163,6 +182,7 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             dtype=self.dtype,
             sliding_window=self.sliding_window,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
+            dcp_sharded=True,
         )
 
     def forward(self): ...
@@ -194,6 +214,7 @@ class DeepseekCompressor(nn.Module):
         use_fp4_cache: bool = False,
     ):
         super().__init__()
+        self.vllm_config = vllm_config
         self.compress_ratio = compress_ratio
         self.hidden_size = hidden_size
         self.head_dim = head_dim
@@ -295,6 +316,13 @@ class DeepseekCompressor(nn.Module):
         num_actual = slot_mapping.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
+        parallel_config = self.vllm_config.parallel_config
+        dcp_world_size = parallel_config.decode_context_parallel_size
+        dcp_rank = 0
+        if dcp_world_size > 1:
+            from vllm.distributed.parallel_state import get_dcp_group
+
+            dcp_rank = get_dcp_group().rank_in_group
 
         # [num_blocks, block_size, kv_dim+score_dim], where kv_dim == score_dim
         state_cache = self.state_cache.kv_cache
@@ -347,28 +375,47 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
-        # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
-        # does not, so the two callables have different signatures.
+        # cutedsl (head=512) accepts the full-cache flags; triton accepts the
+        # DCP mapping kwargs and stores the legacy UE8M0 paged layout.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
-            from .nvidia.ops.sparse_attn_compress_cutedsl import (
-                compress_norm_rope_store_cutedsl,
-            )
+        extra_kwargs: dict[str, Any] = {}
+        if current_platform.is_cuda() and not torch.compiler.is_compiling():
+            # NVIDIA GPUs.
+            use_triton_compressor = self.head_dim != 512 or dcp_world_size > 1
+            if not use_triton_compressor:
+                from .nvidia.ops.sparse_attn_compress_cutedsl import (
+                    compress_norm_rope_store_cutedsl,
+                )
 
-            # head=512 on CUDA always uses cutedsl, for both the fp8_ds_mla
-            # layout and the plain full-cache layout. The full-cache flags
-            # are consumed only here.
-            compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
-            extra_kwargs: dict[str, Any] = dict(
-                store_full_kv=store_full_kv,
-                store_full_fp8=store_full_fp8,
-                fp8_scale=fp8_scale,
-            )
+                # head=512 on CUDA uses cutedsl unless DCP needs Triton's
+                # mapped state lookup. The full-cache flags are consumed only
+                # by this path.
+                compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
+                extra_kwargs = dict(
+                    store_full_kv=store_full_kv,
+                    store_full_fp8=store_full_fp8,
+                    fp8_scale=fp8_scale,
+                )
+            else:
+                # Indexer path (head_dim == 128), and the DCP main-compressor
+                # path where the CuTe kernel's raw state lookup is not valid.
+                compress_norm_rope_store_fn = compress_norm_rope_store_triton
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.):
+            # use Triton and the legacy UE8M0 paged layout.
+            use_triton_compressor = True
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            extra_kwargs = {}
 
+        if use_triton_compressor:
+            extra_kwargs.update(
+                {
+                    "dcp_world_size": dcp_world_size,
+                    "dcp_rank": dcp_rank,
+                    "cp_kv_cache_interleave_size": (
+                        parallel_config.cp_kv_cache_interleave_size
+                    ),
+                }
+            )
         compress_norm_rope_store_fn(
             state_cache=state_cache,
             num_actual=num_actual,

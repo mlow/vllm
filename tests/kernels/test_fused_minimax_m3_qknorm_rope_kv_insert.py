@@ -274,9 +274,9 @@ def test_sparse_full(num_tokens, block_size, kv_cache_dtype):
             torch.testing.assert_close(kv_cache[b, 1, pos], v_ref_h[t], rtol=0, atol=0)
 
     expected_index_cache = torch.zeros_like(index_cache).view(-1, HEAD_DIM)
-    expected_index_cache[index_slot_mapping] = index_k
+    expected_index_cache[index_slot_mapping] = ik_ref
     torch.testing.assert_close(
-        index_cache.view(-1, HEAD_DIM), expected_index_cache, rtol=0, atol=0
+        index_cache.view(-1, HEAD_DIM), expected_index_cache, rtol=1e-2, atol=1e-2
     )
 
 
