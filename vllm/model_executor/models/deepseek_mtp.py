@@ -225,11 +225,21 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = vllm_config.quant_config
+        self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self.model = DeepSeekMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         # Set MoE hyperparameters
         self.set_moe_parameters()
+
+    def _checkpoint_weight_name_prefixes(self) -> tuple[str, ...]:
+        return tuple(
+            f"model.layers.{layer_idx}."
+            for layer_idx in range(
+                self.config.num_hidden_layers,
+                self.config.num_hidden_layers + self.config.num_nextn_predict_layers,
+            )
+        )
 
     def set_moe_parameters(self):
         self.num_moe_layers = self.config.num_nextn_predict_layers
