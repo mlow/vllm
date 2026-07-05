@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import dataclasses
 import io
 from collections.abc import Iterable
 
@@ -39,6 +40,12 @@ from vllm.multimodal.inputs import NestedTensors
 from vllm.transformers_utils.config import set_default_rope_theta
 from vllm.transformers_utils.repo_utils import get_hf_file_bytes
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheSpec,
+    SlidingWindowSpec,
+    get_kv_quant_mode,
+)
 
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
@@ -123,6 +130,44 @@ def _resolve_layer_attention(
     return sliding_window, causal
 
 
+class DFlashAttention(Attention):
+    """Attention with DFlash-specific KV allocation semantics.
+
+    The draft KV cache is replicated across DCP ranks because DFlash draft
+    attention cannot reduce sharded KV. For SWA drafts we keep the cache
+    window-bounded so replicated DCP does not allocate a full-context draft KV.
+    """
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # The draft attends locally over a replicated cache. DCP ranks therefore
+        # need the same draft KV, but sliding-window layers must stay windowed
+        # instead of being widened to full-context storage.
+        dcp_replicated = (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
+        if self.sliding_window is not None:
+            # Build the spec directly instead of converting the parent's
+            # SlidingWindowSpec: Attention.get_kv_cache_spec asserts against
+            # MLA *target* models for sliding-window layers, which would
+            # reject DFlash drafts beside MLA targets (e.g. Kimi K2.7) even
+            # though the draft layer itself is not MLA.
+            assert self.attn_type == AttentionType.DECODER
+            return SlidingWindowSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
+                dtype=self.kv_cache_torch_dtype,
+                sliding_window=self.sliding_window,
+                kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+                dcp_replicated=dcp_replicated,
+            )
+        spec = super().get_kv_cache_spec(vllm_config)
+        if dcp_replicated and isinstance(spec, FullAttentionSpec):
+            spec = dataclasses.replace(spec, dcp_replicated=True)
+        return spec
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -196,7 +241,7 @@ class DFlashQwen3Attention(nn.Module):
         )
 
         self.sliding_window = sliding_window
-        self.attn = Attention(
+        self.attn = DFlashAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
@@ -249,13 +294,17 @@ class DFlashQwen3DecoderLayer(nn.Module):
         layer_idx: int,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        layer_type: str = "full_attention",
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_type = layer_type
         set_default_rope_theta(config, default_theta=1000000)
         attn_type = AttentionType.DECODER
-
+        # Use one uniform sliding-window KV group for every draft layer. The
+        # target model verifies drafted tokens, so windowing the draft's lone
+        # full-attention layer can only affect acceptance, not correctness.
         # DFlash drafts store the sink-bias flag inside dflash_config; fall back
         # to the top-level attribute used by other (e.g. MiMo) configs.
         dflash_config = getattr(config, "dflash_config", None) or {}
@@ -361,6 +410,12 @@ class DFlashQwen3Model(nn.Module):
         )
         self.has_separate_mask_embedding = False
 
+        self.layer_types = [
+            "sliding_attention"
+            if _resolve_layer_attention(self.config, layer_idx)[0] is not None
+            else "full_attention"
+            for layer_idx in range(self.config.num_hidden_layers)
+        ]
         self.layers = nn.ModuleList(
             [
                 DFlashQwen3DecoderLayer(
@@ -369,11 +424,17 @@ class DFlashQwen3Model(nn.Module):
                     layer_idx=layer_idx,
                     cache_config=current_vllm_config.cache_config,
                     quant_config=self.quant_config,
+                    layer_type=self.layer_types[layer_idx],
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
         )
+        self.sliding_attention_layer_names = {
+            layer.self_attn.attn.layer_name
+            for layer in self.layers
+            if layer.layer_type == "sliding_attention"
+        }
         if self.use_aux_hidden_state:
             num_features_to_use = self.config.num_hidden_layers
             if "target_layer_ids" in drafter_config:
@@ -582,6 +643,11 @@ class DFlashQwen3Model(nn.Module):
             if slot_mapping is None:
                 continue  # dummy run: skip cache ops
             attn = self._attn_layers[i]
+            layer_slot_mapping = (
+                context_slot_mapping[attn.layer_name]
+                if isinstance(context_slot_mapping, Mapping)
+                else context_slot_mapping
+            )
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
                 attn,
@@ -652,7 +718,21 @@ class DFlashQwen3Model(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                if name not in params_dict:
+                    if "attention_sink_bias" in name:
+                        continue
+                    raise KeyError(name)
                 param = params_dict[name]
+                if "attention_sink_bias" in name:
+                    tp_size = get_tensor_model_parallel_world_size()
+                    tp_rank = get_tensor_model_parallel_rank()
+                    heads_per_rank = loaded_weight.shape[0] // tp_size
+                    head_start = tp_rank * heads_per_rank
+                    param.data.copy_(
+                        loaded_weight.narrow(0, head_start, heads_per_rank)
+                    )
+                    loaded_params.add(name)
+                    continue
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
@@ -671,7 +751,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
         self.model = DFlashQwen3Model(
             vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "model"),
+            # Keep draft Attention layer names out of the target model's
+            # `model.layers.*` namespace. The Python module hierarchy remains
+            # `self.model`, so checkpoint parameter names are unchanged.
+            prefix=maybe_prefix(prefix, "dflash_model"),
             start_layer_id=target_layer_num,
         )
 
@@ -682,7 +765,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(
-            self.config.draft_vocab_size, scale=logit_scale
+            self.config.draft_vocab_size,
+            scale=logit_scale,
         )
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
@@ -744,6 +828,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.model.precompute_and_store_context_kv(
             context_states, context_positions, context_slot_mapping
         )
+
+    @property
+    def sliding_attention_layer_names(self) -> set[str]:
+        return self.model.sliding_attention_layer_names
 
     def combine_hidden_states(
         self,

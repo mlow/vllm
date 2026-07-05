@@ -645,7 +645,25 @@ def resolve_kv_cache_block_sizes(
         bs = cache_config.block_size * dcp * pcp
         return bs, bs
 
+    is_deepseek_v4_dcp = is_deepseek_v4_hybrid_kv_cache_config(kv_cache_config)
     if dcp != 1 or pcp != 1:
+        if is_deepseek_v4_dcp and dcp > 1 and pcp == 1:
+            group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+            scheduler_block_size = math.lcm(*group_block_sizes) * dcp
+            return scheduler_block_size, scheduler_block_size
+        if dcp > 1 and pcp == 1:
+            # Mixed sharded/replicated groups (e.g. an MLA target plus a
+            # dcp_replicated draft group): each group's scheduler-visible
+            # block covers block_size tokens when replicated and
+            # block_size * dcp when sharded.
+            effective_block_sizes = [
+                g.kv_cache_spec.block_size
+                if getattr(g.kv_cache_spec, "dcp_replicated", False)
+                else g.kv_cache_spec.block_size * dcp
+                for g in groups
+            ]
+            scheduler_block_size = math.lcm(*effective_block_sizes)
+            return scheduler_block_size, math.gcd(*effective_block_sizes)
         raise ValueError(
             "Hybrid KV cache groups with multiple block sizes do not "
             "support context parallelism (dcp_world_size/pcp_world_size > 1)."
@@ -682,6 +700,36 @@ def resolve_kv_cache_block_sizes(
             f"Got group block sizes={group_block_sizes}."
         )
     return scheduler_block_size, hash_block_size
+
+
+def is_deepseek_v4_hybrid_kv_cache_config(
+    kv_cache_config: KVCacheConfig,
+) -> bool:
+    """Return whether the KV layout is DeepSeek V4's MLA/SWA hybrid layout."""
+    if len(kv_cache_config.kv_cache_groups) <= 1:
+        return False
+
+    flattened_specs: list[KVCacheSpec] = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            flattened_specs.extend(spec.kv_cache_specs.values())
+        else:
+            flattened_specs.append(spec)
+
+    if not flattened_specs:
+        return False
+    has_deepseek_v4_swa = any(
+        isinstance(spec, SlidingWindowMLASpec)
+        and getattr(spec, "model_version", None) == "deepseek_v4"
+        for spec in flattened_specs
+    )
+    if not has_deepseek_v4_swa:
+        return False
+    return all(
+        isinstance(spec, MLAAttentionSpec | SlidingWindowMLASpec)
+        for spec in flattened_specs
+    )
 
 
 def get_request_block_hasher(
@@ -1408,9 +1456,9 @@ def get_kv_cache_config_from_groups(
         kv_cache_tensors = []
         for i in range(group_size):
             shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
+            for group in kv_cache_groups:
+                if i < len(group.layer_names):
+                    shared_by.append(group.layer_names[i])
             kv_cache_tensors.append(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
             )
@@ -1525,35 +1573,54 @@ def group_and_unify_kv_cache_specs(
     Group the KV cache specs and unify each group into one UniformTypeKVCacheSpecs.
     Currently, this is only used for DeepseekV4.
     """
-    if not any(
+    has_swa = any(
         isinstance(spec, SlidingWindowMLASpec) for spec in kv_cache_spec.values()
-    ):
+    )
+    # DFlash-under-DCP draft: full-attention layers replicated on every DCP
+    # rank. They have a different page size than the MLA target and need their
+    # own group, but the DeepseekV4 multi-group allocator (with page-size
+    # padding) handles exactly that, so route them through here too.
+    has_repl = any(
+        getattr(spec, "dcp_replicated", False)
+        and not isinstance(spec, MLAAttentionSpec)
+        for spec in kv_cache_spec.values()
+    )
+    if not (has_swa or has_repl):
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
-        dict
-    )
-    # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates
-    # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
-    # be fragile with only block_size and sliding_window as keys, but fine for now.
+    grouped_swa_mla_specs: dict[
+        tuple[int, int, bool], dict[str, KVCacheSpec]
+    ] = defaultdict(dict)
+    # dcp_replicated non-MLA groups (e.g. the DFlash draft), keyed by block_size.
+    grouped_repl_specs: dict[tuple[int], dict[str, KVCacheSpec]] = defaultdict(dict)
+    # NOTE: Here we group SWA layers by (block_size, sliding_window,
+    # dcp_sharded), which separates SWA layers, C4I+C4A layers, and C128A
+    # layers into different groups.
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
-            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+            grouped_swa_mla_specs[
+                (spec.block_size, spec.sliding_window, spec.dcp_sharded)
+            ][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
+        elif getattr(spec, "dcp_replicated", False):
+            grouped_repl_specs[(spec.block_size,)][name] = spec
 
-    assert len(mla_specs) > 0
+    if len(mla_specs) == 0:
+        # No full-MLA group to anchor the DeepseekV4 layout; let the generic
+        # paths handle it.
+        return None
     mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
     assert mla_uniform_spec is not None
 
-    swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []
-    for spec_dict in grouped_swa_mla_specs.values():
+    other_uniform_specs: list[UniformTypeKVCacheSpecs] = []
+    for spec_dict in (*grouped_swa_mla_specs.values(), *grouped_repl_specs.values()):
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
         assert uniform_spec is not None
-        swa_uniform_specs.append(uniform_spec)
+        other_uniform_specs.append(uniform_spec)
 
-    return [mla_uniform_spec, *swa_uniform_specs]
+    return [mla_uniform_spec, *other_uniform_specs]
 
 
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
@@ -1632,8 +1699,11 @@ def _get_kv_cache_groups_uniform_groups(
     ]
 
     swa_mla_specs = grouped_specs[1:]
+    # Non-first groups are SWA-MLA, full-attention dcp_replicated drafts, or
+    # sliding-window dcp_replicated drafts. All are padded to MLA buckets
+    # identically.
     assert all(
-        isinstance(spec, SlidingWindowMLASpec)
+        isinstance(spec, (SlidingWindowMLASpec, FullAttentionSpec, SlidingWindowSpec))
         for group in swa_mla_specs
         for spec in group.kv_cache_specs.values()
     )
