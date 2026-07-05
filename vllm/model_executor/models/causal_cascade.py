@@ -22,10 +22,12 @@ from transformers import AutoConfig, PretrainedConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm
 
 from vllm.config import SpeculativeConfig, VllmConfig, replace
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
+    get_masked_input_and_mask,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
@@ -2899,12 +2901,28 @@ class ServingSparseMLADraftModel(CanonicalSparseMLADraftModel):
             return logits
 
         def lookup_rows(self, token_ids: torch.Tensor) -> torch.Tensor:
-            # ParallelLMHead deliberately overrides forward because it normally
-            # serves as an output projection. Calling the embedding base method
-            # gives the exact global row and performs the required TP reduction.
+            # ParallelLMHead deliberately uses its quantization method for the
+            # output projection, and some linear quantization methods do not
+            # implement the generic embedding API. Gather directly from the
+            # existing sharded head weight instead; this is still the same
+            # verifier parameter and does not materialize a copied head.
             head = self._require_head()
             if isinstance(head, VocabParallelEmbedding):
-                return VocabParallelEmbedding.forward(head, token_ids)
+                if head.tp_size > 1:
+                    masked_input, input_mask = get_masked_input_and_mask(
+                        token_ids,
+                        head.shard_indices.org_vocab_start_index,
+                        head.shard_indices.org_vocab_end_index,
+                        head.shard_indices.num_org_vocab_padding,
+                        head.shard_indices.added_vocab_start_index,
+                        head.shard_indices.added_vocab_end_index,
+                    )
+                else:
+                    masked_input = token_ids
+                output_parallel = F.embedding(masked_input.long(), head.weight)
+                if head.tp_size > 1:
+                    output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+                return tensor_model_parallel_all_reduce(output_parallel)
             return F.embedding(token_ids, head.weight)
 
         @property
@@ -3340,6 +3358,11 @@ class CausalCascadeForCausalLM(nn.Module):
             vllm_config,
             speculative_config=native_mtp_config,
         )
+        from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+            _create_draft_vllm_config,
+        )
+
+        native_mtp_vllm_config = _create_draft_vllm_config(native_mtp_vllm_config)
         # The verifier embedding and LM head are attached after both models are
         # loaded. Avoid allocating either shared matrix while constructing the
         # embedded MTP layer; this is the key memory advantage over nesting a
@@ -3348,7 +3371,11 @@ class CausalCascadeForCausalLM(nn.Module):
 
         self.embedded_mtp = DeepSeekMTP(
             vllm_config=native_mtp_vllm_config,
-            prefix="embedded_mtp",
+            # Keep the native checkpoint prefix for quantization-policy
+            # matching (for example, GLM's BF16 sparse indexer exclusions).
+            # The owning attribute still namespaces parameters as
+            # ``embedded_mtp.*`` in this wrapper.
+            prefix="",
             allocate_shared_weights=False,
         )
 

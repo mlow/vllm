@@ -559,6 +559,8 @@ class CausalCascadeSpeculator(AutoRegressiveSpeculator):
         self,
         *,
         input_batch: InputBatch,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
         last_hidden_states: torch.Tensor,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
@@ -599,7 +601,6 @@ class CausalCascadeSpeculator(AutoRegressiveSpeculator):
             input_batch.num_tokens,
             max_query_len,
         )
-        assert self.prefill_cudagraph_manager is not None
         prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.prefill_cudagraph_manager,
             num_reqs,
@@ -610,30 +611,34 @@ class CausalCascadeSpeculator(AutoRegressiveSpeculator):
             need_eager=is_profile,
         )
 
-        idx_mapping = self.idx_mapping[:num_reqs]
-        rebuilt_slot_mappings = self.block_tables.compute_slot_mappings(
-            idx_mapping,
-            self.input_buffers.query_start_loc,
-            self.input_buffers.positions,
-            prefill_batch_desc.num_tokens,
-        )
-        prefill_slot_mappings = build_slot_mappings_by_layer(
-            rebuilt_slot_mappings,
-            self.kv_cache_config,
-        )
-        num_query_per_req = uniform_token_count or max_query_len
-        prefill_attn_metadata = self._build_draft_attn_metadata(
-            num_reqs=num_reqs,
-            num_reqs_padded=prefill_batch_desc.num_reqs or num_reqs,
-            num_tokens_padded=prefill_batch_desc.num_tokens,
-            num_query_per_req=num_query_per_req,
-            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
-            max_seq_len_upper_bound=max_seq_len,
-            query_start_loc_cpu=torch.from_numpy(input_batch.query_start_loc_np),
-        )
+        prefill_attn_metadata = attn_metadata
+        prefill_slot_mappings = slot_mappings
+        if getattr(self, "rebuild_prefill_attn_metadata", False):
+            idx_mapping = self.idx_mapping[:num_reqs]
+            rebuilt_slot_mappings = self.block_tables.compute_slot_mappings(
+                idx_mapping,
+                self.input_buffers.query_start_loc,
+                self.input_buffers.positions,
+                prefill_batch_desc.num_tokens,
+            )
+            prefill_slot_mappings = build_slot_mappings_by_layer(
+                rebuilt_slot_mappings,
+                self.kv_cache_config,
+            )
+            num_query_per_req = uniform_token_count or max_query_len
+            prefill_attn_metadata = self._build_draft_attn_metadata(
+                num_reqs=num_reqs,
+                num_reqs_padded=prefill_batch_desc.num_reqs or num_reqs,
+                num_tokens_padded=prefill_batch_desc.num_tokens,
+                num_query_per_req=num_query_per_req,
+                seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+                max_seq_len_upper_bound=max_seq_len,
+                query_start_loc_cpu=torch.from_numpy(input_batch.query_start_loc_np),
+            )
         self._prepare_eplb_forward(input_batch.num_tokens)
 
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
+            assert self.prefill_cudagraph_manager is not None
             with record_function_or_nullcontext(
                 "vllm:v2/speculator/causal_cascade/mtp/full_graph_replay"
             ):
@@ -674,7 +679,7 @@ class CausalCascadeSpeculator(AutoRegressiveSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         num_reqs = input_batch.num_reqs
-        del attn_metadata, slot_mappings, skip_attn_for_dummy_run, mm_inputs
+        del skip_attn_for_dummy_run, mm_inputs
         if num_speculative_tokens is None:
             num_speculative_tokens = self.num_speculative_steps
         if not 1 <= num_speculative_tokens <= self.num_speculative_steps:
@@ -685,6 +690,8 @@ class CausalCascadeSpeculator(AutoRegressiveSpeculator):
         self._active_num_speculative_tokens = num_speculative_tokens
         native_mtp_anchor_hidden_state = self._run_embedded_mtp_prefill(
             input_batch=input_batch,
+            attn_metadata=attn_metadata,
+            slot_mappings=slot_mappings,
             last_hidden_states=last_hidden_states,
             num_sampled=num_sampled,
             num_rejected=num_rejected,

@@ -836,6 +836,7 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
 
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
         if self.dcp_world_size > 1:
             # The indexer globally merges logical top-k ids across DCP ranks.
             # Compact just this rank's winners into local physical cache slots;
@@ -861,7 +862,6 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 out=selected_indices,
                 valid_counts=nsa_cache_seqlens,
             )
-            per_token_cache = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
             torch.minimum(
                 nsa_cache_seqlens,
                 per_token_cache,
@@ -872,7 +872,13 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             # Without DCP, the b12x indexer writes flat physical cache slots
             # directly into the shared top-k buffer.
             selected_indices = topk_indices
-            nsa_cache_seqlens = attn_metadata.cache_seq_lens_per_token[:num_actual_toks]
+            nsa_cache_seqlens = per_token_cache
+
+        # Only the DCP path still has the indexer's logical token ids. The
+        # non-DCP B12X output has already been converted to physical cache
+        # slots, so exposing it as both forms would fail the live state's
+        # logical-index causality validation.
+        logical_topk_indices = topk_indices if self.dcp_world_size > 1 else None
 
         is_spec_verify_capture = (
             attn_metadata.max_query_len <= self.spec_capture_max_q
@@ -899,15 +905,18 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
             dflash_input_ids = forward_context.additional_kwargs.get("dflash_input_ids")
             if dflash_input_ids is not None:
                 dflash_input_ids = dflash_input_ids[:num_actual_toks]
+            req_id_per_token = attn_metadata.req_id_per_token
+            if req_id_per_token is not None:
+                req_id_per_token = req_id_per_token[:num_actual_toks]
             if causal_cascade_live_state.get_causal_cascade_live_state() is not None:
                 causal_cascade_live_state.capture_causal_cascade_sparse_mla_layer(
                     str(layer_name),
                     kv_c_and_k_pe_cache,
-                    page_table_1,
-                    topk_indices,
+                    selected_indices,
+                    logical_topk_indices,
                     nsa_cache_seqlens,
                     per_token_cache,
-                    attn_metadata.req_id_per_token[:num_actual_toks],
+                    req_id_per_token,
                     dflash_input_ids,
                     num_actual_toks,
                 )

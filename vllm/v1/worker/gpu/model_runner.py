@@ -545,6 +545,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kernel_block_sizes,
             self.vllm_config,
         )
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_causal_cascade()
+        ):
+            from vllm.v1.worker.gpu.spec_decode.causal_cascade import (
+                live_state as causal_cascade_live_state,
+            )
+
+            causal_cascade_live_state.register_causal_cascade_kv_caches(kv_caches_dict)
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 
     def _init_kv_zero_meta(self) -> None:
