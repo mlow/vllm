@@ -620,7 +620,7 @@ class GroupCoordinator:
             )
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
-                maybe_ca_context = ca_comm.capture()  # type: ignore
+                maybe_ca_context = ca_comm.capture(stream=stream)  # type: ignore
 
             from vllm._aiter_ops import rocm_aiter_ops
 
@@ -1442,7 +1442,16 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+    maybe_dcp_capture = (
+        get_dcp_group().graph_capture(context)
+        if _DCP is not None and get_dcp_group().world_size > 1
+        else nullcontext()
+    )
+    with (
+        get_tp_group().graph_capture(context),
+        get_pp_group().graph_capture(context),
+        maybe_dcp_capture,
+    ):
         yield context
 
 
