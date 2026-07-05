@@ -243,6 +243,8 @@ def triton_filter_and_convert_dcp_index(
     BLOCK_N: int = 128,
     return_valid_counts: bool = False,
     compact_valid_to_front: bool = True,
+    out: torch.Tensor | None = None,
+    valid_counts: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Filter global per-request indices to this DCP rank's local slots.
 
@@ -270,6 +272,9 @@ def triton_filter_and_convert_dcp_index(
     assert NUM_TOPK_TOKENS % BLOCK_N == 0
 
     if dcp_size == 1:
+        assert out is None and valid_counts is None, (
+            "preallocated out/valid_counts are only supported on the DCP path"
+        )
         return triton_convert_req_index_to_global_index(
             req_id,
             block_table,
@@ -290,17 +295,31 @@ def triton_filter_and_convert_dcp_index(
 
     # The compaction uses the valid-count buffer as an atomic slot allocator, so
     # it requires counting. Pre-fill out with -1 so the unwritten tail stays -1.
+    # Callers on the decode hot path (e.g. the b12x sparse-MLA backend) pass
+    # preallocated CUDA-graph-stable buffers to keep the conversion zero-copy.
     count_valid = return_valid_counts or compact_valid_to_front
-    if compact_valid_to_front:
-        out = torch.full_like(token_indices_c, -1)
+    if out is None:
+        if compact_valid_to_front:
+            out = torch.full_like(token_indices_c, -1)
+        else:
+            out = torch.empty_like(token_indices_c)
     else:
-        out = torch.empty_like(token_indices_c)
+        assert out.dtype == torch.int32 and out.device == token_indices.device
+        assert out.shape == token_indices_c.shape
+        if compact_valid_to_front:
+            out.fill_(-1)
 
-    valid_counts: torch.Tensor | None = None
     if count_valid:
-        valid_counts = torch.zeros(
-            num_tokens, dtype=torch.int32, device=token_indices.device
-        )
+        if valid_counts is None:
+            valid_counts = torch.zeros(
+                num_tokens, dtype=torch.int32, device=token_indices.device
+            )
+        else:
+            assert valid_counts.dtype == torch.int32
+            assert valid_counts.shape[0] == num_tokens
+            valid_counts.zero_()
+    else:
+        valid_counts = None
 
     bt_stride0, bt_stride1 = block_table_c.stride()
     ti_stride0, ti_stride1 = token_indices_c.stride()

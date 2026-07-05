@@ -51,7 +51,7 @@ from vllm.v1.attention.backend import (
     SparseMLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
-    triton_convert_dcp_global_index_to_local_index,
+    triton_filter_and_convert_dcp_index,
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -843,11 +843,13 @@ class B12xMLASparseImpl(SparseMLAAttentionImpl[B12xMLASparseMetadata]):
                 :num_actual_toks, : topk_indices.shape[1]
             ]
             nsa_cache_seqlens = attn_metadata.nsa_cache_seqlens[:num_actual_toks]
-            triton_convert_dcp_global_index_to_local_index(
+            # Zero-copy: the kernel scatters directly into the persistent
+            # CUDA-graph-stable views consumed by the b12x planned kernels.
+            triton_filter_and_convert_dcp_index(
                 attn_metadata.req_id_per_token[:num_actual_toks],
                 attn_metadata.block_table,
                 topk_indices,
-                dcp_world_size=self.dcp_world_size,
+                dcp_size=self.dcp_world_size,
                 dcp_rank=self.dcp_rank,
                 cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
                 BLOCK_SIZE=attn_metadata.block_size,

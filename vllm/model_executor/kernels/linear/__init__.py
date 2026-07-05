@@ -434,9 +434,6 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
-        # Kept below the incumbents pending benchmarks; opt in via
-        # --linear-backend=flashinfer_cutedsl.
-        FlashInferCutedslMxfp8LinearKernel,
         EmulationMxfp8LinearKernel,
         HummingMxfp8LinearKernel,
     ],
