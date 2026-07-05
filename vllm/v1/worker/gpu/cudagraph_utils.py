@@ -209,12 +209,15 @@ class CudaGraphManager:
         speculative_config = self.vllm_config.speculative_config
         if (
             speculative_config
-            and speculative_config.uses_dynamic_speculative_decoding()
+            and speculative_config.uses_batch_size_dynamic_speculative_decoding()
         ):
             num_spec_per_batch_size = (
                 speculative_config.num_speculative_tokens_per_batch_size
             )
-            # uses_dynamic_speculative_decoding() guarantees this is set.
+            # uses_batch_size_dynamic_speculative_decoding() guarantees this
+            # is set. Acceptance-length adaptation takes the else branch: it
+            # replays the max-depth graphs and pads unscheduled draft slots
+            # with -1 placeholders that rejection sampling discards.
             assert num_spec_per_batch_size is not None
             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
             # _per_step. Recover num_new_sampled_tokens_per_step
@@ -225,6 +228,21 @@ class CudaGraphManager:
             # Each entry is (range_start, range_end, num_speculative_tokens).
             decode_query_lens = [
                 x[2] + num_new_sampled_tokens_per_step for x in num_spec_per_batch_size
+            ]
+        elif (
+            speculative_config
+            and speculative_config.uses_acceptance_length_adaptation()
+        ):
+            # Acceptance-length adaptation selects any depth in [1, K] at
+            # runtime; capture a uniform-decode graph per depth so a reduced
+            # depth verifies fewer tokens instead of replaying padded
+            # max-depth graphs.
+            num_new_sampled_tokens_per_step = (
+                self.decode_query_len - self.vllm_config.num_speculative_tokens
+            )
+            decode_query_lens = [
+                n + num_new_sampled_tokens_per_step
+                for n in range(1, self.vllm_config.num_speculative_tokens + 1)
             ]
         else:
             decode_query_lens = [self.decode_query_len]
@@ -278,6 +296,31 @@ class CudaGraphManager:
                 )
                 descs_by_mode[mixed_mode].append(desc)
                 descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
+
+        # Guarantee the small-request grid for every selectable decode query
+        # length, independent of the configured capture-size list: a missing
+        # (depth, num_reqs) point would otherwise pad requests or fall off
+        # the FULL-graph path.
+        if separate_decode_routine and decode_mode:
+            for decode_query_len, num_reqs in product(
+                decode_query_lens, range(1, min(self.max_num_reqs, 32) + 1)
+            ):
+                num_tokens = decode_query_len * num_reqs
+                if num_tokens > max_decode_tokens or num_tokens > max_cg_capture_size:
+                    continue
+                for num_active_loras in self.lora_capture_cases:
+                    desc = BatchExecutionDescriptor(
+                        cg_mode=decode_mode,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                        uniform_token_count=decode_query_len,
+                        num_active_loras=num_active_loras,
+                    )
+                    if desc not in descs_by_mode[decode_mode]:
+                        descs_by_mode[decode_mode].append(desc)
+                        descs_by_token_lora[(num_tokens, num_active_loras)].append(
+                            desc
+                        )
 
         if not descs_by_token_lora:
             return
