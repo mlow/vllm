@@ -315,12 +315,15 @@ def _reshape_kv_cache(
                     and not isinstance(kv_cache_spec, TQFullAttentionSpec)
                     else cache_dtype
                 )
+                cache_dtype_str = (
+                    getattr(kv_cache_spec, "cache_dtype_str", None) or layer_cache_dtype
+                )
                 kv_cache_shape = group.backend.get_kv_cache_shape(
                     kernel_num_blocks,
                     kernel_block_size,
                     kv_cache_spec.num_kv_heads,
                     kv_cache_spec.head_size,
-                    cache_dtype_str=layer_cache_dtype,
+                    cache_dtype_str=cache_dtype_str,
                 )
 
                 # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
