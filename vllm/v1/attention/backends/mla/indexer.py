@@ -157,6 +157,12 @@ class DeepseekV32IndexerBackend(AttentionBackend):
         return (0, 1, 2)
 
 
+class B12xNonCompressedIndexerBackend(DeepseekV32IndexerBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "B12X_NON_COMPRESSED_INDEXER"
+
+
 class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     @staticmethod
     def get_name() -> str:

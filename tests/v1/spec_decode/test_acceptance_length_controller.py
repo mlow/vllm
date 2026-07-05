@@ -316,8 +316,10 @@ def test_runner_v2_allows_acceptance_length_adaptation(monkeypatch):
     config._maybe_override_dynamic_sd_cudagraph_mode()
     assert config.compilation_config.cudagraph_mode == CUDAGraphMode.FULL
 
+    # The V2 runner supports the batch-size schedule too (the restriction was
+    # lifted upstream), so combining both controls stays supported.
     speculative_config.num_speculative_tokens_per_batch_size = [(1, 1, 1)]
-    assert (
-        "batch-size dynamic speculative decoding"
-        in config._get_v2_model_runner_unsupported_features()
+    assert not any(
+        "dynamic speculative decoding" in item
+        for item in config._get_v2_model_runner_unsupported_features()
     )

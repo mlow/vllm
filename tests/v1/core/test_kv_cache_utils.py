@@ -1513,6 +1513,7 @@ def _make_dsv4_vllm_config(dcp: int):
             pass
 
     return _Dsv4VllmConfig(
+        kv_transfer_config=None,
         model_config=SimpleNamespace(
             max_model_len=256000,
             original_max_model_len=256000,

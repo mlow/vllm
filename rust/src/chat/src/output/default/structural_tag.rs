@@ -278,8 +278,12 @@ mod tests {
             request(ChatToolChoice::Auto, vec![chat_tool("search", Some(true))]);
         let parser = qwen3_coder_parser(&disabled_request.tools);
 
-        apply_structural_tag_constraint(&mut disabled_request, parser.structural_tag_model(), false)
-            .expect("structural tag should build");
+        apply_structural_tag_constraint(
+            &mut disabled_request,
+            parser.structural_tag_model(),
+            false,
+        )
+        .expect("structural tag should build");
 
         let tag = structural_tag_value(&disabled_request);
         let mut enabled_request =

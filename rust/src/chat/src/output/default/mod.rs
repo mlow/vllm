@@ -79,8 +79,7 @@ impl DefaultChatOutputProcessor {
 
         // Reasoning models emit a thinking prefix unless the request disabled
         // it; the structural-tag grammar must match what the model produces.
-        let reasoning_enabled =
-            has_reasoning_parser && request.enable_thinking()?.unwrap_or(true);
+        let reasoning_enabled = has_reasoning_parser && request.enable_thinking()?.unwrap_or(true);
         apply_structural_tag_constraint(request, parser.structural_tag_model(), reasoning_enabled)?;
 
         if parser.preserve_special_tokens() {
