@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     DecodeSpeculatorCudaGraphManager,
     PrefillSpeculatorCudaGraphManager,
@@ -35,6 +36,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
         self.current_draft_step = torch.tensor(0, dtype=torch.int64, device=device)
+        self.active_num_reqs = torch.tensor(0, dtype=torch.int32, device=device)
         self.last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
@@ -145,18 +147,27 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
+        num_speculative_tokens: int | None = None,
         num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
+        if num_speculative_tokens is None:
+            num_speculative_tokens = self.num_speculative_steps
+        if not 1 <= num_speculative_tokens <= self.num_speculative_steps:
+            raise ValueError(
+                "num_speculative_tokens must be between 1 and "
+                f"{self.num_speculative_steps}, got {num_speculative_tokens}."
+            )
+
         num_tokens = input_batch.num_tokens_after_padding
         num_reqs = input_batch.num_reqs
         max_query_len = input_batch.num_scheduled_tokens.max()
         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
         self.draft_max_seq_len = min(
-            max_seq_len + self.num_speculative_steps, self.max_model_len
+            max_seq_len + num_speculative_tokens, self.max_model_len
         )
 
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
@@ -180,6 +191,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             temperature,
             seeds,
         )
+        self.active_num_reqs.fill_(num_reqs)
 
         # Get the input ids and last token indices for the speculator.
         prepare_prefill_inputs(
@@ -233,7 +245,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 mm_inputs=mm_inputs,
             )
 
-        if self.num_speculative_steps == 1:
+        if num_speculative_tokens == 1:
             # Early exit.
             return self.draft_tokens[:num_reqs, :1]
 
@@ -260,15 +272,45 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             need_eager=is_profile,
         )
 
-        # Generate the remaining num_speculative_steps - 1 draft tokens.
+        # Generate the remaining draft tokens.
         self._multi_step_decode(
             num_reqs,
             dummy_run and skip_attn_for_dummy_run,
             decode_batch_desc,
             num_tokens_across_dp,
+            num_speculative_tokens,
         )
 
-        return self.draft_tokens[:num_reqs]
+        return self.draft_tokens[:num_reqs, :num_speculative_tokens]
+
+    def sample_draft(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor | None,
+    ) -> torch.Tensor:
+        logits = self.model.compute_logits(hidden_states)
+        if draft_logits is not None:
+            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
+            # used for draft and target sampling.
+            return gumbel_sample(
+                logits,
+                idx_mapping,
+                temperature,
+                seeds,
+                positions + 1,
+                apply_temperature=True,
+                output_processed_logits=draft_logits,
+                output_processed_logits_col=draft_step,
+                output_processed_logits_active_rows=self.active_num_reqs,
+                use_fp64=self.use_fp64_gumbel,
+            )
+        else:
+            return logits.argmax(dim=-1)
 
     @torch.inference_mode()
     def _run_model(
@@ -374,6 +416,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         skip_attn: bool,
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
+        num_speculative_tokens: int,
     ) -> None:
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
@@ -381,7 +424,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         attn_metadata = None
         slot_mappings_by_layer = None
-        for step in range(1, self.num_speculative_steps):
+        for step in range(1, num_speculative_tokens):
+            self.active_num_reqs.fill_(num_reqs)
             # Rebuild every step when positions advance, or just once
             # on the first step when positions are constant (Gemma4 MTP).
             if not skip_attn and (self.advance_draft_positions or step == 1):
