@@ -670,6 +670,24 @@ def test_modelopt_mixed_precision_resolves_minimax_qkv_from_shards() -> None:
     )
 
 
+def test_modelopt_mixed_precision_drives_minimax_indexer_split() -> None:
+    from vllm.models.minimax_m3.nvidia.model import (
+        _should_split_mxfp8_indexer_projection,
+    )
+
+    config = _mixed_precision_config(
+        {
+            "model.language_model.layers.3.self_attn.q_proj": {"quant_algo": "MXFP8"},
+            "model.language_model.layers.3.self_attn.k_proj": {"quant_algo": "MXFP8"},
+            "model.language_model.layers.3.self_attn.v_proj": {"quant_algo": "MXFP8"},
+        }
+    )
+
+    assert _should_split_mxfp8_indexer_projection(
+        config, "language_model.model.layers.3.self_attn"
+    )
+
+
 def test_modelopt_mixed_precision_resolves_minimax_dense_gate_up_shards() -> None:
     config = _mixed_precision_config(
         {

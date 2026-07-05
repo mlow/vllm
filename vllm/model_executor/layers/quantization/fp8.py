@@ -203,10 +203,39 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             if self.store_dtype == "mxfp4":
                 from vllm.model_executor.layers.quantization.mxfp4 import (
+                    GptOssMxfp4MoEMethod,
                     Mxfp4MoEMethod,
                 )
 
-                return Mxfp4MoEMethod(layer.moe_config)
+                moe_backend = layer.moe_config.moe_backend
+                # FP8 checkpoints with store_dtype=mxfp4 (GLM/DeepSeek/MiMo
+                # style) use the standard SwiGLU. GptOssMxfp4MoEMethod
+                # hardcodes the GPT-OSS clamped activation
+                # (gemm1_alpha=1.702, beta=1.0, swiglu_limit=7.0); the B12X
+                # W4A16 kernel honors swiglu_limit and would clamp gate/up at
+                # +-7 in every MoE layer, distorting long generations.
+                if moe_backend in {
+                    "b12x",
+                    "deep_gemm",
+                    "flashinfer_cutlass",
+                    "flashinfer_cutlass_afp8",
+                    "flashinfer_trtllm",
+                    "flashinfer_trtllm_afp8",
+                }:
+                    logger.info_once(
+                        "Using DeepSeek-style MXFP4 MoE method for FP8 "
+                        "checkpoint with store_dtype=mxfp4 and "
+                        "moe_backend=%s.",
+                        moe_backend,
+                    )
+                    return Mxfp4MoEMethod(layer.moe_config)
+
+                logger.info_once(
+                    "Using GPT-OSS-style MXFP4 MoE method for FP8 "
+                    "checkpoint with store_dtype=mxfp4 and moe_backend=%s.",
+                    moe_backend,
+                )
+                return GptOssMxfp4MoEMethod(layer.moe_config)
             if self.is_checkpoint_fp8_serialized:
                 return Fp8MoEMethod(self, layer)
             else:
@@ -395,7 +424,10 @@ class Fp8LinearMethod(LinearMethodBase):
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        if getattr(layer, "b12x_skip_generic_block_fp8_linear", False):
+            return
+
         if self.use_marlin:
             if not self.block_quant:
                 # Canonicalize to (K, N) for the kernel.
