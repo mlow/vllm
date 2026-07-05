@@ -9,7 +9,8 @@ from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
     MarlinNvFp4LinearKernel,
@@ -58,6 +59,10 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.online.mxfp8 import (
+    Mxfp8OnlineLinearMethod,
+    is_shared_expert_projection,
+)
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     swap_w13_to_w31,
 )
@@ -81,6 +86,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTokenSym,
     kFp8StaticTensorSym,
     kFp8StaticTokenSym,
+    kMxfp8Dynamic,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
@@ -180,6 +186,29 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         return False
 
+    @staticmethod
+    def _get_shared_expert_online_method(
+        layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        if not isinstance(layer, LinearBase) or not is_shared_expert_projection(prefix):
+            return None
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return None
+        args = vllm_config.model_config.quantization_config
+        if not isinstance(args, QuantizationConfigArgs):
+            return None
+        spec = args.shared_experts
+        if spec is None:
+            return None
+        if spec.weight != kMxfp8Dynamic or spec.activation is not None:
+            raise ValueError(
+                "ModelOpt shared-expert overlay only supports "
+                "weight='mxfp8' with no activation override."
+            )
+        return Mxfp8OnlineLinearMethod()
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -189,6 +218,8 @@ class ModelOptQuantConfigBase(QuantizationConfig):
 
         # handle exclusion
         if self.is_layer_excluded(prefix):
+            if method := self._get_shared_expert_online_method(layer, prefix):
+                return method
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None
@@ -2517,6 +2548,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         # Excluded layers
         if self.is_layer_excluded(prefix):
+            if method := self._get_shared_expert_online_method(layer, prefix):
+                return method
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None
@@ -2533,6 +2566,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             if quant_algo == "MXFP8":
                 return ModelOptMxFp8LinearMethod(self.mxfp8_config)
             # Layer not in quantized_layers — leave unquantized
+            if method := self._get_shared_expert_online_method(layer, prefix):
+                return method
             return UnquantizedLinearMethod()
 
         if isinstance(layer, RoutedExperts):

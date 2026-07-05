@@ -52,13 +52,17 @@ quantization_config:
   moe:
     weight: <name>
     activation: <name>
+  shared_experts:
+    weight: <name>
+    activation: <name>
   ignore: [<layer-name-or-regex>, ...]
 ```
 
-`linear` and `moe` accept a full `{weight, activation}` dict, or a bare
-string. A string resolves first against the `--quantization` shorthands
-(taking the matching layer-kind slot), then against `QUANT_KEY_NAMES` as a
-weight name. Unset fields fall back to the `--quantization` shorthand's
+`linear`, `moe`, and `shared_experts` accept a full `{weight, activation}`
+dict, or a bare string. For `linear` and `moe`, a string resolves first against
+the `--quantization` shorthands (taking the matching layer-kind slot), then
+against `QUANT_KEY_NAMES` as a weight name. `shared_experts` resolves against
+`QUANT_KEY_NAMES`. Unset fields fall back to the `--quantization` shorthand's
 defaults, or for already-quantized checkpoints to whatever the checkpoint
 declares.
 
@@ -70,6 +74,31 @@ The CLI accepts the same shape as JSON or as dotted keys:
 vllm serve <model> --quantization-config '{"moe":{"activation":"mxfp8"}}'
 vllm serve <model> --quantization-config.moe.activation mxfp8
 ```
+
+### MXFP8 shared experts
+
+Use `shared_experts` to quantize only the gate, up, and down projections of a
+shared-expert MLP. Attention, routers, dense MLPs, and routed experts are not
+selected by this field. For a BF16/FP16 checkpoint:
+
+```bash
+vllm serve <model> \
+  --quantization online \
+  --quantization-config.shared_experts.weight mxfp8
+```
+
+The same option can overlay online MXFP8 on shared experts that a ModelOpt
+checkpoint explicitly leaves in BF16. This supports GLM 5.2 ModelOpt NVFP4
+checkpoints, whose `ignore` list contains the shared experts:
+
+```bash
+vllm serve <glm-5.2-modelopt-checkpoint> \
+  --quantization modelopt_fp4 \
+  --quantization-config.shared_experts.weight mxfp8
+```
+
+Serialized checkpoint-quantized shared experts are preserved; only excluded
+BF16 projection weights are converted at load time.
 
 ### Activation overrides on already-quantized checkpoints
 

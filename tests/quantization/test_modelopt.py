@@ -6,6 +6,7 @@ Run `pytest tests/quantization/test_modelopt.py`.
 """
 
 import os
+from types import SimpleNamespace
 from typing import Any, NoReturn
 from unittest.mock import MagicMock, Mock, patch
 
@@ -14,7 +15,8 @@ import torch
 
 from tests.quantization.utils import is_quant_method_supported
 from vllm.config.model import ModelConfig
-from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.config.quantization import QuantizationConfigArgs
+from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
@@ -63,6 +65,10 @@ def _mock_lm_head() -> Mock:
     return lm_head
 
 
+def _mock_linear() -> Mock:
+    return Mock(spec=LinearBase)
+
+
 def _mixed_precision_config(quantized_layers: dict) -> ModelOptMixedPrecisionConfig:
     return ModelOptMixedPrecisionConfig(
         kv_cache_quant_method=None,
@@ -104,6 +110,64 @@ def test_modelopt_nvfp4_quantizes_parallel_lm_head():
         "vllm.model_executor.layers.quantization.modelopt.init_nvfp4_linear_kernel"
     ):
         method = config.get_quant_method(_mock_lm_head(), prefix="lm_head")
+
+    assert isinstance(method, ModelOptNvFp4LinearMethod)
+
+
+def test_modelopt_nvfp4_online_quantizes_bf16_shared_experts():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=["*shared_experts*", "lm_head"],
+    )
+    current_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=QuantizationConfigArgs(shared_experts="mxfp8")
+        )
+    )
+    sentinel = MagicMock()
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "get_current_vllm_config_or_none",
+            return_value=current_config,
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.Mxfp8OnlineLinearMethod",
+            return_value=sentinel,
+        ),
+    ):
+        gate_up_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.gate_up_proj"
+        )
+        down_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.down_proj"
+        )
+        router_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.router"
+        )
+        lm_head_method = config.get_quant_method(_mock_lm_head(), "lm_head")
+
+    assert gate_up_method is sentinel
+    assert down_method is sentinel
+    assert isinstance(router_method, UnquantizedLinearMethod)
+    assert isinstance(lm_head_method, UnquantizedLinearMethod)
+
+
+def test_modelopt_nvfp4_preserves_serialized_shared_experts():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[],
+    )
+
+    with patch(
+        "vllm.model_executor.layers.quantization.modelopt.init_nvfp4_linear_kernel"
+    ):
+        method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.gate_up_proj"
+        )
 
     assert isinstance(method, ModelOptNvFp4LinearMethod)
 

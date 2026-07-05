@@ -80,7 +80,7 @@ class QuantizationConfigArgs:
     """User-facing quantization configuration.
 
     See `docs/features/quantization/online.md` for the schema and shorthand
-    string forms accepted on `linear` and `moe`.
+    string forms accepted on `linear`, `moe`, and `shared_experts`.
     """
 
     linear: QuantSpec | None = None
@@ -89,17 +89,20 @@ class QuantizationConfigArgs:
     moe: QuantSpec | None = None
     """Spec applied to ``FusedMoE`` layers."""
 
+    shared_experts: QuantSpec | None = None
+    """Spec applied only to shared-expert gate/up/down projections."""
+
     ignore: list[str] = Field(default_factory=list)
     """Layers to skip quantization for."""
 
-    @field_validator("linear", "moe", mode="before")
+    @field_validator("linear", "moe", "shared_experts", mode="before")
     @classmethod
     def _coerce_spec(cls, v: Any, info: ValidationInfo) -> Any:
         if not isinstance(v, str):
             return v
         field_name = info.field_name
         assert field_name is not None
-        if v in _ONLINE_SHORTHANDS:
+        if v in _ONLINE_SHORTHANDS and field_name != "shared_experts":
             spec = getattr(_ONLINE_SHORTHANDS[v], field_name)
             if spec is None:
                 raise ValueError(
@@ -144,6 +147,28 @@ ONLINE_QUANT_SHORTHAND_NAMES: tuple[str, ...] = (
 )
 
 
+# Checkpoint formats that support overlaying online MXFP8 on BF16 shared-expert
+# projections which the checkpoint explicitly leaves unquantized.
+_MODELOPT_SHARED_EXPERT_OVERLAY_NAMES = frozenset(
+    {"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"}
+)
+
+
+def _is_modelopt_shared_expert_overlay(
+    quantization: str | None, args: QuantizationConfigArgs
+) -> bool:
+    spec = args.shared_experts
+    return (
+        quantization in _MODELOPT_SHARED_EXPERT_OVERLAY_NAMES
+        and args.linear is None
+        and args.moe is None
+        and spec is not None
+        and spec.weight == kMxfp8Dynamic
+        and spec.activation is None
+        and not args.ignore
+    )
+
+
 def resolve_quantization_config(
     quantization: str | None,
     quantization_config: dict[str, Any] | QuantizationConfigArgs | None,
@@ -151,27 +176,31 @@ def resolve_quantization_config(
     """Resolve `--quantization` shorthand and `--quantization-config` into a
     QuantizationConfigArgs.
 
-    `quantization` is a CLI shorthand that desugars into a base config via
+    `quantization` may be a CLI shorthand that desugars into a base config via
     `_ONLINE_SHORTHANDS`. `quantization_config` is a dict or pre-built args
-    object. When both are given, fields explicitly set in `quantization_config`
-    take precedence over the shorthand.
+    object. When both are online settings, fields explicitly set in
+    `quantization_config` take precedence over the shorthand. ModelOpt also
+    accepts the MXFP8 shared-expert overlay.
     """
+    if isinstance(quantization_config, dict):
+        quantization_config = QuantizationConfigArgs(**quantization_config)
+
     if quantization is not None and quantization not in ONLINE_QUANT_SHORTHAND_NAMES:
-        if quantization_config is not None:
+        if quantization_config is not None and not _is_modelopt_shared_expert_overlay(
+            quantization, quantization_config
+        ):
             raise ValueError(
                 f"quantization_config is only supported when quantization is "
-                f"one of {sorted(ONLINE_QUANT_SHORTHAND_NAMES)}, "
+                f"one of {sorted(ONLINE_QUANT_SHORTHAND_NAMES)}, or when "
+                f"using the ModelOpt MXFP8 shared-expert overlay, "
                 f"got quantization={quantization!r}"
             )
-        return None
+        return quantization_config
 
     base = _ONLINE_SHORTHANDS.get(quantization) if quantization else None
 
     if quantization_config is None:
         return base
-
-    if isinstance(quantization_config, dict):
-        quantization_config = QuantizationConfigArgs(**quantization_config)
 
     if base is None:
         return quantization_config
@@ -179,5 +208,6 @@ def resolve_quantization_config(
     return QuantizationConfigArgs(
         linear=quantization_config.linear or base.linear,
         moe=quantization_config.moe or base.moe,
+        shared_experts=quantization_config.shared_experts,
         ignore=quantization_config.ignore or base.ignore,
     )
