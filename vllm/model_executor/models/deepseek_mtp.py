@@ -17,6 +17,10 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
+    scaled_dequantize,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -38,6 +42,133 @@ from .deepseek_v2 import (
 from .utils import get_pp_missing_layer_names, maybe_prefix
 
 logger = init_logger(__name__)
+
+
+def _maybe_remap_fp8_scale_inv_name(
+    name: str, params_dict: dict[str, torch.nn.Parameter]
+) -> str:
+    """Map FP8 checkpoint scale_inv names to CT runtime scale params."""
+    if name in params_dict:
+        return name
+    if "weight_scale_inv" not in name:
+        return name
+    alt_name = name.replace("weight_scale_inv", "weight_scale")
+    return alt_name if alt_name in params_dict else name
+
+
+def _maybe_pad_glm_mtp_fused_qkv_fp8_weight(
+    name: str,
+    tensor: torch.Tensor,
+    param: torch.nn.Parameter,
+    shard_id: int | str | None,
+) -> torch.Tensor:
+    """Pad GLM FP8 MTP fused KV-A rows to CUTLASS block shape.
+
+    The checkpoint stores q_a and kv_a separately as 2048 and 576 rows. The
+    runtime fused block-FP8 module pads kv_a to 640 rows so the physical output
+    dimension is a full 128-row block. Do the corresponding zero padding before
+    vLLM's generic merged-column loader narrows by the padded shard size.
+    """
+    if (
+        shard_id != 1
+        or not name.endswith("self_attn.fused_qkv_a_proj.weight")
+        or tensor.dtype != torch.float8_e4m3fn
+    ):
+        return tensor
+
+    output_dim = getattr(param, "output_dim", 0)
+    if tensor.shape[output_dim] != 576:
+        return tensor
+
+    padded_size = 640
+    pad_shape = list(tensor.shape)
+    pad_shape[output_dim] = padded_size - tensor.shape[output_dim]
+    padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+    logger.info_once(
+        "Padding GLM FP8 MTP fused_qkv_a_proj kv_a checkpoint shard for %s: "
+        "loaded shape %s -> output-dim %d padded to %d rows",
+        name,
+        tuple(tensor.shape),
+        output_dim,
+        padded_size,
+    )
+    return torch.cat((tensor, padding), dim=output_dim)
+
+
+def _try_load_fp8_linear_as_bf16(
+    name: str,
+    tensor: torch.Tensor,
+    buf: dict[str, dict[str, torch.Tensor]],
+    params_dict: dict[str, torch.nn.Parameter],
+    loaded_params: set[str],
+    shard_id: int | str | None = None,
+) -> bool:
+    is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+    is_scale_inv = name.endswith(".weight_scale_inv")
+    is_mxfp8_scale = name.endswith(".weight_scale") and tensor.dtype == torch.uint8
+    if not is_weight and not is_scale_inv and not is_mxfp8_scale:
+        return False
+
+    if is_weight:
+        base_name = name.rsplit(".", 1)[0]
+    elif is_scale_inv:
+        base_name = name.removesuffix(".weight_scale_inv")
+    else:
+        base_name = name.removesuffix(".weight_scale")
+    weight_name = f"{base_name}.weight"
+    scale_inv_name = f"{base_name}.weight_scale_inv"
+    mxfp8_scale_name = f"{base_name}.weight_scale"
+
+    # If the runtime module registered an FP8 scale parameter, let the normal
+    # quantized loader handle it.
+    if (
+        _maybe_remap_fp8_scale_inv_name(scale_inv_name, params_dict) in params_dict
+        or mxfp8_scale_name in params_dict
+    ):
+        return False
+    if weight_name not in params_dict:
+        return False
+
+    buffer_key = base_name if shard_id is None else f"{base_name}:{shard_id}"
+    entry = buf.setdefault(buffer_key, {})
+    if is_weight:
+        entry["weight"] = tensor
+    elif is_scale_inv:
+        entry["scale_inv"] = tensor
+    else:
+        entry["mxfp8_scale"] = tensor
+    if "weight" not in entry or (
+        "scale_inv" not in entry and "mxfp8_scale" not in entry
+    ):
+        return True
+
+    weight_fp8 = entry["weight"]
+    del buf[buffer_key]
+
+    if "scale_inv" in entry:
+        scale_inv = entry["scale_inv"]
+        block_size = weight_fp8.shape[1] // scale_inv.shape[1]
+        weight_bf16 = scaled_dequantize(
+            weight_fp8,
+            scale_inv,
+            group_shape=GroupShape(block_size, block_size),
+            out_dtype=torch.bfloat16,
+        )
+    else:
+        from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+            dequant_mxfp8_to_bf16,
+        )
+
+        weight_bf16 = dequant_mxfp8_to_bf16(weight_fp8, entry["mxfp8_scale"])
+
+    param = params_dict[weight_name]
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    if shard_id is None:
+        weight_loader(param, weight_bf16)
+    else:
+        weight_loader(param, weight_bf16, shard_id)
+    loaded_params.add(weight_name)
+    return True
 
 
 class SharedHead(nn.Module):
@@ -321,6 +452,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         _pending_wk_fp8: dict = {}  # FP8 indexer wk dequant buffer
+        _pending_fp8_linear: dict = {}
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
@@ -339,6 +471,14 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 params_dict,
                 loaded_params,
                 pp_missing_layer_names,
+            ):
+                continue
+            if _try_load_fp8_linear_as_bf16(
+                name,
+                loaded_weight,
+                _pending_fp8_linear,
+                params_dict,
+                loaded_params,
             ):
                 continue
 
@@ -360,18 +500,55 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
 
                 # QKV fusion is optional, fall back to normal
                 # weight loading if it's not enabled
-                if (
-                    param_name == "fused_qkv_a_proj"
-                ) and name_mapped not in params_dict:
-                    continue
-                else:
-                    name = name_mapped
+                if param_name == "fused_qkv_a_proj":
+                    # FP8 checkpoints provide scale tensors as
+                    # *.weight_scale_inv or MXFP8 *.weight_scale, while the
+                    # fused runtime module may only expose the fused BF16
+                    # weight. Do not skip those scale tensors before the
+                    # fallback loader has a chance to pair them with the fused
+                    # weight.
+                    has_fused_target = name_mapped in params_dict
+                    if name_mapped.endswith((".weight_scale_inv", ".weight_scale")):
+                        if name_mapped.endswith(".weight_scale_inv"):
+                            fused_weight = (
+                                name_mapped.removesuffix(".weight_scale_inv")
+                                + ".weight"
+                            )
+                        else:
+                            fused_weight = (
+                                name_mapped.removesuffix(".weight_scale") + ".weight"
+                            )
+                        has_fused_target = (
+                            has_fused_target
+                            or fused_weight in params_dict
+                            or _maybe_remap_fp8_scale_inv_name(
+                                name_mapped, params_dict
+                            )
+                            in params_dict
+                        )
+                    if not has_fused_target:
+                        continue
+                name = name_mapped
+
+                if _try_load_fp8_linear_as_bf16(
+                    name,
+                    loaded_weight,
+                    _pending_fp8_linear,
+                    params_dict,
+                    loaded_params,
+                    shard_id=shard_id,
+                ):
+                    break
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
 
+                name = _maybe_remap_fp8_scale_inv_name(name, params_dict)
                 param = params_dict[name]
+                loaded_weight = _maybe_pad_glm_mtp_fused_qkv_fp8_weight(
+                    name, loaded_weight, param, shard_id
+                )
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -437,6 +614,9 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         # Do not modify `name` since the loop may continue here
                         # Instead, create a new variable
                         name_mapped = chunk_name.replace(weight_name, param_name)
+                        name_mapped = _maybe_remap_fp8_scale_inv_name(
+                            name_mapped, params_dict
+                        )
 
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or
@@ -474,6 +654,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         if name is None:
                             continue
 
+                        name = _maybe_remap_fp8_scale_inv_name(name, params_dict)
                         # According to DeepSeek-V3 Technical Report, MTP modules
                         # shares embedding layer. We only load the first weights.
                         if (
@@ -486,7 +667,14 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         weight_loader = getattr(
                             param, "weight_loader", default_weight_loader
                         )
-                        weight_loader(param, loaded_weight)
+                        try:
+                            weight_loader(param, loaded_weight)
+                        except AssertionError as e:
+                            raise AssertionError(
+                                "MTP weight shape mismatch while loading "
+                                f"{name}: param={tuple(param.shape)} "
+                                f"loaded={tuple(loaded_weight.shape)}"
+                            ) from e
             if not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
 
