@@ -486,11 +486,22 @@ class CustomAllreduce:
             else:
                 dma = None
                 dma_error: Exception | None = None
+                dma_fp8 = os.getenv(
+                    "VLLM_PCIE_DMA_FP8", os.getenv("B12X_PCIE_DMA_FP8", "")
+                )
+                logger.info(
+                    "b12x PCIe DMA allreduce fp8 request: "
+                    "VLLM_PCIE_DMA_FP8=%r B12X_PCIE_DMA_FP8=%r -> %r",
+                    os.getenv("VLLM_PCIE_DMA_FP8"),
+                    os.getenv("B12X_PCIE_DMA_FP8"),
+                    dma_fp8,
+                )
                 try:
                     dma = dma_cls(
                         exchange_group=self.nccl_group,
                         device=self.device,
                         max_bytes=pcie_buffer_size,
+                        fp8=dma_fp8,
                     )
                 except Exception as exc:
                     dma_error = exc
@@ -508,7 +519,9 @@ class CustomAllreduce:
                         dma_error,
                     )
                 else:
+                    assert dma is not None
                     self._pcie_dma = dma
+                    logger.info("b12x PCIe DMA allreduce wire mode: %s", dma.wire_mode)
 
             # One quick sweep from 1 row to the prefill chunk size using the
             # real kernels (fused AR+RMSNorm, the DMA allreduce, and NCCL +
