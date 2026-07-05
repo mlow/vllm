@@ -36,10 +36,15 @@ if(VLLM_FLASH_ATTN_SRC_DIR)
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
+  set(VLLM_FLASH_ATTN_GIT_SUBMODULES "")
+  if(VLLM_GPU_LANG STREQUAL "CUDA")
+    set(VLLM_FLASH_ATTN_GIT_SUBMODULES "csrc/cutlass")
+  endif()
   FetchContent_Declare(
           vllm-flash-attn
           GIT_REPOSITORY https://github.com/vllm-project/flash-attention.git
-          GIT_TAG b3964b1d8b95d8e8447435668ab169a2700bab65
+          GIT_TAG 2c839c33742309ec41e620bf837495ec9926c56e
+          GIT_SUBMODULES ${VLLM_FLASH_ATTN_GIT_SUBMODULES}
           GIT_PROGRESS TRUE
           # Don't share the vllm-flash-attn build between build types
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
