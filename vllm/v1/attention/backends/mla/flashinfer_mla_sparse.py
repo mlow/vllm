@@ -348,21 +348,34 @@ class FlashInferMLASparseMetadataBuilder(
         )
 
 
-# Global workspace buffer (lazily initialized)
-_fi_sparse_workspace: torch.Tensor | None = None
+# Global FlashInfer sparse-MLA workspaces, one per CUDA device.
+#
+# vLLM workers are single-device in normal serving, but tests and warmup helpers
+# can construct this backend on different CUDA devices in one process. Keying
+# the scratch buffer by device avoids reusing a tensor allocated on another GPU.
+_fi_sparse_workspace_by_device: dict[torch.device, torch.Tensor] = {}
+
+
+def _normalize_workspace_device(device: torch.device) -> torch.device:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    return device
 
 
 def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
-    global _fi_sparse_workspace
-    if _fi_sparse_workspace is None:
+    device = _normalize_workspace_device(device)
+    workspace = _fi_sparse_workspace_by_device.get(device)
+    if workspace is None:
         # FlashInfer's CuteDSL MLA-decode tactic requires an int8 workspace;
         # the trtllm-gen path views it as uint8, so int8 is safe for all backends.
-        _fi_sparse_workspace = torch.zeros(
+        workspace = torch.zeros(
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
             dtype=torch.int8,
             device=device,
         )
-    return _fi_sparse_workspace
+        _fi_sparse_workspace_by_device[device] = workspace
+    return workspace
 
 
 class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata]):
