@@ -58,6 +58,18 @@ if TYPE_CHECKING:
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
+    VLLM_USE_B12X_SPARSE_INDEXER: bool = False
+    VLLM_USE_B12X_MHC: bool = False
+    VLLM_USE_B12X_FP8_GEMM: bool = False
+    VLLM_USE_B12X_WO_PROJECTION: bool = False
+    VLLM_USE_B12X_MOE: bool = False
+    VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
+    VLLM_USE_B12X_DCP_A2A: bool = False
+    VLLM_DCP_SHARD_DRAFT: str | None = None
+    VLLM_DCP_GLOBAL_TOPK: bool = True
+    VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
+    VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
+    VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: Literal["auto", "nccl", "shm"] = "auto"
     VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: bool = False
     VLLM_USE_RAY_WRAPPED_PP_COMM: bool = True
@@ -198,6 +210,12 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
+    VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
+    VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = True
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -1026,6 +1044,60 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Use b12x for the DeepSeek V4 C4 sparse indexer and its top-k selection.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_SPARSE_INDEXER", "0"))
+    ),
+    # Use b12x for DeepSeek V4 mHC pre/post residual mixing.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_MHC": lambda: bool(int(os.getenv("VLLM_USE_B12X_MHC", "0"))),
+    # Use b12x for block-scaled FP8 linear GEMMs.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_FP8_GEMM": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_FP8_GEMM", "0"))
+    ),
+    # Use b12x for the DeepSeek V4 WO-A/WO-B fused projection.
+    # This is separate from the generic FP8 linear switch for perf isolation.
+    "VLLM_USE_B12X_WO_PROJECTION": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_WO_PROJECTION", "0"))
+    ),
+    # Use b12x for FP4 MoE experts.
+    # This is opt-in while the b12x subsystems are brought over one at a time.
+    "VLLM_USE_B12X_MOE": lambda: bool(int(os.getenv("VLLM_USE_B12X_MOE", "0"))),
+    # Use b12x for MiniMax M3's block-sparse MSA attention.
+    # This is opt-in while page-128 MSA support is integrated.
+    "VLLM_USE_B12X_MINIMAX_M3_MSA": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_MINIMAX_M3_MSA", "0"))
+    ),
+    # Use b12x PCIe collectives for DCP query gather and output reduction.
+    "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
+    # Shard the draft model's DCP caches like the target model. Truthy values:
+    # "1"/"true"/"yes". Unset picks a per-call-site default: sharded for the
+    # target indexer cache and native MTP drafts, replicated for external
+    # (Eagle-style) drafts.
+    "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT", None),
+    # Under DCP, gather sparse-indexer logits across ranks and select a global
+    # top-k instead of a per-rank local top-k.
+    "VLLM_DCP_GLOBAL_TOPK": lambda: (
+        os.getenv("VLLM_DCP_GLOBAL_TOPK", "1").lower() in ("1", "true", "yes", "on")
+    ),
+    # Diagnostic flag retained for local experiments. MiniMax M3 compile is
+    # fail-closed in the model until the no-break path is validated.
+    "VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE", "0"))
+    ),
+    # Re-run every B12X piecewise subgraph eagerly immediately before capture.
+    # PIECEWISE descriptors already receive an eager full-forward warmup before
+    # capture, so this remains opt-in for debugging kernels that still need it.
+    "VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM": lambda: bool(
+        int(os.getenv("VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM", "0"))
+    ),
+    # Force DeepSeek V4 native MXFP4/E8M0 MoE weights through b12x's
+    # native/modelopt-layout W4A16 prep path.
+    "VLLM_B12X_MOE_FORCE_MODELOPT_PREP": lambda: bool(
+        int(os.getenv("VLLM_B12X_MOE_FORCE_MODELOPT_PREP", "0"))
+    ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests
     "VLLM_KEEP_ALIVE_ON_ENGINE_DEATH": lambda: bool(
@@ -1599,6 +1671,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
         "auto",
         ["auto", "trtllm", "mnnvl"],
+    ),
+    # Opt in to the b12x PCIe oneshot custom allreduce path on PCIe-only GPUs.
+    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
+    "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
+        "VLLM_PCIE_ALLREDUCE_BACKEND",
+        "cpp",
+        ["b12x", "cpp"],
+    ),
+    # Max input size for the b12x PCIe oneshot allreduce dispatch.
+    # Accepts raw bytes or a KB/MB suffix (e.g. "84KB").
+    "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE", "84KB"
+    ),
+    # Max input size for the b12x PCIe fused allreduce+add_rms_norm dispatch.
+    "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
+        "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
+    ),
+    # Allow the b12x PCIe oneshot allreduce on cross-NUMA PCIe topologies.
+    "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA": lambda: (
+        os.getenv("VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1") != "0"
+    ),
+    # Use a single channel for the b12x PCIe oneshot allreduce.
+    "VLLM_PCIE_ONESHOT_SINGLE_CHANNEL": lambda: (
+        os.getenv("VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", "1").strip().lower()
+        not in ("", "0", "false", "no", "off")
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(

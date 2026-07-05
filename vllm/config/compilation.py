@@ -758,6 +758,7 @@ class CompilationConfig:
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
         "vllm::rocm_aiter_sparse_attn_indexer",
+        "vllm::minimax_m3_sparse_attention_with_output",
         "vllm::deepseek_v4_attention",
         "vllm::hpc_rope_norm_forward",
     ]
@@ -1139,6 +1140,7 @@ class CompilationConfig:
                         self.pass_config.fuse_rope_kvcache = False
                     self.splitting_ops.append("vllm::unified_kv_cache_update")
                     self.splitting_ops.append("vllm::unified_mla_kv_cache_update")
+                    self.splitting_ops.append("vllm::minimax_m3_sparse_kv_cache_update")
 
             elif len(self.splitting_ops) == 0:
                 if (
@@ -1247,6 +1249,7 @@ class CompilationConfig:
         kv_cache_update_ops = [
             "vllm::unified_kv_cache_update",
             "vllm::unified_mla_kv_cache_update",
+            "vllm::minimax_m3_sparse_kv_cache_update",
         ]
         return self.splitting_ops is not None and all(
             op in self.splitting_ops for op in kv_cache_update_ops
