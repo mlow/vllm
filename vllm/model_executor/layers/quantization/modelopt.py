@@ -59,6 +59,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.compressed_tensors.utils import (
+    should_ignore_layer,
+)
 from vllm.model_executor.layers.quantization.online.mxfp8 import (
     Mxfp8OnlineLinearMethod,
     is_shared_expert_projection,
@@ -208,6 +211,48 @@ class ModelOptQuantConfigBase(QuantizationConfig):
             )
         return Mxfp8OnlineLinearMethod()
 
+    def _get_dense_linear_online_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        """Overlay online MXFP8 on BF16 dense linears the checkpoint excludes.
+
+        Shared-expert projections are governed exclusively by the
+        ``shared_experts`` spec (see ``_get_shared_expert_online_method``), so
+        they are never selected here; ``quantization_config.ignore`` entries
+        (exact names or ``re:`` regexes, matched on unfused shard names) keep
+        individual modules on the unquantized BF16 path.
+        """
+        if not isinstance(layer, LinearBase) or is_shared_expert_projection(prefix):
+            return None
+
+        vllm_config = get_current_vllm_config_or_none()
+        if vllm_config is None:
+            return None
+        args = vllm_config.model_config.quantization_config
+        if not isinstance(args, QuantizationConfigArgs):
+            return None
+        spec = args.linear
+        if spec is None:
+            return None
+        if args.ignore and should_ignore_layer(
+            prefix,
+            ignore=args.ignore,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            return None
+        if spec.weight != kMxfp8Dynamic or spec.activation is not None:
+            raise ValueError(
+                "ModelOpt dense-linear overlay only supports "
+                "weight='mxfp8' with no activation override."
+            )
+        logger.info_once(
+            "ModelOpt dense-linear overlay: quantizing checkpoint-excluded "
+            "BF16 linears to MXFP8 at load time (module example: %s).",
+            prefix,
+        )
+        logger.debug("MXFP8 dense-linear overlay applied to %s", prefix)
+        return Mxfp8OnlineLinearMethod()
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -219,6 +264,9 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         if self.is_layer_excluded(prefix):
             if method := self._get_shared_expert_online_method(layer, prefix):
                 return method
+            if not isinstance(layer, ParallelLMHead):
+                if method := self._get_dense_linear_online_method(layer, prefix):
+                    return method
             if isinstance(layer, (LinearBase, ParallelLMHead)):
                 return UnquantizedLinearMethod()
             return None

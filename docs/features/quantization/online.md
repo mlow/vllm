@@ -98,6 +98,49 @@ vllm serve <glm-5.2-modelopt-checkpoint> \
 Serialized checkpoint-quantized shared experts are preserved; only excluded
 BF16 projection weights are converted at load time.
 
+### MXFP8 dense linears on ModelOpt checkpoints
+
+The `linear` field overlays online MXFP8 the same way onto every other
+BF16 dense linear the ModelOpt checkpoint excludes: attention projections,
+dense (non-expert) MLPs, and indexer projections. Shared-expert projections
+are never selected by `linear` — they remain governed exclusively by
+`shared_experts` — and modules matched by `ignore` (exact names or `re:`
+regexes against unfused shard names) stay BF16. Routers, `lm_head`,
+embeddings, and plain `nn.Linear` modules (e.g. GLM's MTP `eh_proj`) are
+never touched.
+
+This reproduces a fully offline-requantized "MXFP8 dense" checkpoint
+bit-exactly from the original BF16-dense checkpoint at load time. For a
+GLM 5.2 ModelOpt NVFP4 checkpoint there are two supported recipes:
+
+MXFP8 dense + MXFP8 shared experts + NVFP4 routed experts:
+
+```bash
+vllm serve lukealonso/GLM-5.2-NVFP4 \
+  --quantization modelopt_fp4 \
+  --quantization-config '{"linear":{"weight":"mxfp8"},"shared_experts":{"weight":"mxfp8"}}'
+```
+
+MXFP8 dense + BF16 shared experts + NVFP4 routed experts:
+
+```bash
+vllm serve lukealonso/GLM-5.2-NVFP4 \
+  --quantization modelopt_fp4 \
+  --quantization-config.linear.weight mxfp8
+```
+
+Recommended GLM 5.2 recipe — additionally keep `kv_b_proj` in BF16. MLA
+attention dequantizes `kv_b_proj` at load time to build its absorbed
+`W_UK`/`W_UV` matrices, so quantizing it buys no speed and only adds
+rounding noise to every attention read; excluding it measured the smallest
+per-token deviation from the BF16-dense reference at identical throughput:
+
+```bash
+vllm serve lukealonso/GLM-5.2-NVFP4 \
+  --quantization modelopt_fp4 \
+  --quantization-config '{"linear":{"weight":"mxfp8"},"ignore":["re:.*kv_b_proj"]}'
+```
+
 ### Activation overrides on already-quantized checkpoints
 
 For checkpoint-quantized models, `quantization_config` lets you pick an

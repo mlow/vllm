@@ -107,6 +107,128 @@ def test_modelopt_nvfp4_quantizes_parallel_lm_head():
     assert isinstance(method, ModelOptNvFp4LinearMethod)
 
 
+def test_modelopt_nvfp4_online_quantizes_bf16_dense_linears():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=[
+            "model.layers.*.self_attn*",
+            "*shared_experts*",
+            "lm_head",
+        ],
+    )
+    current_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=QuantizationConfigArgs(linear="mxfp8")
+        )
+    )
+    sentinel = MagicMock()
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "get_current_vllm_config_or_none",
+            return_value=current_config,
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.Mxfp8OnlineLinearMethod",
+            return_value=sentinel,
+        ),
+    ):
+        attn_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+        )
+        indexer_method = config.get_quant_method(
+            _mock_linear(), "model.layers.0.self_attn.indexer.wq_b"
+        )
+        # shared experts are governed solely by the shared_experts spec
+        shared_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.down_proj"
+        )
+        lm_head_method = config.get_quant_method(_mock_lm_head(), "lm_head")
+
+    assert attn_method is sentinel
+    assert indexer_method is sentinel
+    assert isinstance(shared_method, UnquantizedLinearMethod)
+    assert isinstance(lm_head_method, UnquantizedLinearMethod)
+
+
+def test_modelopt_nvfp4_dense_overlay_honors_ignore():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=["model.layers.*.self_attn*"],
+    )
+    current_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=QuantizationConfigArgs(
+                linear="mxfp8",
+                ignore=["re:.*o_proj"],
+            )
+        )
+    )
+    sentinel = MagicMock()
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "get_current_vllm_config_or_none",
+            return_value=current_config,
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.Mxfp8OnlineLinearMethod",
+            return_value=sentinel,
+        ),
+    ):
+        kv_b_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+        )
+        o_proj_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.o_proj"
+        )
+
+    assert kv_b_method is sentinel
+    assert isinstance(o_proj_method, UnquantizedLinearMethod)
+
+
+def test_modelopt_nvfp4_dense_overlay_composes_with_shared_experts():
+    config = ModelOptNvFp4Config(
+        is_checkpoint_nvfp4_serialized=True,
+        kv_cache_quant_algo=None,
+        exclude_modules=["model.layers.*.self_attn*", "*shared_experts*"],
+    )
+    current_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            quantization_config=QuantizationConfigArgs(
+                linear="mxfp8",
+                shared_experts="mxfp8",
+            )
+        )
+    )
+    dense_sentinel = MagicMock()
+
+    with (
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt."
+            "get_current_vllm_config_or_none",
+            return_value=current_config,
+        ),
+        patch(
+            "vllm.model_executor.layers.quantization.modelopt.Mxfp8OnlineLinearMethod",
+            return_value=dense_sentinel,
+        ),
+    ):
+        attn_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.self_attn.kv_b_proj"
+        )
+        shared_method = config.get_quant_method(
+            _mock_linear(), "model.layers.3.mlp.shared_experts.gate_up_proj"
+        )
+
+    assert attn_method is dense_sentinel
+    assert shared_method is dense_sentinel
+
+
 def test_modelopt_nvfp4_online_quantizes_bf16_shared_experts():
     config = ModelOptNvFp4Config(
         is_checkpoint_nvfp4_serialized=True,

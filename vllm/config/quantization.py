@@ -147,25 +147,27 @@ ONLINE_QUANT_SHORTHAND_NAMES: tuple[str, ...] = (
 )
 
 
-# Checkpoint formats that support overlaying online MXFP8 on BF16 shared-expert
-# projections which the checkpoint explicitly leaves unquantized.
-_MODELOPT_SHARED_EXPERT_OVERLAY_NAMES = frozenset(
+# Checkpoint formats that support overlaying online MXFP8 on BF16 projections
+# which the checkpoint explicitly leaves unquantized (shared experts via
+# `shared_experts`, other dense linears via `linear`).
+_MODELOPT_MXFP8_OVERLAY_NAMES = frozenset(
     {"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"}
 )
 
 
-def _is_modelopt_shared_expert_overlay(
+def _is_modelopt_mxfp8_overlay(
     quantization: str | None, args: QuantizationConfigArgs
 ) -> bool:
-    spec = args.shared_experts
-    return (
-        quantization in _MODELOPT_SHARED_EXPERT_OVERLAY_NAMES
-        and args.linear is None
-        and args.moe is None
-        and spec is not None
-        and spec.weight == kMxfp8Dynamic
-        and spec.activation is None
-        and not args.ignore
+    if quantization not in _MODELOPT_MXFP8_OVERLAY_NAMES or args.moe is not None:
+        return False
+    specs = [s for s in (args.linear, args.shared_experts) if s is not None]
+    if not specs:
+        return False
+    if args.ignore and args.linear is None:
+        # `ignore` only filters the dense-linear overlay.
+        return False
+    return all(
+        spec.weight == kMxfp8Dynamic and spec.activation is None for spec in specs
     )
 
 
@@ -186,13 +188,14 @@ def resolve_quantization_config(
         quantization_config = QuantizationConfigArgs(**quantization_config)
 
     if quantization is not None and quantization not in ONLINE_QUANT_SHORTHAND_NAMES:
-        if quantization_config is not None and not _is_modelopt_shared_expert_overlay(
+        if quantization_config is not None and not _is_modelopt_mxfp8_overlay(
             quantization, quantization_config
         ):
             raise ValueError(
                 f"quantization_config is only supported when quantization is "
                 f"one of {sorted(ONLINE_QUANT_SHORTHAND_NAMES)}, or when "
-                f"using the ModelOpt MXFP8 shared-expert overlay, "
+                f"using the ModelOpt MXFP8 overlay (weight='mxfp8' on "
+                f"'shared_experts' and/or 'linear', optional 'ignore'), "
                 f"got quantization={quantization!r}"
             )
         return quantization_config

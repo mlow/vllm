@@ -129,6 +129,44 @@ def test_resolve_allows_modelopt_shared_expert_overlay():
     assert args == QuantizationConfigArgs(shared_experts="mxfp8")
 
 
+def test_resolve_allows_modelopt_dense_linear_overlay():
+    args = resolve_quantization_config(
+        "modelopt_fp4",
+        {"linear": {"weight": "mxfp8"}},
+    )
+    assert args == QuantizationConfigArgs(linear={"weight": "mxfp8"})
+
+
+def test_resolve_allows_modelopt_combined_overlay_with_ignore():
+    args = resolve_quantization_config(
+        "modelopt_fp4",
+        {
+            "linear": {"weight": "mxfp8"},
+            "shared_experts": "mxfp8",
+            "ignore": ["re:.*o_proj"],
+        },
+    )
+    assert args.linear == QuantSpec(weight=kMxfp8Dynamic)
+    assert args.shared_experts == QuantSpec(weight=kMxfp8Dynamic)
+    assert args.ignore == ["re:.*o_proj"]
+
+
+def test_resolve_rejects_modelopt_ignore_without_linear():
+    with pytest.raises(ValueError, match="MXFP8 overlay"):
+        resolve_quantization_config(
+            "modelopt_fp4",
+            {"shared_experts": "mxfp8", "ignore": ["re:.*o_proj"]},
+        )
+
+
+def test_resolve_rejects_modelopt_moe_override():
+    with pytest.raises(ValueError, match="MXFP8 overlay"):
+        resolve_quantization_config(
+            "modelopt_fp4",
+            {"linear": {"weight": "mxfp8"}, "moe": "mxfp8"},
+        )
+
+
 def test_resolve_rejects_quantization_config_with_non_shorthand_quant():
     # If --quantization names something other than an online shorthand,
     # quantization_config is not allowed via this path (checkpoint quant
