@@ -169,9 +169,13 @@ if [[ "${GLM52_DSPARK_JSON}" == "true" ]]; then
     echo "Adaptive speculative depth enabled with a ${ADAPTIVE_SPEC_WINDOW}-step" \
       "window." >&2
   fi
+  # The dense DSpark draft must not inherit the target's fp8_ds_mla KV
+  # layout; bf16 draft KV keeps FLASH_ATTN eligible for its 5 layers.
+  DSPARK_DRAFT_KV_CACHE_DTYPE="${DSPARK_DRAFT_KV_CACHE_DTYPE:-auto}"
   DEFAULT_SPEC_CONFIG="$(
-    printf '{"model":"%s","method":"dspark"%s%s}' \
+    printf '{"model":"%s","method":"dspark","draft_kv_cache_dtype":"%s"%s%s}' \
       "${DSPARK_MODEL}" \
+      "${DSPARK_DRAFT_KV_CACHE_DTYPE}" \
       "${DSPARK_NUM_SPEC_CONFIG}" \
       "${ADAPTIVE_SPEC_CONFIG}"
   )"
@@ -289,7 +293,7 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --dcp-comm-backend "${DCP_COMM_BACKEND:-a2a}" \
   --enable-chunked-prefill \
   --enable-prefix-caching \
-  --load-format instanttensor \
+  --load-format fastsafetensors \
   --async-scheduling \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,20,24,28,32,36,40,44,48,52,56,60,64]}' \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \

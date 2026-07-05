@@ -897,11 +897,8 @@ class Worker(WorkerBase):
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
-        os.environ["B12X_VLLM_ENGINE_STARTED"] = "1"
 
-        from vllm.triton_utils.jit_monitor import (
-            activate as activate_triton_jit_monitor,
-        )
+        os.environ["B12X_VLLM_ENGINE_STARTED"] = "1"
 
         activate_jit_monitor(
             mode=self.observability_config.jit_monitor_mode,

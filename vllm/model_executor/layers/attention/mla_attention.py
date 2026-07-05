@@ -270,7 +270,10 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp_alltoall import (
+    dcp_a2a_lse_reduce,
+    dcp_b12x_all_gather_heads,
+)
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
@@ -345,7 +348,10 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
-    if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
+    if backend_name in (
+        "FLASHMLA_SPARSE",
+        "B12X_MLA_SPARSE",
+    ) and is_quantized_kv_cache(kv_cache_dtype):
         return "fp8_ds_mla"
     if backend_name == "FLASHINFER_MLA_SPARSE_SM120" and kv_cache_dtype in (
         "auto",
@@ -530,6 +536,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             _vllm_config is not None
             and _vllm_config.parallel_config.decode_context_parallel_size > 1
             and _vllm_config.parallel_config.dcp_comm_backend == "a2a"
+        )
+        self.dcp_b12x = (
+            self.dcp_a2a
+            and envs.VLLM_USE_B12X_DCP_A2A
+            and self.attn_backend.get_name() == "B12X_MLA_SPARSE"
+        )
+        self.dcp_max_batch_size = (
+            int(_vllm_config.scheduler_config.max_num_batched_tokens)
+            if _vllm_config is not None
+            else 0
         )
 
         # Initialize q/k/v range constants.
@@ -824,7 +840,15 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                     mqa_q = torch.cat(mqa_q, dim=-1)
                 # mqa_q do allgather in head dim.
-                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                if self.dcp_b12x:
+                    mqa_q = dcp_b12x_all_gather_heads(
+                        mqa_q,
+                        get_dcp_group(),
+                        max_batch_size=self.dcp_max_batch_size,
+                        output_head_dim=self.kv_lora_rank,
+                    )
+                else:
+                    mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
             # call decode attn
             if not is_sparse_impl:
@@ -839,6 +863,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                         lse,
                         get_dcp_group(),
                         is_lse_base_on_e=self.impl.lse_base_on_e,
+                        use_b12x=self.dcp_b12x,
+                        b12x_max_batch_size=self.dcp_max_batch_size,
+                        b12x_query_head_dim=(
+                            self.kv_lora_rank + self.qk_rope_head_dim
+                        ),
                     )
                 else:
                     attn_out = cp_lse_ag_out_rs(

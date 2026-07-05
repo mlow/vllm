@@ -643,11 +643,6 @@ class DFlashQwen3Model(nn.Module):
             if slot_mapping is None:
                 continue  # dummy run: skip cache ops
             attn = self._attn_layers[i]
-            layer_slot_mapping = (
-                context_slot_mapping[attn.layer_name]
-                if isinstance(context_slot_mapping, Mapping)
-                else context_slot_mapping
-            )
             kv_cache = attn.kv_cache
             attn.impl.do_kv_cache_update(
                 attn,

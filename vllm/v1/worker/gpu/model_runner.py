@@ -1235,8 +1235,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
-            input_batch = self.prepare_inputs(scheduler_output, batch_desc)
-            block_tables, slot_mappings = self.prepare_attn(input_batch)
+            with record_function_or_nullcontext("vllm:v2/target/prepare_inputs"):
+                input_batch = self.prepare_inputs(
+                    scheduler_output, batch_desc, max_query_len
+                )
+            phase = _profile_batch_phase(input_batch)
+            with record_function_or_nullcontext(
+                f"vllm:v2/target/{phase}/prepare_attn_tables"
+            ):
+                block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the

@@ -1622,8 +1622,13 @@ def sparse_attn_indexer(
             topk_indices_buffer,
             skip_k_cache_insert,
             use_fp4_cache,
+            dcp_rank,
+            dcp_world_size,
+            cp_kv_cache_interleave_size,
+            skip_topk_buffer_clear,
             use_b12x_sparse_indexer,
             output_physical_slots,
+            topk_scores_buffer,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -1631,9 +1636,8 @@ def sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
-    dcp_world_size = attn_metadata_narrowed.dcp_world_size
-    dcp_rank = attn_metadata_narrowed.dcp_rank
-    cp_kv_cache_interleave_size = attn_metadata_narrowed.cp_interleave_size
+    # DCP scalars arrive as op arguments (resolved once at layer construction),
+    # not through per-step metadata.
     dcp_global_topk = _dcp_global_topk_requested() and dcp_world_size > 1
     if output_physical_slots:
         if not _use_b12x_sparse_indexer(use_b12x_sparse_indexer):
@@ -1717,24 +1721,23 @@ def sparse_attn_indexer(
             if use_b12x_indexer and chunk.total_seq_lens <= 0:
                 topk_indices.fill_(-1)
                 if dcp_global_topk:
-                    if True:
-                        if topk_scores_buffer is None:
-                            raise RuntimeError(
-                                "B12X sparse indexer DCP requires topk_scores_buffer."
-                            )
-                        topk_scores = topk_scores_buffer[
-                            chunk.token_start : chunk.token_end, :topk_tokens
-                        ]
-                        topk_scores.fill_(-float("inf"))
-                        _merge_b12x_dcp_topk(
-                            topk_indices=topk_indices,
-                            topk_scores=topk_scores,
-                            topk_tokens=topk_tokens,
-                            dcp_world_size=dcp_world_size,
-                            dcp_rank=dcp_rank,
-                            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                    if topk_scores_buffer is None:
+                        raise RuntimeError(
+                            "B12X sparse indexer DCP requires topk_scores_buffer."
                         )
-                        topk_indices.masked_fill_(topk_scores == -float("inf"), -1)
+                    topk_scores = topk_scores_buffer[
+                        chunk.token_start : chunk.token_end, :topk_tokens
+                    ]
+                    topk_scores.fill_(-float("inf"))
+                    _merge_b12x_dcp_topk(
+                        topk_indices=topk_indices,
+                        topk_scores=topk_scores,
+                        topk_tokens=topk_tokens,
+                        dcp_world_size=dcp_world_size,
+                        dcp_rank=dcp_rank,
+                        cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                    )
+                    topk_indices.masked_fill_(topk_scores == -float("inf"), -1)
                 continue
 
             if use_b12x_indexer:
@@ -2093,7 +2096,9 @@ def sparse_attn_indexer(
                 topk_indices,
                 topk_workspace,
                 topk_tokens,
-                logits.shape[1],
+                decode_metadata.max_seq_len
+                if decode_metadata.max_seq_len is not None
+                else logits.shape[1],
             )
         else:
             ops.top_k_per_row_decode(
