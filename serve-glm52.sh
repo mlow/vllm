@@ -74,6 +74,14 @@ while (($#)); do
       GLM51_DISABLE_MTP=1
       shift
       ;;
+    --dspark)
+      GLM52_DSPARK=1
+      shift
+      ;;
+    --no-dspark)
+      GLM52_DSPARK=0
+      shift
+      ;;
     *)
       VLLM_EXTRA_ARGS+=("$1")
       shift
@@ -101,6 +109,8 @@ ATTENTION_BACKEND="${ATTENTION_BACKEND:-B12X_MLA_SPARSE}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 GLM51_PROFILE="${GLM51_PROFILE:-0}"
 GLM52_CAUSAL_CASCADE="${GLM52_CAUSAL_CASCADE:-0}"
+GLM52_DSPARK="${GLM52_DSPARK:-0}"
+DSPARK_MODEL="${DSPARK_MODEL:-RedHatAI/GLM-5.2-speculator.dspark}"
 ADAPTIVE_SPEC_WINDOW="${GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW:-}"
 
 if [[ -n "${ADAPTIVE_SPEC_WINDOW}" \
@@ -129,7 +139,47 @@ HF_OVERRIDES="${HF_OVERRIDES:-$DEFAULT_HF_OVERRIDES}"
 SPEC_ARGS=()
 CAUSAL_CASCADE_ARGS=()
 GLM52_CAUSAL_CASCADE_JSON="$(json_bool GLM52_CAUSAL_CASCADE "${GLM52_CAUSAL_CASCADE}")"
-if [[ "${GLM52_CAUSAL_CASCADE_JSON}" == "true" ]]; then
+GLM52_DSPARK_JSON="$(json_bool GLM52_DSPARK "${GLM52_DSPARK}")"
+if [[ "${GLM52_DSPARK_JSON}" == "true" && "${GLM52_CAUSAL_CASCADE_JSON}" == "true" ]]; then
+  echo "ERROR: --dspark and --causal-cascade are mutually exclusive" >&2
+  exit 1
+fi
+if [[ "${GLM52_DSPARK_JSON}" == "true" ]]; then
+  if [[ -n "${ADAPTIVE_SPEC_WINDOW}" && -n "${SPEC_CONFIG:-}" ]]; then
+    echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW cannot be combined" \
+      "with an explicit SPEC_CONFIG" >&2
+    exit 1
+  fi
+
+  # The speculators-format translation (which would read speculative_tokens
+  # from the checkpoint) only runs when the speculator is the served model,
+  # not when it is referenced from --speculative-config, so the depth must be
+  # explicit here. 7 matches RedHatAI/GLM-5.2-speculator.dspark (block_size 8
+  # = 1 bonus anchor + 7 drafts).
+  NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-7}"
+  DSPARK_NUM_SPEC_CONFIG="$(
+    printf ',"num_speculative_tokens":%s' "${NUM_SPECULATIVE_TOKENS}"
+  )"
+  ADAPTIVE_SPEC_CONFIG=""
+  if [[ -n "${ADAPTIVE_SPEC_WINDOW}" ]]; then
+    ADAPTIVE_SPEC_CONFIG="$(
+      printf ',"adaptive_speculative_tokens_window":%s' \
+        "${ADAPTIVE_SPEC_WINDOW}"
+    )"
+    echo "Adaptive speculative depth enabled with a ${ADAPTIVE_SPEC_WINDOW}-step" \
+      "window." >&2
+  fi
+  DEFAULT_SPEC_CONFIG="$(
+    printf '{"model":"%s","method":"dspark"%s%s}' \
+      "${DSPARK_MODEL}" \
+      "${DSPARK_NUM_SPEC_CONFIG}" \
+      "${ADAPTIVE_SPEC_CONFIG}"
+  )"
+  SPEC_CONFIG="${SPEC_CONFIG:-${DEFAULT_SPEC_CONFIG}}"
+  SPEC_ARGS+=(--speculative-config "${SPEC_CONFIG}")
+
+  echo "DSpark speculative decoding enabled with ${DSPARK_MODEL}." >&2
+elif [[ "${GLM52_CAUSAL_CASCADE_JSON}" == "true" ]]; then
   if [[ -n "${ADAPTIVE_SPEC_WINDOW}" ]]; then
     echo "ERROR: GLM52_ADAPTIVE_SPECULATIVE_TOKENS_WINDOW requires the MTP" \
       "speculative path; disable GLM52_CAUSAL_CASCADE" >&2
