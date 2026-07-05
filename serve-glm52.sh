@@ -93,7 +93,6 @@ GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.92}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
-MAX_CUDAGRAPH_CAPTURE_SIZE=128
 GENERATION_CONFIG="${GENERATION_CONFIG:-vllm}"
 
 MOE_BACKEND="${MOE_BACKEND:-b12x}"
@@ -240,13 +239,12 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --dcp-comm-backend "${DCP_COMM_BACKEND:-a2a}" \
   --enable-chunked-prefill \
   --enable-prefix-caching \
-  --load-format fastsafetensors \
+  --load-format instanttensor \
   --async-scheduling \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,20,24,28,32,36,40,44,48,52,56,60,64]}' \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
-  --max-cudagraph-capture-size "${MAX_CUDAGRAPH_CAPTURE_SIZE}" \
   --long-prefill-token-threshold 2048 \
   --quantization modelopt_fp4 \
   --moe-backend "${MOE_BACKEND}" \

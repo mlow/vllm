@@ -68,11 +68,10 @@ def make_b12x_custom_allreduce(
     custom_allreduce = object.__new__(CustomAllreduce)
     custom_allreduce.disabled = False
     custom_allreduce._pcie_runtime = runtime
+    custom_allreduce._pcie_dma = None
     custom_allreduce._pcie_capture_stream = None
     custom_allreduce._pcie_allreduce_max_size = allreduce_max_size
     custom_allreduce._pcie_fused_add_rms_norm_max_size = fused_max_size
-    custom_allreduce._pcie_logged_first_accept = False
-    custom_allreduce._pcie_logged_first_reject = False
     custom_allreduce._pcie_logged_first_allreduce = False
     custom_allreduce._IS_CAPTURING = False
     custom_allreduce._ptr = 0
