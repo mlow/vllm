@@ -73,6 +73,48 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     }
 )
 
+AUTO_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+        "MiniMaxM3SparseForCausalLM",
+        "MiniMaxM3SparseForConditionalGeneration",
+    }
+)
+
+
+def _should_auto_enable_breakable_cudagraph(
+    model_config: ModelConfig | None,
+) -> bool:
+    if os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") is not None:
+        return False
+    if model_config is None:
+        return False
+    return any(
+        arch in AUTO_BREAKABLE_CUDAGRAPH_ARCHITECTURES
+        for arch in model_config.architectures
+    )
+
+
+def _maybe_auto_enable_breakable_cudagraph(
+    model_config: ModelConfig | None,
+) -> bool:
+    if not _should_auto_enable_breakable_cudagraph(model_config):
+        return False
+
+    os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
+    if envs.VLLM_USE_AOT_COMPILE:
+        os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+        logger.warning_once(
+            "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1 for this "
+            "architecture, disabling VLLM_USE_AOT_COMPILE=1."
+        )
+    logger.info_once(
+        "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
+        "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
+    )
+    return True
+
 
 class OptimizationLevel(IntEnum):
     """Optimization level enum."""
@@ -126,7 +168,7 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable if TP > 1 and Hopper/Blackwell and flashinfer installed."""
+    """Enable when a supported fused all-reduce RMSNorm backend is active."""
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
@@ -137,14 +179,13 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
             rocm_aiter_ops.is_enabled() and cfg.parallel_config.tensor_parallel_size > 1
         )
 
-    return (
-        cfg.parallel_config.tensor_parallel_size > 1
-        and current_platform.is_cuda()
-        and has_flashinfer()
-        and (
-            current_platform.is_device_capability_family(100)
-            or current_platform.is_device_capability(90)
-        )
+    if cfg.parallel_config.tensor_parallel_size <= 1 or not current_platform.is_cuda():
+        return False
+    if envs.VLLM_ENABLE_PCIE_ALLREDUCE and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x":
+        return True
+    return has_flashinfer() and (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability(90)
     )
 
 
@@ -932,6 +973,9 @@ class VllmConfig:
         self.try_verify_and_update_config()
 
         if self.model_config is not None:
+            from vllm.config.virtual_tp import maybe_apply_b12x_virtual_tp_padding
+
+            maybe_apply_b12x_virtual_tp_padding(self)
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
 
@@ -1161,28 +1205,9 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # For model classes don't carry @support_torch_compile —
-        # the breakable cudagraph is the supported PIECEWISE path. Auto-enable
-        # it unless the user has explicitly opted out via the env var.
-        if (
-            self.model_config is not None
-            and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and any(
-                a
-                in (
-                    "DeepseekV4ForCausalLM",
-                    "DeepSeekV4MTPModel",
-                    "MiniMaxM3SparseForCausalLM",
-                    "MiniMaxM3SparseForConditionalGeneration",
-                )
-                for a in self.model_config.architectures
-            )
-        ):
-            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
-            logger.info_once(
-                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
-                "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
-            )
+        # These architectures prefer breakable cudagraphs unless the caller
+        # explicitly chooses a different compile path.
+        _maybe_auto_enable_breakable_cudagraph(self.model_config)
 
         if envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
             logger.warning_once(
@@ -2148,6 +2173,10 @@ class VllmConfig:
             ):
                 unsupported.append("EAGLE3 with pipeline parallelism")
 
+        # Reasoning parsers are an OpenAI serving-layer feature and are safe to
+        # use with ModelRunnerV2. The unsupported part is per-request reasoning
+        # budget enforcement, which is rejected in the V1 input processor when
+        # a request sets thinking_token_budget.
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
 
