@@ -10,21 +10,112 @@ rows directly to the CausalCascade speculator.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Any
 
+import regex as re
 import torch
 
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.spec_decode.causal_cascade_packing import pack_sparse_mla_rows
 
 logger = init_logger(__name__)
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 _LIVE_STATE: CausalCascadeLiveState | None = None
+
+
+def _capture_sparse_mla_buffers(
+    page_table_dst: torch.Tensor,
+    topk_indices_dst: torch.Tensor,
+    nsa_lens_dst: torch.Tensor,
+    cache_lens_dst: torch.Tensor,
+    req_ids_dst: torch.Tensor,
+    token_ids_dst: torch.Tensor,
+    page_table_src: torch.Tensor,
+    topk_indices_src: torch.Tensor | None,
+    nsa_lens_src: torch.Tensor,
+    cache_lens_src: torch.Tensor,
+    req_ids_src: torch.Tensor | None,
+    token_ids_src: torch.Tensor | None,
+    num_rows: int,
+    topk: int,
+) -> None:
+    """Copy one verifier layer's live inputs behind an opaque graph boundary."""
+    page_table_dst[:num_rows, :topk].copy_(page_table_src[:num_rows, :topk])
+    if topk_indices_src is None:
+        topk_indices_dst[:num_rows, :topk].fill_(-1)
+    else:
+        topk_indices_dst[:num_rows, :topk].copy_(topk_indices_src[:num_rows, :topk])
+    nsa_lens_dst[:num_rows].copy_(nsa_lens_src[:num_rows])
+    cache_lens_dst[:num_rows].copy_(cache_lens_src[:num_rows])
+    if req_ids_src is None:
+        req_ids_dst[:num_rows].fill_(-1)
+    else:
+        req_ids_dst[:num_rows].copy_(req_ids_src[:num_rows])
+    if token_ids_src is not None:
+        token_ids_dst[:num_rows].copy_(token_ids_src[:num_rows])
+
+
+def _capture_sparse_mla_buffers_fake(
+    page_table_dst: torch.Tensor,
+    topk_indices_dst: torch.Tensor,
+    nsa_lens_dst: torch.Tensor,
+    cache_lens_dst: torch.Tensor,
+    req_ids_dst: torch.Tensor,
+    token_ids_dst: torch.Tensor,
+    page_table_src: torch.Tensor,
+    topk_indices_src: torch.Tensor | None,
+    nsa_lens_src: torch.Tensor,
+    cache_lens_src: torch.Tensor,
+    req_ids_src: torch.Tensor | None,
+    token_ids_src: torch.Tensor | None,
+    num_rows: int,
+    topk: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="causal_cascade_capture_sparse_mla_buffers",
+    op_func=_capture_sparse_mla_buffers,
+    mutates_args=[
+        "page_table_dst",
+        "topk_indices_dst",
+        "nsa_lens_dst",
+        "cache_lens_dst",
+        "req_ids_dst",
+        "token_ids_dst",
+    ],
+    fake_impl=_capture_sparse_mla_buffers_fake,
+)
+
+
+def _capture_anchor_hidden_state_buffer(
+    hidden_states_dst: torch.Tensor,
+    hidden_states_src: torch.Tensor,
+    num_rows: int,
+) -> None:
+    hidden_states_dst[:num_rows].copy_(hidden_states_src[:num_rows])
+
+
+def _capture_anchor_hidden_state_buffer_fake(
+    hidden_states_dst: torch.Tensor,
+    hidden_states_src: torch.Tensor,
+    num_rows: int,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="causal_cascade_capture_anchor_hidden_state_buffer",
+    op_func=_capture_anchor_hidden_state_buffer,
+    mutates_args=["hidden_states_dst"],
+    fake_impl=_capture_anchor_hidden_state_buffer_fake,
+)
 
 
 @dataclass
@@ -38,6 +129,8 @@ class _LayerCaptureBuffer:
     layer_name: str = ""
     num_actual_tokens: int = 0
     topk: int = 0
+    has_logical_indices: bool = False
+    has_req_ids: bool = False
     has_token_ids: bool = False
 
 
@@ -84,7 +177,7 @@ def capture_causal_cascade_sparse_mla_layer(
     topk_indices: torch.Tensor | None,
     nsa_cache_seqlens: torch.Tensor,
     cache_seq_lens_per_token: torch.Tensor,
-    req_id_per_token: torch.Tensor,
+    req_id_per_token: torch.Tensor | None,
     token_ids_per_token: torch.Tensor | None,
     num_actual_tokens: int,
 ) -> None:
@@ -171,8 +264,6 @@ class CausalCascadeLiveState:
         )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
-        if not self._is_tp_rank_zero:
-            return
         self._kv_caches_by_layer_id.clear()
         for layer_name, kv_cache in kv_caches.items():
             layer_id = _parse_layer_id(layer_name)
@@ -182,10 +273,11 @@ class CausalCascadeLiveState:
         if self._kv_caches_by_layer_id:
             device = next(iter(self._kv_caches_by_layer_id.values())).device
             self._allocate_capture_buffers(device)
-        logger.info(
-            "CausalCascade native live state registered sparse-MLA KV layers=%s",
-            sorted(self._kv_caches_by_layer_id),
-        )
+        if self._is_tp_rank_zero:
+            logger.info(
+                "CausalCascade native live state registered sparse-MLA KV layers=%s",
+                sorted(self._kv_caches_by_layer_id),
+            )
 
     def capture_sparse_mla_layer(
         self,
@@ -195,12 +287,10 @@ class CausalCascadeLiveState:
         topk_indices: torch.Tensor | None,
         nsa_cache_seqlens: torch.Tensor,
         cache_seq_lens_per_token: torch.Tensor,
-        req_id_per_token: torch.Tensor,
+        req_id_per_token: torch.Tensor | None,
         token_ids_per_token: torch.Tensor | None,
         num_actual_tokens: int,
     ) -> None:
-        if not self._is_tp_rank_zero:
-            return
         layer_id = _parse_layer_id(layer_name)
         if layer_id is None or layer_id not in self._layer_id_set:
             return
@@ -259,29 +349,29 @@ class CausalCascadeLiveState:
         buffer.layer_name = layer_name
         buffer.num_actual_tokens = num_actual_tokens
         buffer.topk = topk
+        buffer.has_logical_indices = topk_indices is not None and topk_indices.ndim == 2
+        buffer.has_req_ids = req_id_per_token is not None
         buffer.has_token_ids = token_ids_per_token is not None
-        buffer.page_table[:num_actual_tokens, :topk].copy_(
-            page_table_1[:num_actual_tokens, :topk]
+        torch.ops.vllm.causal_cascade_capture_sparse_mla_buffers(
+            buffer.page_table,
+            buffer.topk_indices,
+            buffer.nsa_lens,
+            buffer.cache_lens,
+            buffer.req_ids,
+            buffer.token_ids,
+            page_table_1,
+            topk_indices,
+            nsa_cache_seqlens,
+            cache_seq_lens_per_token,
+            req_id_per_token,
+            token_ids_per_token,
+            num_actual_tokens,
+            topk,
         )
-        if topk_indices is None or topk_indices.ndim != 2:
-            buffer.topk_indices[:num_actual_tokens, :topk].fill_(-1)
-        else:
-            buffer.topk_indices[:num_actual_tokens, :topk].copy_(
-                topk_indices[:num_actual_tokens, :topk]
-            )
-        buffer.nsa_lens[:num_actual_tokens].copy_(nsa_cache_seqlens[:num_actual_tokens])
-        buffer.cache_lens[:num_actual_tokens].copy_(
-            cache_seq_lens_per_token[:num_actual_tokens]
-        )
-        buffer.req_ids[:num_actual_tokens].copy_(req_id_per_token[:num_actual_tokens])
-        if token_ids_per_token is not None:
-            buffer.token_ids[:num_actual_tokens].copy_(
-                token_ids_per_token[:num_actual_tokens]
-            )
 
         count = self._debug_capture_log_counts.get(layer_id, 0) + 1
         self._debug_capture_log_counts[layer_id] = count
-        if count <= 3 or count & (count - 1) == 0:
+        if self._is_tp_rank_zero and (count <= 3 or count & (count - 1) == 0):
             logger.info(
                 "CausalCascade live capture layer=%d count=%d rows=%d topk=%d "
                 "graph_capture=%s",
@@ -297,8 +387,6 @@ class CausalCascadeLiveState:
         hidden_states: torch.Tensor,
         num_rows: int | None = None,
     ) -> None:
-        if not self._is_tp_rank_zero:
-            return
         if hidden_states.ndim != 2:
             logger.warning_once(
                 "CausalCascade live state expected anchor hidden states rank 2, got %s",
@@ -336,14 +424,16 @@ class CausalCascadeLiveState:
                 buffer.shape[0],
             )
             return
-        buffer[:rows].copy_(hidden_states[:rows])
+        torch.ops.vllm.causal_cascade_capture_anchor_hidden_state_buffer(
+            buffer,
+            hidden_states,
+            rows,
+        )
 
     def get_live_anchor_hidden_states(
         self,
         row_indices: torch.Tensor,
     ) -> torch.Tensor | None:
-        if not self._is_tp_rank_zero:
-            return None
         buffer = self._anchor_hidden_state_buffer
         if buffer is None:
             return None
@@ -377,8 +467,6 @@ class CausalCascadeLiveState:
                     details,
                 )
 
-        if not self._is_tp_rank_zero:
-            return None
         if not layer_ids:
             missing("no_layer_ids")
             return None
@@ -412,6 +500,7 @@ class CausalCascadeLiveState:
         topk_index_layers: list[torch.Tensor] = []
         physical_slot_layers: list[torch.Tensor] = []
         valid_mask_layers: list[torch.Tensor] = []
+        logical_indices_available = True
         anchor_pos: torch.Tensor | None = None
         anchor_token_ids: torch.Tensor | None = None
         selected_cache_lens: torch.Tensor | None = None
@@ -482,10 +571,6 @@ class CausalCascadeLiveState:
                     cache_rows=int(flat_cache.shape[0]),
                 )
                 return None
-            topk_indices = buffer.topk_indices.index_select(0, row_index)[
-                :,
-                :layer_topk,
-            ].to(torch.int32)
             cache_lens = buffer.cache_lens.index_select(
                 0,
                 row_index,
@@ -503,21 +588,28 @@ class CausalCascadeLiveState:
             ):
                 missing("cache_len_layer_mismatch", layer_id=layer_id)
                 return None
-            invalid_topk = valid_mask & (
-                (topk_indices < 0)
-                | (topk_indices.to(torch.long) >= cache_lens.unsqueeze(1))
-            )
-            if torch.any(invalid_topk):
-                missing(
-                    "noncausal_topk_indices",
-                    layer_id=layer_id,
-                    invalid_count=int(invalid_topk.sum().item()),
+            if buffer.has_logical_indices:
+                topk_indices = buffer.topk_indices.index_select(0, row_index)[
+                    :,
+                    :layer_topk,
+                ].to(torch.int32)
+                invalid_topk = valid_mask & (
+                    (topk_indices < 0)
+                    | (topk_indices.to(torch.long) >= cache_lens.unsqueeze(1))
                 )
-                return None
+                if torch.any(invalid_topk):
+                    missing(
+                        "noncausal_topk_indices",
+                        layer_id=layer_id,
+                        invalid_count=int(invalid_topk.sum().item()),
+                    )
+                    return None
+                topk_index_layers.append(topk_indices.contiguous())
+            else:
+                logical_indices_available = False
 
             gathered, valid_mask = pack_sparse_mla_rows(flat_cache, physical_slots)
             packed_layers.append(gathered)
-            topk_index_layers.append(topk_indices.contiguous())
             physical_slot_layers.append(physical_slots.to(torch.int32).contiguous())
             valid_mask_layers.append(valid_mask.contiguous())
 
@@ -534,14 +626,15 @@ class CausalCascadeLiveState:
                     .to(torch.long)
                     .contiguous()
                 )
-                selected_req_ids = (
-                    buffer.req_ids.index_select(
-                        0,
-                        row_index,
+                if buffer.has_req_ids:
+                    selected_req_ids = (
+                        buffer.req_ids.index_select(
+                            0,
+                            row_index,
+                        )
+                        .to(torch.long)
+                        .contiguous()
                     )
-                    .to(torch.long)
-                    .contiguous()
-                )
                 debug_rows = int(buffer.num_actual_tokens)
                 if debug_rows <= 0:
                     debug_rows = min(16, int(buffer.cache_lens.shape[0]))
@@ -553,9 +646,10 @@ class CausalCascadeLiveState:
                 debug_nsa_lens_head = (
                     buffer.nsa_lens[:debug_rows].to(torch.long).contiguous()
                 )
-                debug_req_ids_head = (
-                    buffer.req_ids[:debug_rows].to(torch.long).contiguous()
-                )
+                if buffer.has_req_ids:
+                    debug_req_ids_head = (
+                        buffer.req_ids[:debug_rows].to(torch.long).contiguous()
+                    )
                 if buffer.has_token_ids:
                     anchor_token_ids = buffer.token_ids.index_select(
                         0,
@@ -565,7 +659,6 @@ class CausalCascadeLiveState:
         assert anchor_pos is not None
         assert selected_cache_lens is not None
         assert selected_nsa_lens is not None
-        assert selected_req_ids is not None
         anchor_token_ids_valid = anchor_token_ids is not None
         if anchor_token_ids is None:
             missing(
@@ -580,9 +673,8 @@ class CausalCascadeLiveState:
             device=anchor_pos.device,
             dtype=torch.long,
         )
-        return {
+        result = {
             "mla_cache_rows_packed": torch.stack(packed_layers, dim=1),
-            "mla_cache_topk_indices": torch.stack(topk_index_layers, dim=1),
             "mla_cache_physical_slots": torch.stack(physical_slot_layers, dim=1),
             "mla_cache_valid_mask": torch.stack(valid_mask_layers, dim=1),
             "verifier_layer_ids": torch.tensor(
@@ -593,10 +685,8 @@ class CausalCascadeLiveState:
             "anchor_pos": anchor_pos,
             "selected_cache_lens": selected_cache_lens,
             "selected_nsa_lens": selected_nsa_lens,
-            "selected_req_ids": selected_req_ids,
             "debug_cache_lens_head": debug_cache_lens_head,
             "debug_nsa_lens_head": debug_nsa_lens_head,
-            "debug_req_ids_head": debug_req_ids_head,
             "anchor_token_ids": anchor_token_ids,
             "anchor_token_ids_valid": torch.full(
                 anchor_pos.shape,
@@ -614,6 +704,16 @@ class CausalCascadeLiveState:
             "known_token_pos": anchor_pos + 1,
             "position_ids": anchor_pos.unsqueeze(1) + 1 + block_offsets.unsqueeze(0),
         }
+        if logical_indices_available and len(topk_index_layers) == len(layer_ids):
+            result["mla_cache_topk_indices"] = torch.stack(
+                topk_index_layers,
+                dim=1,
+            )
+        if selected_req_ids is not None:
+            result["selected_req_ids"] = selected_req_ids
+        if debug_req_ids_head is not None:
+            result["debug_req_ids_head"] = debug_req_ids_head
+        return result
 
     def _allocate_capture_buffers(self, device: torch.device) -> None:
         if self._capture_max_rows <= 0:

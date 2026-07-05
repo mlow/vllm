@@ -20,29 +20,67 @@ import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
 )
-from vllm.model_executor.model_loader import get_model
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.v1.worker.gpu.cudagraph_utils import AttentionStatePair
+from vllm.model_executor.model_loader import get_model
+from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    AttentionStatePair,
+    get_uniform_token_count,
+)
+from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
+    PrefillSpeculatorCudaGraphManager,
+)
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
+    _profile_cg_mode,
+    prepare_prefill_inputs,
+)
 from vllm.v1.worker.gpu.spec_decode.causal_cascade.live_state import (
     configure_causal_cascade_live_state,
     get_causal_cascade_live_state,
 )
-from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 
 logger = init_logger(__name__)
 
 
-class CausalCascadeSpeculator(DraftModelSpeculator):
+class CausalCascadeSpeculator(AutoRegressiveSpeculator):
     supports_mm_inputs: bool = False
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        anchor_source = str(
+            getattr(
+                self.draft_model_config.hf_config,
+                "anchor_hidden_state_source",
+                "",
+            )
+        )
+        if anchor_source != "native_glm_mtp_post_shared_head_rmsnorm":
+            raise ValueError(
+                "The unified CausalCascade runtime requires "
+                "anchor_hidden_state_source="
+                "'native_glm_mtp_post_shared_head_rmsnorm', got "
+                f"{anchor_source!r}"
+            )
+        self.mtp_anchor_hidden_states = torch.empty(
+            self.max_num_reqs,
+            self.hidden_size,
+            dtype=self.dtype,
+            device=device,
+        )
+        logger.info(
+            "CausalCascade unified MTP anchor enabled: the embedded MTP layer "
+            "will run once before the block draft."
+        )
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_group = get_tp_group()
         self._debug_propose_calls = 0
@@ -72,7 +110,9 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             os.environ.get("CAUSAL_CASCADE_MIN_CONTEXT_TOKENS", "0")
         )
         if self._ablate_cross_attention:
-            logger.warning("CausalCascadeSpeculator live sparse-MLA cross attention is ablated")
+            logger.warning(
+                "CausalCascadeSpeculator live sparse-MLA cross attention is ablated"
+            )
         logger.info(
             "CausalCascadeSpeculator first live draft slot=%d "
             "use_capture_positions=%s min_context_tokens=%d",
@@ -205,13 +245,13 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         count = self._debug_success_calls
         if not (count <= 5 or count & (count - 1) == 0):
             return
-        sample_tokens = (
-            self.draft_tokens[: min(num_reqs, 2)].detach().cpu().tolist()
-        )
+        sample_tokens = self.draft_tokens[: min(num_reqs, 2)].detach().cpu().tolist()
         rows = live_inputs["mla_cache_rows_packed"]
         position_ids = live_inputs["position_ids"]
         physical_slots = live_inputs["mla_cache_physical_slots"]
-        topk_indices = live_inputs["mla_cache_topk_indices"]
+        topk_indices = live_inputs.get("mla_cache_topk_indices")
+        topk_min = -1 if topk_indices is None else int(topk_indices.min().item())
+        topk_max = -1 if topk_indices is None else int(topk_indices.max().item())
         logger.info(
             "CausalCascadeSpeculator proposal count=%d propose_calls=%d "
             "num_reqs=%d first_draft_slot=%d rows_shape=%s "
@@ -228,15 +268,11 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             float(rows.float().abs().mean().item()),
             int(physical_slots.min().item()),
             int(physical_slots.max().item()),
-            int(topk_indices.min().item()),
-            int(topk_indices.max().item()),
+            topk_min,
+            topk_max,
             float(anchor_hidden_state.float().norm(dim=-1).mean().item()),
             hidden_source,
-            (
-                "n/a"
-                if hidden_max_abs_diff is None
-                else f"{hidden_max_abs_diff:.6f}"
-            ),
+            ("n/a" if hidden_max_abs_diff is None else f"{hidden_max_abs_diff:.6f}"),
             position_ids[: min(num_reqs, 2)].detach().cpu().tolist(),
             sample_tokens,
         )
@@ -245,9 +281,16 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         self,
         num_reqs: int,
         *,
+        num_speculative_tokens: int | None = None,
         broadcast: bool = True,
     ) -> torch.Tensor:
-        draft_tokens = self.draft_tokens[:num_reqs].clone()
+        if num_speculative_tokens is None:
+            num_speculative_tokens = getattr(
+                self,
+                "_active_num_speculative_tokens",
+                self.num_speculative_steps,
+            )
+        draft_tokens = self.draft_tokens[:num_reqs, :num_speculative_tokens].clone()
         if broadcast and self.tp_group.world_size > 1:
             self.tp_group.broadcast(draft_tokens, src=0)
         return draft_tokens
@@ -317,9 +360,6 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             "hidden_max_abs_diff": hidden_max_abs_diff,
             "use_capture_positions": bool(self._use_capture_positions),
             "ablate_cross_attention": bool(self._ablate_cross_attention),
-            "slot1_verifier_head_bypass": bool(
-                getattr(self.model.config, "slot1_verifier_head_bypass", False)
-            ),
             "known_token_conditioning": getattr(
                 self.model.config,
                 "known_token_conditioning",
@@ -330,9 +370,7 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
                 "anchor_token_conditioning",
                 None,
             ),
-            "markov_head_rank": int(
-                getattr(self.model.config, "markov_head_rank", 0)
-            ),
+            "markov_head_rank": int(getattr(self.model.config, "markov_head_rank", 0)),
             "row_indices": self._cpu_tensor(row_indices[:dump_reqs]),
             "capture_row_indices": self._cpu_tensor(capture_row_indices[:dump_reqs]),
             "valid_row_ends": self._cpu_tensor(valid_row_ends[:dump_reqs]),
@@ -350,7 +388,9 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             "query_start_loc": self._cpu_tensor(
                 input_batch.query_start_loc[: dump_reqs + 1]
             ),
-            "cu_num_logits": self._cpu_tensor(input_batch.cu_num_logits[: dump_reqs + 1]),
+            "cu_num_logits": self._cpu_tensor(
+                input_batch.cu_num_logits[: dump_reqs + 1]
+            ),
             "logits_indices": self._cpu_tensor(input_batch.logits_indices),
             "expanded_local_pos": self._cpu_tensor(input_batch.expanded_local_pos),
             "verified_input_ids": self._cpu_tensor(
@@ -379,7 +419,9 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             ),
             "verifier_bonus_token_ids": first_reqs(verifier_bonus_token_ids),
             "known_token_ids": first_reqs(known_token_ids),
-            "input_batch_positions_at_rows": self._cpu_tensor(input_anchor_pos[:dump_reqs]),
+            "input_batch_positions_at_rows": self._cpu_tensor(
+                input_anchor_pos[:dump_reqs]
+            ),
             "capture_anchor_pos": self._cpu_tensor(capture_anchor_pos[:dump_reqs]),
             "used_anchor_pos": self._cpu_tensor(live_inputs["anchor_pos"][:dump_reqs]),
             "source_anchor_token_ids": first_reqs(
@@ -428,14 +470,40 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         tmp_path.replace(path)
         logger.warning("Wrote CausalCascade live debug dump: %s", path)
 
-    def init_cudagraph_manager(self, cudagraph_mode) -> None:
-        del cudagraph_mode
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        # Only the one-pass embedded MTP prefill needs a graph. The seven
+        # CausalCascade output positions are produced by one block forward, so
+        # allocating a native MTP decode graph would be both wasteful and wrong.
+        self.prefill_cudagraph_manager = PrefillSpeculatorCudaGraphManager(
+            self.vllm_config,
+            self.device,
+            cudagraph_mode,
+            2,
+        )
+        self.decode_cudagraph_manager = None
 
     def capture(
         self,
         attn_states: dict[Any, AttentionStatePair],
     ) -> None:
         del attn_states
+        logger.info("Capturing embedded CausalCascade MTP prefill...")
+        self.last_token_indices.zero_()
+        assert self.prefill_cudagraph_manager is not None
+        if self.prefill_cudagraph_manager.use_breakable_cg:
+            self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
+        # The embedded MTP layer has its own attention layer and must always
+        # build metadata from its one-step topology; verifier metadata describes
+        # the wider verification block.
+        self.prefill_cudagraph_manager.capture(
+            self._run_embedded_mtp_graph,
+            model_state=self.model_state,
+            input_buffers=self.input_buffers,
+            block_tables=self.block_tables,
+            attn_groups=self.attn_groups,
+            kv_cache_config=self.kv_cache_config,
+            progress_bar_desc="Capturing embedded MTP CUDA graphs",
+        )
 
     def load_draft_model(
         self,
@@ -447,6 +515,7 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             vllm_config=self.vllm_config,
             model_config=self.draft_model_config,
         )
+        draft_model.attach_target_shared_weights(target_model)
         populate = getattr(
             draft_model,
             "populate_target_compatible_mla_weights",
@@ -462,6 +531,128 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         )
         return draft_model
 
+    def set_attn(self, model_state, kv_cache_config, block_tables) -> None:
+        super().set_attn(model_state, kv_cache_config, block_tables)
+        self.rebuild_prefill_attn_metadata = True
+
+    def _run_embedded_mtp_graph(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        _, mtp_head_states = self._run_model(
+            num_tokens,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+        )
+        self.mtp_anchor_hidden_states[:num_reqs].copy_(
+            mtp_head_states[self.last_token_indices[:num_reqs]]
+        )
+
+    def _run_embedded_mtp_prefill(
+        self,
+        *,
+        input_batch: InputBatch,
+        last_hidden_states: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+        last_sampled: torch.Tensor,
+        next_prefill_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_tokens_across_dp: torch.Tensor | None,
+        is_profile: bool,
+    ) -> torch.Tensor:
+        num_tokens = input_batch.num_tokens_after_padding
+        num_reqs = input_batch.num_reqs
+        max_query_len = input_batch.num_scheduled_tokens.max()
+        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+        self.draft_max_seq_len = min(max_seq_len + 1, self.max_model_len)
+        self.hidden_states[:num_tokens].copy_(last_hidden_states)
+        self._copy_request_inputs(
+            num_reqs,
+            input_batch.idx_mapping,
+            temperature,
+            seeds,
+        )
+        self.active_num_reqs.fill_(num_reqs)
+        prepare_prefill_inputs(
+            self.last_token_indices,
+            self.current_draft_step,
+            self.input_buffers,
+            input_batch,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            self.max_num_reqs,
+        )
+
+        uniform_token_count = get_uniform_token_count(
+            num_reqs,
+            input_batch.num_tokens,
+            max_query_len,
+        )
+        assert self.prefill_cudagraph_manager is not None
+        prefill_batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+            self.prefill_cudagraph_manager,
+            num_reqs,
+            num_tokens,
+            uniform_token_count,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            need_eager=is_profile,
+        )
+
+        idx_mapping = self.idx_mapping[:num_reqs]
+        rebuilt_slot_mappings = self.block_tables.compute_slot_mappings(
+            idx_mapping,
+            self.input_buffers.query_start_loc,
+            self.input_buffers.positions,
+            prefill_batch_desc.num_tokens,
+        )
+        prefill_slot_mappings = build_slot_mappings_by_layer(
+            rebuilt_slot_mappings,
+            self.kv_cache_config,
+        )
+        num_query_per_req = uniform_token_count or max_query_len
+        prefill_attn_metadata = self._build_draft_attn_metadata(
+            num_reqs=num_reqs,
+            num_reqs_padded=prefill_batch_desc.num_reqs or num_reqs,
+            num_tokens_padded=prefill_batch_desc.num_tokens,
+            num_query_per_req=num_query_per_req,
+            seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
+            max_seq_len_upper_bound=max_seq_len,
+            query_start_loc_cpu=torch.from_numpy(input_batch.query_start_loc_np),
+        )
+        self._prepare_eplb_forward(input_batch.num_tokens)
+
+        if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
+            with record_function_or_nullcontext(
+                "vllm:v2/speculator/causal_cascade/mtp/full_graph_replay"
+            ):
+                self.prefill_cudagraph_manager.run_fullgraph(prefill_batch_desc)
+        else:
+            with record_function_or_nullcontext(
+                "vllm:v2/speculator/causal_cascade/mtp/"
+                f"{_profile_cg_mode(prefill_batch_desc.cg_mode)}"
+            ):
+                self._run_embedded_mtp_graph(
+                    num_reqs,
+                    prefill_batch_desc.num_tokens,
+                    prefill_attn_metadata,
+                    prefill_slot_mappings,
+                    num_tokens_across_dp,
+                    prefill_batch_desc.cg_mode,
+                )
+        return self.mtp_anchor_hidden_states[:num_reqs]
+
     def propose(
         self,
         input_batch: InputBatch,
@@ -475,28 +666,43 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         next_prefill_tokens: torch.Tensor,
         temperature: torch.Tensor,
         seeds: torch.Tensor,
+        num_speculative_tokens: int | None = None,
         num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
-        del (
-            attn_metadata,
-            slot_mappings,
-            last_hidden_states,
-            num_tokens_across_dp,
-            skip_attn_for_dummy_run,
-            mm_inputs,
-            is_profile,
-        )
         num_reqs = input_batch.num_reqs
+        del attn_metadata, slot_mappings, skip_attn_for_dummy_run, mm_inputs
+        if num_speculative_tokens is None:
+            num_speculative_tokens = self.num_speculative_steps
+        if not 1 <= num_speculative_tokens <= self.num_speculative_steps:
+            raise ValueError(
+                "num_speculative_tokens must be between 1 and "
+                f"{self.num_speculative_steps}, got {num_speculative_tokens}"
+            )
+        self._active_num_speculative_tokens = num_speculative_tokens
+        native_mtp_anchor_hidden_state = self._run_embedded_mtp_prefill(
+            input_batch=input_batch,
+            last_hidden_states=last_hidden_states,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            last_sampled=last_sampled,
+            next_prefill_tokens=next_prefill_tokens,
+            temperature=temperature,
+            seeds=seeds,
+            num_tokens_across_dp=num_tokens_across_dp,
+            is_profile=is_profile,
+        )
         self.draft_tokens[:num_reqs].fill_(-1)
 
         if dummy_run:
-            return self._finish_proposal(num_reqs, broadcast=False)
-        if self.tp_rank != 0:
-            return self._finish_proposal(num_reqs)
+            return self._finish_proposal(
+                num_reqs,
+                num_speculative_tokens=num_speculative_tokens,
+                broadcast=False,
+            )
         self._debug_propose_calls += 1
         if input_batch.is_prefilling_np[:num_reqs].any():
             self._debug_fallback("prefill_in_progress", num_reqs)
@@ -520,16 +726,9 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             "known_token_conditioning",
             "none",
         )
-        anchor_token_conditioning = getattr(
-            self.model.config,
-            "anchor_token_conditioning",
-            "none",
-        )
-        markov_head_enabled = bool(
-            getattr(self.model, "markov_head_enabled", False)
-        )
-        slot1_verifier_head_bypass = bool(
-            getattr(self.model.config, "slot1_verifier_head_bypass", False)
+        markov_head_enabled = bool(getattr(self.model, "markov_head_enabled", False))
+        slot1_native_anchor_enabled = bool(
+            getattr(self.model, "slot1_native_anchor_enabled", False)
         )
         first_draft_slot = self._first_draft_slot
         if first_draft_slot < 0 or first_draft_slot >= block_size:
@@ -538,11 +737,11 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
                 f"block: got {first_draft_slot}, block_size={block_size}"
             )
         max_draft_steps = block_size - first_draft_slot
-        if self.num_speculative_steps > max_draft_steps:
+        if num_speculative_tokens > max_draft_steps:
             raise RuntimeError(
                 "CausalCascade num_speculative_tokens exceeds the trained "
                 "block for its configured slot mapping: "
-                f"got {self.num_speculative_steps}, max={max_draft_steps}, "
+                f"got {num_speculative_tokens}, max={max_draft_steps}, "
                 f"block_size={block_size}, first_draft_slot={first_draft_slot}, "
                 f"known_token_conditioning={known_token_conditioning!r}"
             )
@@ -573,18 +772,31 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             device=last_sampled.device,
             dtype=torch.long,
         )
-        sampled_bonus_token_ids = last_sampled.index_select(
-            0,
-            req_state_indices,
-        ).to(device=input_batch.input_ids.device, dtype=torch.long).reshape(-1)
-        prefill_bonus_token_ids = next_prefill_tokens.index_select(
-            0,
-            req_state_indices.to(device=next_prefill_tokens.device),
-        ).to(device=input_batch.input_ids.device, dtype=torch.long).reshape(-1)
-        has_sampled_token = num_sampled[:num_reqs].to(
-            device=input_batch.input_ids.device,
-            dtype=torch.long,
-        ).reshape(-1) > 0
+        sampled_bonus_token_ids = (
+            last_sampled.index_select(
+                0,
+                req_state_indices,
+            )
+            .to(device=input_batch.input_ids.device, dtype=torch.long)
+            .reshape(-1)
+        )
+        prefill_bonus_token_ids = (
+            next_prefill_tokens.index_select(
+                0,
+                req_state_indices.to(device=next_prefill_tokens.device),
+            )
+            .to(device=input_batch.input_ids.device, dtype=torch.long)
+            .reshape(-1)
+        )
+        has_sampled_token = (
+            num_sampled[:num_reqs]
+            .to(
+                device=input_batch.input_ids.device,
+                dtype=torch.long,
+            )
+            .reshape(-1)
+            > 0
+        )
         verifier_bonus_token_ids = torch.where(
             has_sampled_token,
             sampled_bonus_token_ids[:num_reqs],
@@ -614,13 +826,19 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             dtype=torch.bool,
         )
         if anchor_token_ids_valid is not None:
-            valid_anchor_tokens = anchor_token_ids_valid[:num_reqs].to(
-                device=input_anchor_token_ids.device,
-                dtype=torch.bool,
-            ).reshape(-1)
-            capture_anchor_token_ids = live_inputs["anchor_token_ids"][
-                :num_reqs
-            ].to(device=input_anchor_token_ids.device, dtype=torch.long).reshape(-1)
+            valid_anchor_tokens = (
+                anchor_token_ids_valid[:num_reqs]
+                .to(
+                    device=input_anchor_token_ids.device,
+                    dtype=torch.bool,
+                )
+                .reshape(-1)
+            )
+            capture_anchor_token_ids = (
+                live_inputs["anchor_token_ids"][:num_reqs]
+                .to(device=input_anchor_token_ids.device, dtype=torch.long)
+                .reshape(-1)
+            )
             input_anchor_token_ids = input_anchor_token_ids.reshape(-1)
             source_anchor_token_ids = torch.where(
                 valid_anchor_tokens,
@@ -639,6 +857,10 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         aux_anchor_hidden_state = aux_hidden_states[-1].index_select(
             0,
             aux_row_indices.to(device=aux_hidden_states[-1].device, dtype=torch.long),
+        )
+        verifier_head_hidden_state = last_hidden_states.index_select(
+            0,
+            aux_row_indices.to(device=last_hidden_states.device, dtype=torch.long),
         )
         get_anchor_hidden_states = getattr(
             live_state,
@@ -666,6 +888,12 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
             )
             anchor_hidden_state = captured_anchor_hidden_state
             hidden_source = "capture"
+        if native_mtp_anchor_hidden_state is not None:
+            anchor_hidden_state = native_mtp_anchor_hidden_state.to(
+                device=aux_anchor_hidden_state.device,
+                dtype=aux_anchor_hidden_state.dtype,
+            )
+            hidden_source = "native_mtp"
         if live_inputs["mla_cache_rows_packed"].shape[0] < num_reqs:
             self._debug_fallback("short_live_inputs", num_reqs)
             return self._finish_proposal(num_reqs)
@@ -686,9 +914,7 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         )
         self._debug_position_mismatch(capture_anchor_pos, input_anchor_pos)
         anchor_pos = (
-            capture_anchor_pos
-            if self._use_capture_positions
-            else input_anchor_pos
+            capture_anchor_pos if self._use_capture_positions else input_anchor_pos
         )
         block_offsets = torch.arange(
             block_size,
@@ -718,6 +944,8 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         mla_cache_valid_mask = live_inputs.get("mla_cache_valid_mask")
         logits = self.model.forward_logits(
             anchor_hidden_state=anchor_hidden_state,
+            verifier_head_hidden_state=verifier_head_hidden_state,
+            verifier_pre_norm_hidden_state=aux_anchor_hidden_state,
             anchor_token_ids=live_inputs["anchor_token_ids"][:num_reqs],
             mla_cache_rows_packed=live_inputs["mla_cache_rows_packed"][:num_reqs],
             mla_cache_valid_mask=mla_cache_valid_mask[:num_reqs]
@@ -730,16 +958,24 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
         )
         step_logits = logits[
             :,
-            first_draft_slot : first_draft_slot + self.num_speculative_steps,
+            first_draft_slot : first_draft_slot + num_speculative_tokens,
         ].contiguous()
+
+        # The shared tensor-parallel verifier head has now completed all
+        # collectives. Rank 0 alone performs the replicated Markov correction
+        # and sampling; other ranks join the final token broadcast.
+        if self.tp_rank != 0:
+            return self._finish_proposal(num_reqs)
 
         if self.draft_logits is None:
             if markov_head_enabled:
                 assert known_token_ids is not None
                 previous_token_ids = known_token_ids
                 corrected_step_logits: list[torch.Tensor] = []
-                for draft_step in range(self.num_speculative_steps):
-                    if draft_step == 0 and slot1_verifier_head_bypass:
+                for draft_step in range(num_speculative_tokens):
+                    # Training leaves slot 1's native-MTP residual prediction
+                    # untouched and starts Markov conditioning at slot 2.
+                    if draft_step == 0 and slot1_native_anchor_enabled:
                         current_logits = step_logits[:, draft_step]
                     else:
                         current_logits = self.model.apply_markov_head(
@@ -751,7 +987,9 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
                     self.draft_tokens[:num_reqs, draft_step] = previous_token_ids
                 step_logits = torch.stack(corrected_step_logits, dim=1)
             else:
-                self.draft_tokens[:num_reqs] = step_logits.argmax(dim=-1)
+                self.draft_tokens[:num_reqs, :num_speculative_tokens] = (
+                    step_logits.argmax(dim=-1)
+                )
         else:
             self._copy_request_inputs(
                 num_reqs,
@@ -763,8 +1001,8 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
                 assert known_token_ids is not None
                 previous_token_ids = known_token_ids
                 corrected_step_logits = []
-                for draft_step in range(self.num_speculative_steps):
-                    if draft_step == 0 and slot1_verifier_head_bypass:
+                for draft_step in range(num_speculative_tokens):
+                    if draft_step == 0 and slot1_native_anchor_enabled:
                         current_logits = step_logits[:, draft_step]
                     else:
                         current_logits = self.model.apply_markov_head(
@@ -797,18 +1035,23 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
                 step_logits = torch.stack(corrected_step_logits, dim=1)
             else:
                 flat_logits = step_logits.view(-1, step_logits.shape[-1])
-                expanded_idx_mapping = self.idx_mapping[
-                    :num_reqs
-                ].repeat_interleave(self.num_speculative_steps)
+                expanded_idx_mapping = self.idx_mapping[:num_reqs].repeat_interleave(
+                    num_speculative_tokens
+                )
                 positions = live_inputs["position_ids"][
                     :num_reqs,
-                    first_draft_slot : first_draft_slot + self.num_speculative_steps,
+                    first_draft_slot : first_draft_slot + num_speculative_tokens,
                 ].reshape(-1)
-                draft_step = torch.arange(
-                    self.num_speculative_steps,
-                    device=step_logits.device,
-                    dtype=torch.int32,
-                ).unsqueeze(0).expand(num_reqs, -1).reshape(-1)
+                draft_step = (
+                    torch.arange(
+                        num_speculative_tokens,
+                        device=step_logits.device,
+                        dtype=torch.int32,
+                    )
+                    .unsqueeze(0)
+                    .expand(num_reqs, -1)
+                    .reshape(-1)
+                )
                 sampled = gumbel_sample(
                     flat_logits,
                     expanded_idx_mapping,
@@ -820,9 +1063,9 @@ class CausalCascadeSpeculator(DraftModelSpeculator):
                     output_processed_logits_col=draft_step,
                     use_fp64=self.use_fp64_gumbel,
                 )
-                self.draft_tokens[:num_reqs] = sampled.view(
+                self.draft_tokens[:num_reqs, :num_speculative_tokens] = sampled.view(
                     num_reqs,
-                    self.num_speculative_steps,
+                    num_speculative_tokens,
                 )
         self._maybe_dump_live_inputs(
             num_reqs=num_reqs,

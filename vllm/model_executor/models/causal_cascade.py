@@ -1,17 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
+# ruff: noqa: B009, E501, F821
 from typing import Any, ClassVar
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+
+# The training architecture is the source of truth; this module supplies only
+# vLLM-specific loading and live inference plumbing.
+from glmflash.models.dflash_sparse_mla.config import (
+    DFlashSparseMLASpeculatorConfig as CanonicalSparseMLAConfig,
+)
+from glmflash.models.dflash_sparse_mla.core import (
+    DFlashSparseMLADraftModel as CanonicalSparseMLADraftModel,
+)
+from glmflash.models.dflash_sparse_mla.core import (
+    SparseMLACrossAttention as CanonicalSparseMLACrossAttention,
+)
 from torch import nn
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.qwen3.modeling_qwen3 import Qwen3MLP, Qwen3RMSNorm
 
-from vllm.config import VllmConfig
+from vllm.config import SpeculativeConfig, VllmConfig, replace
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 
@@ -144,20 +159,6 @@ def _derive_mla_dims(verifier_name_or_path: str) -> dict[str, int]:
         "mla_v_head_dim": int(verifier_config.v_head_dim),
         "mla_num_heads": int(verifier_config.num_attention_heads),
     }
-
-
-def _env_bool(name: str) -> bool | None:
-    value = os.environ.get(name)
-    if value is None:
-        return None
-    normalized = value.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(
-        f"{name} must be one of 1/0, true/false, yes/no, on/off; got {value!r}"
-    )
 
 
 def dequantize_fp8_ds_mla_rows(
@@ -1558,9 +1559,7 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
             )
         markov_head_rank = int(getattr(config, "markov_head_rank", 0))
         if markov_head_rank < 0:
-            raise ValueError(
-                f"markov_head_rank must be >= 0, got {markov_head_rank}"
-            )
+            raise ValueError(f"markov_head_rank must be >= 0, got {markov_head_rank}")
         if markov_head_rank > 0 and config.block_size <= 1:
             raise ValueError("markov_head_rank requires block_size > 1")
         self.markov_head = (
@@ -2419,14 +2418,11 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
         global_step: int | None = None,
         ablate_sparse_mla_cross_attention: bool = False,
     ) -> torch.Tensor:
-        ablate_sparse_mla_cross_attention = (
-            ablate_sparse_mla_cross_attention
-            or bool(
-                getattr(
-                    self.config,
-                    "ablate_sparse_mla_cross_attention",
-                    False,
-                )
+        ablate_sparse_mla_cross_attention = ablate_sparse_mla_cross_attention or bool(
+            getattr(
+                self.config,
+                "ablate_sparse_mla_cross_attention",
+                False,
             )
         )
         if (
@@ -2624,14 +2620,11 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
         **kwargs,
     ):
         del kwargs
-        ablate_sparse_mla_cross_attention = (
-            ablate_sparse_mla_cross_attention
-            or bool(
-                getattr(
-                    self.config,
-                    "ablate_sparse_mla_cross_attention",
-                    False,
-                )
+        ablate_sparse_mla_cross_attention = ablate_sparse_mla_cross_attention or bool(
+            getattr(
+                self.config,
+                "ablate_sparse_mla_cross_attention",
+                False,
             )
         )
         if anchor_hidden_state is None or target_token_ids is None or loss_mask is None:
@@ -2863,14 +2856,463 @@ class DFlashSparseMLADraftModel(DraftVocabMixin, SpeculatorModel):
         return draft_tokens, loss, metrics
 
 
+class ServingSparseMLADraftModel(CanonicalSparseMLADraftModel):
+    """Canonical glmflash model with a logits-only serving entry point.
+
+    The architecture and parameter names intentionally come from glmflash, the
+    training-side source of truth.  vLLM owns only the live-input partitioning
+    and logits-only execution path here.
+    """
+
+    class _SharedVerifierLMHead(nn.Module):
+        """Parameter-free view of the verifier's tensor-parallel LM head."""
+
+        def __init__(self, vocab_size: int) -> None:
+            super().__init__()
+            self._head: nn.Module | None = None
+            self.logits_processor = LogitsProcessor(vocab_size)
+            # CausalCascade executes on every TP rank because the shared head
+            # and row lookup both contain TP collectives. Keep the result on
+            # every rank so optional iterative/token-fusion paths remain valid.
+            self.logits_processor.use_all_gather = True
+
+        def attach(self, head: nn.Module) -> None:
+            self._head = head
+
+        def _require_head(self) -> nn.Module:
+            if self._head is None:
+                raise RuntimeError(
+                    "CausalCascade verifier LM head has not been attached"
+                )
+            return self._head
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            head = self._require_head()
+            if isinstance(head, VocabParallelEmbedding):
+                logits = self.logits_processor(head, hidden_states)
+            else:
+                logits = F.linear(hidden_states, head.weight)
+            if logits is None:
+                raise RuntimeError(
+                    "CausalCascade shared LM-head projection returned no logits"
+                )
+            return logits
+
+        def lookup_rows(self, token_ids: torch.Tensor) -> torch.Tensor:
+            # ParallelLMHead deliberately overrides forward because it normally
+            # serves as an output projection. Calling the embedding base method
+            # gives the exact global row and performs the required TP reduction.
+            head = self._require_head()
+            if isinstance(head, VocabParallelEmbedding):
+                return VocabParallelEmbedding.forward(head, token_ids)
+            return F.embedding(token_ids, head.weight)
+
+        @property
+        def weight(self) -> torch.Tensor:
+            raise RuntimeError(
+                "CausalCascade must access verifier LM-head rows through "
+                "_lookup_lm_head_rows; a full replicated weight is not present"
+            )
+
+    def _init_sparse_mla_vocab(self, config: CanonicalSparseMLAConfig) -> None:
+        """Initialize vocab metadata without allocating a dense LM-head copy."""
+        tl_config = config.transformer_layer_config
+        self.draft_vocab_size = config.draft_vocab_size
+        self.verifier_vocab_size = tl_config.vocab_size
+        self.hidden_size = tl_config.hidden_size
+        self.use_draft_vocab = self.draft_vocab_size != self.verifier_vocab_size
+        t2d: torch.Tensor | None = None
+        d2t: torch.Tensor | None = None
+        if self.use_draft_vocab:
+            t2d = torch.zeros((self.verifier_vocab_size,), dtype=torch.bool)
+            d2t = torch.zeros((self.draft_vocab_size,), dtype=torch.long)
+        self.register_buffer("t2d", t2d)
+        self.register_buffer("d2t", d2t)
+        self.lm_head = self._SharedVerifierLMHead(self.draft_vocab_size)
+
+    def __init__(self, config: PretrainedConfig) -> None:
+        if not isinstance(config, CanonicalSparseMLAConfig):
+            config = CanonicalSparseMLAConfig.model_validate(config.to_dict())
+        super().__init__(config)
+
+    def attach_verifier_lm_head(self, head: nn.Module) -> None:
+        head_vocab_size = int(getattr(head, "org_vocab_size", head.weight.shape[0]))
+        if head_vocab_size != int(self.draft_vocab_size):
+            raise ValueError(
+                "CausalCascade/verifier vocab mismatch: "
+                f"draft={self.draft_vocab_size}, verifier={head_vocab_size}"
+            )
+        self.lm_head.attach(head)
+
+    def _lookup_lm_head_rows(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.lm_head.lookup_rows(token_ids)
+
+    def _partition_live_mla_rows(
+        self,
+        *,
+        mla_cache_rows: torch.Tensor | None,
+        mla_cache_rows_packed: torch.Tensor | None,
+        mla_cache_valid_mask: torch.Tensor | None,
+        verifier_layer_ids: torch.Tensor | None,
+        dtype: torch.dtype,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        if self.config.anchor_only:
+            return (None, None, None, None, None, None)
+        if mla_cache_rows is None:
+            if mla_cache_rows_packed is None:
+                raise ValueError(
+                    "CausalCascade requires mla_cache_rows or "
+                    "mla_cache_rows_packed unless anchor_only is enabled"
+                )
+            from glmflash.models.dflash_sparse_mla.core import (
+                dequantize_fp8_ds_mla_rows,
+            )
+
+            mla_cache_rows = dequantize_fp8_ds_mla_rows(
+                mla_cache_rows_packed,
+                dtype=dtype,
+            )
+        if mla_cache_valid_mask is not None:
+            if mla_cache_valid_mask.shape != mla_cache_rows.shape[:3]:
+                raise ValueError(
+                    "mla_cache_valid_mask shape mismatch: got "
+                    f"{tuple(mla_cache_valid_mask.shape)}, expected "
+                    f"{tuple(mla_cache_rows.shape[:3])}"
+                )
+            mla_cache_valid_mask = mla_cache_valid_mask.to(
+                device=mla_cache_rows.device,
+                dtype=torch.bool,
+            )
+
+        if verifier_layer_ids is not None:
+            if verifier_layer_ids.ndim == 2:
+                verifier_layer_ids = verifier_layer_ids[0]
+            available = {
+                int(layer_id.item()): idx
+                for idx, layer_id in enumerate(verifier_layer_ids.to("cpu"))
+            }
+        else:
+            expected_layers = len(self.layers)
+            if (
+                mla_cache_rows.shape[1] != expected_layers
+                or self.config.local_cross_attention_layer_ids
+            ):
+                raise ValueError(
+                    f"mla_cache_rows has {mla_cache_rows.shape[1]} layers, "
+                    f"expected {expected_layers} and no local cross-attention "
+                    "layers when verifier_layer_ids is omitted"
+                )
+            available = {
+                int(layer_id): idx
+                for idx, layer_id in enumerate(self.config.verifier_kv_layer_ids)
+            }
+
+        target_topk = int(self.config.sparse_topk)
+        if target_topk <= 0:
+            raise ValueError(f"sparse_topk must be > 0, got {target_topk}")
+        if mla_cache_rows.shape[2] < target_topk:
+            raise ValueError(
+                f"mla_cache_rows has topk {mla_cache_rows.shape[2]}, "
+                f"requested {target_topk}"
+            )
+        if mla_cache_rows.shape[2] > target_topk:
+            mla_cache_rows = mla_cache_rows[:, :, :target_topk, :].contiguous()
+        if mla_cache_valid_mask is not None:
+            if mla_cache_valid_mask.shape[2] < target_topk:
+                raise ValueError(
+                    "mla_cache_valid_mask has topk "
+                    f"{mla_cache_valid_mask.shape[2]}, requested {target_topk}"
+                )
+            if mla_cache_valid_mask.shape[2] > target_topk:
+                mla_cache_valid_mask = mla_cache_valid_mask[
+                    :, :, :target_topk
+                ].contiguous()
+
+        def select_layer_tensor(
+            tensor: torch.Tensor | None,
+            layer_ids: list[int],
+            *,
+            name: str,
+        ) -> torch.Tensor | None:
+            if tensor is None:
+                return None
+            layer_indices: list[int] = []
+            for layer_id in layer_ids:
+                idx = available.get(int(layer_id))
+                if idx is None:
+                    raise ValueError(
+                        f"{name} does not contain requested verifier layer "
+                        f"{layer_id}; available layers are {list(available)}"
+                    )
+                layer_indices.append(idx)
+            index = torch.tensor(layer_indices, device=tensor.device)
+            return tensor.index_select(1, index)
+
+        sparse_ids = list(self.config.verifier_kv_layer_ids)
+        local_ids = list(self.config.local_cross_attention_layer_ids)
+        sparse_rows = select_layer_tensor(
+            mla_cache_rows,
+            sparse_ids,
+            name="mla_cache_rows",
+        )
+        sparse_mask = select_layer_tensor(
+            mla_cache_valid_mask,
+            sparse_ids,
+            name="mla_cache_valid_mask",
+        )
+        local_rows = (
+            select_layer_tensor(
+                mla_cache_rows,
+                local_ids,
+                name="mla_cache_rows",
+            )
+            if local_ids
+            else None
+        )
+        local_mask = (
+            select_layer_tensor(
+                mla_cache_valid_mask,
+                local_ids,
+                name="mla_cache_valid_mask",
+            )
+            if local_ids
+            else None
+        )
+
+        refinement_rows = None
+        refinement_mask = None
+        if (
+            int(getattr(self.config, "iterative_refinement_rounds", 1)) > 1
+            and getattr(self.config, "iterative_refinement_mode", "shared") == "untied"
+        ):
+            refinement_ids = [
+                int(getattr(self.config, "iterative_refinement_layer_id", 77))
+            ]
+            refinement_rows = select_layer_tensor(
+                mla_cache_rows,
+                refinement_ids,
+                name="mla_cache_rows",
+            )
+            refinement_mask = select_layer_tensor(
+                mla_cache_valid_mask,
+                refinement_ids,
+                name="mla_cache_valid_mask",
+            )
+        return (
+            sparse_rows,
+            sparse_mask,
+            local_rows,
+            local_mask,
+            refinement_rows,
+            refinement_mask,
+        )
+
+    def forward_logits(
+        self,
+        *,
+        anchor_hidden_state: torch.Tensor,
+        verifier_head_hidden_state: torch.Tensor | None = None,
+        verifier_pre_norm_hidden_state: torch.Tensor | None = None,
+        anchor_token_ids: torch.Tensor | None = None,
+        mla_cache_rows: torch.Tensor | None = None,
+        mla_cache_rows_packed: torch.Tensor | None = None,
+        mla_cache_valid_mask: torch.Tensor | None = None,
+        verifier_layer_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        known_token_ids: torch.Tensor | None = None,
+        ablate_sparse_mla_cross_attention: bool = False,
+    ) -> torch.Tensor:
+        ablate_sparse_mla_cross_attention = ablate_sparse_mla_cross_attention or bool(
+            getattr(
+                self.config,
+                "ablate_sparse_mla_cross_attention",
+                False,
+            )
+        )
+        batch_size = anchor_hidden_state.shape[0]
+        hidden_size = self.hidden_size
+        if anchor_hidden_state.shape != (batch_size, hidden_size):
+            raise ValueError(
+                "anchor_hidden_state shape mismatch: got "
+                f"{tuple(anchor_hidden_state.shape)}, expected "
+                f"{(batch_size, hidden_size)}"
+            )
+        anchor_token_ids = self._normalize_anchor_token_ids(
+            anchor_token_ids,
+            target_token_ids=None,
+            batch_size=batch_size,
+            device=anchor_hidden_state.device,
+        )
+        anchor_context = anchor_hidden_state.to(
+            dtype=self.block_position_embeddings.weight.dtype,
+        )
+        hidden_states = self.anchor_initializer(anchor_context)
+        if self.dual_stream_trunk:
+            if verifier_head_hidden_state is None:
+                raise ValueError(
+                    "verifier_head_hidden_state is required for a dual-stream "
+                    "CausalCascade checkpoint"
+                )
+            if verifier_head_hidden_state.shape != (batch_size, hidden_size):
+                raise ValueError(
+                    "verifier_head_hidden_state shape mismatch: got "
+                    f"{tuple(verifier_head_hidden_state.shape)}, expected "
+                    f"{(batch_size, hidden_size)}"
+                )
+            verifier_context = verifier_head_hidden_state.to(
+                device=anchor_context.device,
+                dtype=anchor_context.dtype,
+            )
+            assert self.verifier_anchor_initializer is not None
+            hidden_states = torch.cat(
+                [
+                    hidden_states,
+                    self.verifier_anchor_initializer(verifier_context),
+                ],
+                dim=-1,
+            )
+            dense_context_for_layers = torch.cat(
+                [anchor_context, verifier_context],
+                dim=-1,
+            )
+        else:
+            dense_context_for_layers = anchor_context
+
+        if self.verifier_hidden_residual is not None:
+            if verifier_pre_norm_hidden_state is None:
+                raise ValueError(
+                    "verifier_pre_norm_hidden_state is required when "
+                    "verifier_hidden_residual_rank > 0"
+                )
+            hidden_states = hidden_states + self.verifier_hidden_residual(
+                verifier_pre_norm_hidden_state.to(
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                )
+            )
+
+        anchor_dropout_probs = self._current_anchor_dropout_probs(
+            device=anchor_hidden_state.device,
+            global_step=None,
+        )
+        hidden_states = self._apply_anchor_dropout(
+            hidden_states,
+            probs=anchor_dropout_probs,
+        )
+        block_positions = torch.arange(self.block_size, device=hidden_states.device)
+        hidden_states = hidden_states + self.block_position_embeddings(block_positions)
+        hidden_states = self._apply_anchor_token_conditioning(
+            hidden_states,
+            anchor_token_ids,
+        )
+        hidden_states = self._apply_known_token_conditioning(
+            hidden_states,
+            known_token_ids,
+        )
+
+        (
+            sparse_rows,
+            sparse_mask,
+            local_rows,
+            local_mask,
+            refinement_rows,
+            refinement_mask,
+        ) = self._partition_live_mla_rows(
+            mla_cache_rows=mla_cache_rows,
+            mla_cache_rows_packed=mla_cache_rows_packed,
+            mla_cache_valid_mask=mla_cache_valid_mask,
+            verifier_layer_ids=verifier_layer_ids,
+            dtype=hidden_states.dtype,
+        )
+        if not self.config.anchor_only:
+            assert sparse_rows is not None
+            hidden_states = self._run_sparse_layers(
+                hidden_states,
+                sparse_rows,
+                sparse_mask,
+                anchor_hidden_state=dense_context_for_layers,
+                position_ids=position_ids,
+                ablate_sparse_mla_cross_attention=(ablate_sparse_mla_cross_attention),
+            )
+        hidden_states = self._run_local_layers(
+            hidden_states,
+            local_rows,
+            local_mask,
+            anchor_hidden_state=dense_context_for_layers,
+            position_ids=position_ids,
+            ablate_sparse_mla_cross_attention=ablate_sparse_mla_cross_attention,
+        )
+
+        base_logits = self._compute_base_logits(hidden_states, anchor_context)
+        rounds = int(getattr(self.config, "iterative_refinement_rounds", 1))
+        mode = getattr(self.config, "iterative_refinement_mode", "shared")
+        for extra_round_idx in range(rounds - 1):
+            candidate = self._prediction_conditioned_refinement_input(
+                hidden_states,
+                base_logits,
+            )
+            if mode == "shared":
+                if not self.config.anchor_only:
+                    assert sparse_rows is not None
+                    candidate = self._run_sparse_layers(
+                        candidate,
+                        sparse_rows,
+                        sparse_mask,
+                        anchor_hidden_state=dense_context_for_layers,
+                        position_ids=position_ids,
+                        ablate_sparse_mla_cross_attention=(
+                            ablate_sparse_mla_cross_attention
+                        ),
+                        active_start_override=2,
+                    )
+                candidate = self._run_local_layers(
+                    candidate,
+                    local_rows,
+                    local_mask,
+                    anchor_hidden_state=dense_context_for_layers,
+                    position_ids=position_ids,
+                    ablate_sparse_mla_cross_attention=(
+                        ablate_sparse_mla_cross_attention
+                    ),
+                )
+            else:
+                if refinement_rows is None:
+                    raise RuntimeError(
+                        "untied iterative refinement is missing its MLA rows"
+                    )
+                candidate = self._run_untied_refinement_layer(
+                    candidate,
+                    self.iterative_refinement_layers[extra_round_idx],
+                    refinement_rows[:, 0],
+                    (refinement_mask[:, 0] if refinement_mask is not None else None),
+                    anchor_hidden_state=dense_context_for_layers,
+                    position_ids=position_ids,
+                    ablate_sparse_mla_cross_attention=(
+                        ablate_sparse_mla_cross_attention
+                    ),
+                )
+            hidden_states, _, _ = self._blend_iterative_refinement(
+                hidden_states,
+                candidate,
+                extra_round_idx=extra_round_idx,
+            )
+            base_logits = self._compute_base_logits(hidden_states, anchor_context)
+        return base_logits
+
+
 class CausalCascadeForCausalLM(nn.Module):
     """Native vLLM wrapper for the GLM CausalCascade draft model.
 
-    This intentionally vendors the trained CausalCascade module instead of
-    importing the external training package at serving time. The first serving
-    path uses the faithful PyTorch sparse-MLA replay path from training; the
-    model exposes the absorbed-query pieces needed to replace that attention
-    replay with the live B12X sparse-MLA backend.
+    The trainable architecture comes from glmflash so training and serving load
+    the same module and parameter names. This wrapper only supplies vLLM's live
+    inputs, target-weight population, and model-loader contract.
     """
 
     packed_modules_mapping = {}
@@ -2884,13 +3326,30 @@ class CausalCascadeForCausalLM(nn.Module):
         del prefix
         super().__init__()
         config = vllm_config.speculative_config.draft_model_config.hf_config
-        slot1_bypass_override = _env_bool("CAUSAL_CASCADE_SLOT1_VERIFIER_HEAD_BYPASS")
-        if slot1_bypass_override is not None:
-            config.slot1_verifier_head_bypass = slot1_bypass_override
-        self.config = config
-        self.model = DFlashSparseMLADraftModel(config)
-        self.logits_processor = LogitsProcessor(
-            int(config.draft_vocab_size),
+        self.model = ServingSparseMLADraftModel(config)
+        self.config = self.model.config
+        native_mtp_config = SpeculativeConfig(
+            method="mtp",
+            num_speculative_tokens=1,
+            target_model_config=vllm_config.model_config,
+            target_parallel_config=vllm_config.parallel_config,
+            quantization=vllm_config.model_config.quantization,
+            draft_sample_method="greedy",
+        )
+        native_mtp_vllm_config = replace(
+            vllm_config,
+            speculative_config=native_mtp_config,
+        )
+        # The verifier embedding and LM head are attached after both models are
+        # loaded. Avoid allocating either shared matrix while constructing the
+        # embedded MTP layer; this is the key memory advantage over nesting a
+        # second native-MTP speculator.
+        from vllm.model_executor.models.deepseek_mtp import DeepSeekMTP
+
+        self.embedded_mtp = DeepSeekMTP(
+            vllm_config=native_mtp_vllm_config,
+            prefix="embedded_mtp",
+            allocate_shared_weights=False,
         )
 
     @property
@@ -2905,6 +3364,10 @@ class CausalCascadeForCausalLM(nn.Module):
     def markov_head_enabled(self) -> bool:
         return self.model.markov_head_enabled
 
+    @property
+    def slot1_native_anchor_enabled(self) -> bool:
+        return self.model.slot1_native_anchor_enabled
+
     def apply_markov_head(
         self,
         base_logits: torch.Tensor,
@@ -2916,6 +3379,8 @@ class CausalCascadeForCausalLM(nn.Module):
         self,
         *,
         anchor_hidden_state: torch.Tensor,
+        verifier_head_hidden_state: torch.Tensor | None = None,
+        verifier_pre_norm_hidden_state: torch.Tensor | None = None,
         anchor_token_ids: torch.Tensor | None = None,
         mla_cache_rows: torch.Tensor | None = None,
         mla_cache_rows_packed: torch.Tensor | None = None,
@@ -2927,6 +3392,8 @@ class CausalCascadeForCausalLM(nn.Module):
     ) -> torch.Tensor:
         return self.model.forward_logits(
             anchor_hidden_state=anchor_hidden_state,
+            verifier_head_hidden_state=verifier_head_hidden_state,
+            verifier_pre_norm_hidden_state=verifier_pre_norm_hidden_state,
             anchor_token_ids=anchor_token_ids,
             mla_cache_rows=mla_cache_rows,
             mla_cache_rows_packed=mla_cache_rows_packed,
@@ -2937,16 +3404,93 @@ class CausalCascadeForCausalLM(nn.Module):
             ablate_sparse_mla_cross_attention=ablate_sparse_mla_cross_attention,
         )
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embedded_mtp.embed_input_ids(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        intermediate_tensors=None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor:
+        """Run the single embedded GLM MTP layer and return its anchor state."""
+        return self.embedded_mtp(
+            input_ids=input_ids,
+            positions=positions,
+            hidden_states=hidden_states,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            spec_step_idx=spec_step_idx,
+        )
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.logits_processor(self.model.lm_head, hidden_states)
+        return self.model.lm_head(hidden_states)
 
     def load_weights(self, weights):
-        loaded_weights = AutoWeightsLoader(
+        causal_loader = AutoWeightsLoader(
             self.model,
             ignore_unexpected_prefixes=["verifier_lm_head"],
             ignore_unexpected_suffixes=["inv_freq"],
-        ).load_weights(weights)
-        return {f"model.{name}" for name in loaded_weights}
+        )
+        causal_loaded: set[str] = set()
+        mtp_prefixes = self.embedded_mtp.checkpoint_weight_name_prefixes
+
+        def mtp_weights():
+            for raw_name, weight in weights:
+                name = raw_name.removeprefix("causal_cascade.")
+                mtp_name = name.removeprefix("embedded_mtp.")
+                if any(mtp_name.startswith(prefix) for prefix in mtp_prefixes):
+                    yield mtp_name, weight
+                    continue
+                # Historical training checkpoints contain a frozen 1.9GB
+                # dense head. The live model intentionally owns no such
+                # parameter: logits and token rows use the verifier's head.
+                if name == "lm_head.weight":
+                    continue
+                loaded = causal_loader.load_weights([(name, weight)])
+                causal_loaded.update(loaded)
+
+        mtp_loaded = self.embedded_mtp.load_weights(mtp_weights())
+        return {
+            *(f"model.{name}" for name in causal_loaded),
+            *(f"embedded_mtp.{name}" for name in mtp_loaded),
+        }
+
+    def attach_target_shared_weights(self, target_model: nn.Module) -> None:
+        """Bind verifier-owned embedding/head matrices without copying them."""
+        target_language_model = (
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
+        )
+        target_inner = getattr(target_language_model, "model", target_language_model)
+        target_lm_head = getattr(target_language_model, "lm_head", None)
+        if target_lm_head is None:
+            target_lm_head = getattr(target_model, "lm_head", None)
+        target_embed = getattr(target_inner, "embed_tokens", None)
+        if target_embed is None:
+            target_embed = getattr(target_inner, "embedding", None)
+        if target_lm_head is None or target_embed is None:
+            raise RuntimeError(
+                "CausalCascade could not locate the verifier LM head and input "
+                "embedding required by the embedded MTP layer"
+            )
+
+        self.model.attach_verifier_lm_head(target_lm_head)
+        self.embedded_mtp.model.embed_tokens = target_embed
+        for layer in self.embedded_mtp.model.layers.values():
+            layer.shared_head.head = target_lm_head
+
+        # Native GLM MTP shares the verifier's sparse-indexer output. Keep the
+        # same aliasing when the MTP layer is embedded in CausalCascade.
+        target_topk = getattr(target_inner, "topk_indices_buffer", None)
+        if target_topk is not None:
+            for module in self.embedded_mtp.model.modules():
+                if hasattr(module, "topk_indices_buffer"):
+                    module.topk_indices_buffer = target_topk
 
     def populate_target_compatible_mla_weights(self, target_model: nn.Module) -> None:
         """Populate frozen target-compatible MLA tensors from a loaded target.
@@ -2970,12 +3514,6 @@ class CausalCascadeForCausalLM(nn.Module):
             raise RuntimeError(
                 "CausalCascade could not locate target model layers for "
                 "target-compatible MLA weight population."
-            )
-        target_norm = getattr(target_inner, "norm", None)
-        if target_norm is None or not hasattr(target_norm, "weight"):
-            raise RuntimeError(
-                "CausalCascade could not locate target model final RMSNorm "
-                "weight for slot1 verifier-head bypass."
             )
 
         def materialize_tp_weight(
@@ -3020,15 +3558,7 @@ class CausalCascadeForCausalLM(nn.Module):
                 f"a recognized TP shard for tp_size={tp_size}."
             )
 
-        final_norm_weight = materialize_tp_weight(
-            layer_id=-1,
-            name="model.norm.weight",
-            source=target_norm.weight,
-            expected=self.model.verifier_final_norm_weight,
-        )
-        self.model.load_verifier_final_norm_weight(final_norm_weight)
-
-        modules_by_layer: dict[int, list[SparseMLACrossAttention]] = {}
+        modules_by_layer: dict[int, list[CanonicalSparseMLACrossAttention]] = {}
         for module in self.model._iter_cross_attention_modules():
             if module.verifier_layer_id is None:
                 continue
@@ -3047,7 +3577,8 @@ class CausalCascadeForCausalLM(nn.Module):
                 q_a_weight = fused[:q_lora_rank]
             if q_a_weight is None:
                 raise RuntimeError(
-                    f"CausalCascade could not locate q_a weight on target layer {layer_id}."
+                    "CausalCascade could not locate q_a weight on target layer "
+                    f"{layer_id}."
                 )
 
             weights = {

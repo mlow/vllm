@@ -156,9 +156,7 @@ def _maybe_disable_unserialized_modelopt_fp4_nextn(
     # NVFP4 NextN experts must stay quantized. Remove only those synthetic
     # whole-layer entries and keep the checkpoint's finer-grained ignores such
     # as self_attn/indexer/shared_experts.
-    unquantized_prefixes = getattr(
-        config, "vllm_unquantized_mtp_layer_prefixes", None
-    )
+    unquantized_prefixes = getattr(config, "vllm_unquantized_mtp_layer_prefixes", None)
     exclude_modules = getattr(quant_config, "exclude_modules", None)
     if isinstance(unquantized_prefixes, list) and isinstance(exclude_modules, list):
         synthetic_ignores = {
@@ -306,22 +304,33 @@ class SharedHead(nn.Module):
         config: PretrainedConfig,
         prefix: str,
         quant_config: QuantizationConfig | None = None,
+        allocate_head: bool = True,
     ) -> None:
         super().__init__()
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "head"),
-        )
+        self.head: ParallelLMHead | None
+        if allocate_head:
+            self.head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "head"),
+            )
+        else:
+            self.head = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.norm(hidden_states)
 
 
 class DeepSeekMultiTokenPredictorLayer(nn.Module):
-    def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+        *,
+        allocate_shared_lm_head: bool = True,
+    ) -> None:
         super().__init__()
 
         config = vllm_config.speculative_config.draft_model_config.hf_config
@@ -361,7 +370,10 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             topk_scores_buffer = None
 
         self.shared_head = SharedHead(
-            config=config, prefix=prefix, quant_config=quant_config
+            config=config,
+            prefix=prefix,
+            quant_config=quant_config,
+            allocate_head=allocate_shared_lm_head,
         )
         self.mtp_block = DeepseekV2DecoderLayer(
             vllm_config,
@@ -406,7 +418,13 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        allocate_shared_weights: bool = True,
+    ):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
@@ -416,7 +434,9 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         self.layers = torch.nn.ModuleDict(
             {
                 str(idx): DeepSeekMultiTokenPredictorLayer(
-                    vllm_config, f"{prefix}.layers.{idx}"
+                    vllm_config,
+                    f"{prefix}.layers.{idx}",
+                    allocate_shared_lm_head=allocate_shared_weights,
                 )
                 for idx in range(
                     self.mtp_start_layer_idx,
@@ -424,11 +444,15 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                 )
             }
         )
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
-        )
+        self.embed_tokens: VocabParallelEmbedding | None
+        if allocate_shared_weights:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
+        else:
+            self.embed_tokens = None
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
     def set_skip_topk(self, skip: bool):
@@ -463,6 +487,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
                         topk_indices_buffer[:num_slots] = topk_indices_buffer[slot_ids]
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.embed_tokens is None:
+            raise RuntimeError("MTP input embedding has not been attached")
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -474,6 +500,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         if inputs_embeds is None:
+            if self.embed_tokens is None:
+                raise RuntimeError("MTP input embedding has not been attached")
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
         return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
@@ -491,6 +519,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        if mtp_layer.shared_head.head is None:
+            raise RuntimeError("MTP shared LM head has not been attached")
         logits = self.logits_processor(
             mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
         )
@@ -512,6 +542,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
         """
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
+        if mtp_layer.shared_head.head is None:
+            raise RuntimeError("MTP shared LM head has not been attached")
         return self.logits_processor.get_top_tokens(
             mtp_layer.shared_head.head,
             mtp_layer.shared_head(hidden_states),
@@ -520,7 +552,13 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        allocate_shared_weights: bool = True,
+    ):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         self.quant_config = _maybe_disable_unserialized_modelopt_fp4_nextn(
@@ -529,7 +567,9 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
         self.checkpoint_weight_name_prefixes = self._checkpoint_weight_name_prefixes()
         self._exclude_unquantized_mtp_layers_from_quant_config()
         self.model = DeepSeekMultiTokenPredictor(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+            allocate_shared_weights=allocate_shared_weights,
         )
         # Set MoE hyperparameters
         self.set_moe_parameters()
@@ -726,9 +766,7 @@ class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
                         has_fused_target = (
                             has_fused_target
                             or fused_weight in params_dict
-                            or _maybe_remap_fp8_scale_inv_name(
-                                name_mapped, params_dict
-                            )
+                            or _maybe_remap_fp8_scale_inv_name(name_mapped, params_dict)
                             in params_dict
                         )
                     if not has_fused_target:
