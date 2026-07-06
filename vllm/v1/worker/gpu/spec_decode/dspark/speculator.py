@@ -345,24 +345,37 @@ class DSparkSpeculator(DraftModelSpeculator):
             scheduled = int(input_batch.num_scheduled_tokens[req_idx])
             computed_end = computed_start + scheduled
 
+            # precompute_context_kv_flat was called before this method and
+            # populated DSpark's private KV for ALL positions in the batch
+            # (using target hidden states, which are available for all tokens
+            # even when they came from prefix cache).  Find the actual range
+            # of positions covered for this request.
+            req_start = int(input_batch.query_start_loc_np[req_idx])
+            req_end = int(input_batch.query_start_loc_np[req_idx + 1])
+            full_start = int(input_batch.positions[req_start].item())
+            full_end = int(input_batch.positions[req_end - 1].item()) + 1
+
             if self._cache_req_ids[state_idx] != req_id:
                 self._cache_req_ids[state_idx] = req_id
-                self._cache_trusted_start[state_idx] = computed_start
-                self._cache_trusted_end[state_idx] = computed_start
-                self._cache_ready[state_idx] = computed_start == 0
+                self._cache_trusted_start[state_idx] = full_start
+                self._cache_trusted_end[state_idx] = full_end
+                self._cache_ready[state_idx] = full_start == 0
 
             if computed_start > self._cache_trusted_end[state_idx]:
                 # A discontinuity means target KV came from vLLM's cache or a
-                # resumed request, not from DSpark's private cache population.
-                self._cache_trusted_start[state_idx] = computed_start
-                self._cache_trusted_end[state_idx] = computed_start
-                self._cache_ready[state_idx] = False
+                # resumed request, but precompute_context_kv_flat has already
+                # populated DSpark's private KV for the full batch range from
+                # target hidden states (these are always available for all
+                # tokens, even prefix-cached ones).  Trust the full range.
+                self._cache_trusted_start[state_idx] = full_start
+                self._cache_trusted_end[state_idx] = full_end
+                self._cache_ready[state_idx] = full_start == 0
             elif computed_start < self._cache_trusted_start[state_idx]:
                 # Request state was rewound. Treat the current row as a fresh
                 # contiguous region.
-                self._cache_trusted_start[state_idx] = computed_start
-                self._cache_trusted_end[state_idx] = computed_start
-                self._cache_ready[state_idx] = computed_start == 0
+                self._cache_trusted_start[state_idx] = full_start
+                self._cache_trusted_end[state_idx] = full_end
+                self._cache_ready[state_idx] = full_start == 0
 
             self._cache_trusted_end[state_idx] = max(
                 self._cache_trusted_end[state_idx],
