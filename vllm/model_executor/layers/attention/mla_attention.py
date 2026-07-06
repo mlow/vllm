@@ -556,6 +556,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             self.dcp_a2a
             and envs.VLLM_USE_B12X_DCP_A2A
             and self.attn_backend.get_name() == "B12X_MLA_SPARSE"
+            # The B12X PCIe DCP channel only exists for world sizes 2/4/8;
+            # other DCP sizes (e.g. TP6 with DCP3/DCP6) use NCCL collectives.
+            and _vllm_config is not None
+            and _vllm_config.parallel_config.decode_context_parallel_size
+            in (2, 4, 8)
         )
         self.dcp_max_batch_size = (
             int(_vllm_config.scheduler_config.max_num_batched_tokens)
