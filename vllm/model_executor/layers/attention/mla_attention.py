@@ -547,6 +547,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if _vllm_config is not None
             else 0
         )
+        # Hybrid DCP dispatch: the one-shot A2A/B12X exchange is
+        # latency-optimal for small decode batches but loses to pipelined
+        # NCCL collectives on large prefill/extend batches. Batches with more
+        # tokens than the cap take VLLM_DCP_A2A_LARGE_BACKEND instead
+        # (0 = uncapped, pure A2A).
+        self.dcp_a2a_max_tokens = envs.VLLM_DCP_A2A_MAX_TOKENS if self.dcp_a2a else 0
+        self.dcp_a2a_large_backend = envs.VLLM_DCP_A2A_LARGE_BACKEND
+        if self.dcp_a2a and self.dcp_a2a_large_backend not in ("ag_rs", "a2a"):
+            raise ValueError(
+                "VLLM_DCP_A2A_LARGE_BACKEND must be 'ag_rs' or 'a2a', got "
+                f"{self.dcp_a2a_large_backend!r}."
+            )
 
         # Initialize q/k/v range constants.
         self.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
@@ -839,8 +851,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 if isinstance(mqa_q, tuple):
                     # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                     mqa_q = torch.cat(mqa_q, dim=-1)
+                # Hybrid dispatch on the per-step token count. This is
+                # CUDA-graph safe: under capture the branch sees the padded
+                # capture size, so every graph bakes in one path, and eager
+                # prefill re-evaluates per step. All DCP ranks run the same
+                # batch, so the choice is uniform across the group.
+                dcp_small_batch = (
+                    self.dcp_a2a_max_tokens <= 0
+                    or num_mqa_tokens <= self.dcp_a2a_max_tokens
+                )
+                dcp_use_b12x = self.dcp_b12x and dcp_small_batch
+                dcp_use_a2a = self.dcp_a2a and (
+                    dcp_small_batch or self.dcp_a2a_large_backend != "ag_rs"
+                )
                 # mqa_q do allgather in head dim.
-                if self.dcp_b12x:
+                if dcp_use_b12x:
                     mqa_q = dcp_b12x_all_gather_heads(
                         mqa_q,
                         get_dcp_group(),
@@ -857,17 +882,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
-                if self.dcp_a2a:
+                if lse is None:
+                    raise RuntimeError(
+                        f"{type(self.impl).__name__} did not return decode "
+                        "softmax LSE required by DCP."
+                    )
+                if dcp_use_a2a:
                     attn_out = dcp_a2a_lse_reduce(
                         attn_out,
                         lse,
                         get_dcp_group(),
                         is_lse_base_on_e=self.impl.lse_base_on_e,
-                        use_b12x=self.dcp_b12x,
+                        use_b12x=dcp_use_b12x,
                         b12x_max_batch_size=self.dcp_max_batch_size,
-                        b12x_query_head_dim=(
-                            self.kv_lora_rank + self.qk_rope_head_dim
-                        ),
+                        b12x_query_head_dim=(self.kv_lora_rank + self.qk_rope_head_dim),
                     )
                 else:
                     attn_out = cp_lse_ag_out_rs(

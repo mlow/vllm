@@ -415,6 +415,100 @@ def test_b12x_query_gather_dispatch_bypasses_group(monkeypatch: pytest.MonkeyPat
     }
 
 
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_lse_reduce_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "4")
+    created: dict[str, Any] = {}
+    sentinel = torch.zeros(1)
+
+    class _FakePool:
+        def lse_reduce_scatter(self, out, lse, *, is_lse_base_on_e):
+            return sentinel
+
+    def fake_get_pool(
+        cp_group, *, device, total_heads, head_dim, query_head_dim, max_batch_size
+    ):
+        created["max_batch_size"] = max_batch_size
+        return _FakePool()
+
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
+    group = _FakeCPGroup(4, None)  # type: ignore[arg-type]
+
+    out = torch.zeros(4, 16, 64, dtype=torch.bfloat16, device="cuda")
+    lse = torch.zeros(4, 16, dtype=torch.float32, device="cuda")
+    result = dcp_alltoall._try_b12x_dcp_lse_reduce(
+        out,
+        lse,
+        group,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        max_batch_size=8192,
+        query_head_dim=64,
+    )
+    # Batch within the cap uses B12X, with the staging pool capped too.
+    assert result is sentinel
+    assert created["max_batch_size"] == 4
+
+    out_large = torch.zeros(8, 16, 64, dtype=torch.bfloat16, device="cuda")
+    lse_large = torch.zeros(8, 16, dtype=torch.float32, device="cuda")
+    result = dcp_alltoall._try_b12x_dcp_lse_reduce(
+        out_large,
+        lse_large,
+        group,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        max_batch_size=8192,
+        query_head_dim=64,
+    )
+    # Batch above the cap declines B12X so the caller picks an NCCL path.
+    assert result is None
+
+
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "4")
+    created: dict[str, Any] = {}
+    sentinel = torch.zeros(1)
+
+    class _FakePool:
+        def all_gather_heads(self, local_input):
+            return sentinel
+
+    def fake_get_pool(
+        cp_group, *, device, total_heads, head_dim, query_head_dim, max_batch_size
+    ):
+        created["max_batch_size"] = max_batch_size
+        return _FakePool()
+
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", fake_get_pool)
+    group = _FakeCPGroup(4, None)  # type: ignore[arg-type]
+
+    small = torch.zeros(4, 8, 64, dtype=torch.bfloat16, device="cuda")
+    result = dcp_alltoall._try_b12x_dcp_all_gather_heads(
+        small,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8192,
+        output_head_dim=64,
+    )
+    assert result is sentinel
+    assert created["max_batch_size"] == 4
+
+    large = torch.zeros(8, 8, 64, dtype=torch.bfloat16, device="cuda")
+    result = dcp_alltoall._try_b12x_dcp_all_gather_heads(
+        large,
+        group,  # type: ignore[arg-type]
+        max_batch_size=8192,
+        output_head_dim=64,
+    )
+    assert result is None
+
+
 def test_b12x_query_gather_requires_env(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 

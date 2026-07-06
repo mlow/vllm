@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_MOE: bool = False
     VLLM_USE_B12X_MINIMAX_M3_MSA: bool = False
     VLLM_USE_B12X_DCP_A2A: bool = False
+    VLLM_DCP_A2A_MAX_TOKENS: int = 0
+    VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
@@ -1072,6 +1074,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Use b12x PCIe collectives for DCP query gather and output reduction.
     "VLLM_USE_B12X_DCP_A2A": lambda: bool(int(os.getenv("VLLM_USE_B12X_DCP_A2A", "0"))),
+    # Token cap for the low-latency DCP A2A exchange (0 = uncapped). Batches
+    # with more tokens than this bypass the one-shot A2A/B12X path, which is
+    # latency-optimal for small decode batches but loses to pipelined NCCL
+    # collectives on large prefill/extend batches. Also bounds the B12X DCP
+    # IPC staging allocation, which scales linearly with this value.
+    "VLLM_DCP_A2A_MAX_TOKENS": lambda: int(os.getenv("VLLM_DCP_A2A_MAX_TOKENS", "0")),
+    # Collective pattern used for DCP batches above VLLM_DCP_A2A_MAX_TOKENS:
+    # "ag_rs" (default) routes them through the AllGather+ReduceScatter path;
+    # "a2a" keeps the NCCL all-to-all exchange (without B12X staging).
+    "VLLM_DCP_A2A_LARGE_BACKEND": lambda: os.getenv(
+        "VLLM_DCP_A2A_LARGE_BACKEND", "ag_rs"
+    ),
     # Shard the draft model's DCP caches like the target model. Truthy values:
     # "1"/"true"/"yes". Unset picks a per-call-site default: sharded for the
     # target indexer cache and native MTP drafts, replicated for external
