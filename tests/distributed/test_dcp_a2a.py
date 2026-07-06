@@ -532,6 +532,32 @@ def test_b12x_query_gather_requires_env(monkeypatch: pytest.MonkeyPatch):
     assert actual is expected
 
 
+def test_warmup_skips_unsupported_world_size(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_try_b12x_dcp_all_gather_heads",
+        lambda *args, **kwargs: pytest.fail(
+            "warmup must not touch the B12X channel for world size 6"
+        ),
+    )
+    group = _FakeCPGroup(6, None)  # type: ignore[arg-type]
+
+    # Must log-and-return instead of raising: the runtime dispatchers fall
+    # back to NCCL for DCP world sizes without a B12X channel (e.g. TP6).
+    dcp_alltoall.warmup_b12x_dcp_a2a(
+        group,  # type: ignore[arg-type]
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+        max_batch_size=8192,
+        total_heads=66,
+        head_dim=512,
+        query_head_dim=576,
+    )
+
+
 class TestPackedA2AKernels:
     @pytest.mark.skipif(
         torch.accelerator.device_count() < 1, reason="CUDA is required."

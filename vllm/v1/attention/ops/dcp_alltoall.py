@@ -292,6 +292,16 @@ def warmup_b12x_dcp_a2a(
     """Create and exercise the B12X DCP channel before CUDA graph capture."""
     if not envs.VLLM_USE_B12X_DCP_A2A:
         return
+    if cp_group.world_size not in (2, 4, 8):
+        # The PCIe channel only exists for these world sizes. The runtime
+        # dispatchers already fall back to NCCL collectives per call, so an
+        # unsupported DCP size (e.g. TP6 with DCP3/DCP6) must not fail boot.
+        logger.warning_once(
+            "B12X PCIe DCP collectives support world sizes 2/4/8; "
+            "DCP world size %d uses NCCL collectives instead.",
+            cp_group.world_size,
+        )
+        return
     if query_head_dim is None:
         query_head_dim = head_dim
     local_query = torch.empty(
