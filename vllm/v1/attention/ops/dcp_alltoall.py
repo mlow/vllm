@@ -166,6 +166,13 @@ def _try_b12x_dcp_lse_reduce(
     if max_batch_size is None:
         max_batch_size = batch
     max_batch_size = int(max_batch_size)
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    if token_cap > 0:
+        # Deliberate hybrid dispatch: batches above the cap take a pipelined
+        # NCCL collective instead, and the staging pool shrinks to the cap.
+        if batch > token_cap:
+            return None
+        max_batch_size = min(max_batch_size, token_cap)
     if max_batch_size < 1:
         return None
     if query_head_dim is None:
@@ -225,6 +232,11 @@ def _try_b12x_dcp_all_gather_heads(
     if max_batch_size is None:
         max_batch_size = batch
     max_batch_size = int(max_batch_size)
+    token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
+    if token_cap > 0:
+        if batch > token_cap:
+            return None
+        max_batch_size = min(max_batch_size, token_cap)
     if max_batch_size < 1 or batch > max_batch_size:
         return None
     if output_head_dim is None:
