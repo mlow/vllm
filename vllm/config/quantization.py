@@ -147,18 +147,23 @@ ONLINE_QUANT_SHORTHAND_NAMES: tuple[str, ...] = (
 )
 
 
-# Checkpoint formats that support overlaying online MXFP8 on BF16 projections
+# Checkpoint formats that support overlaying online quantization on BF16 projections
 # which the checkpoint explicitly leaves unquantized (shared experts via
 # `shared_experts`, other dense linears via `linear`).
-_MODELOPT_MXFP8_OVERLAY_NAMES = frozenset(
-    {"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed"}
+_MODELOPT_ONLINE_OVERLAY_NAMES = frozenset(
+    {"modelopt", "modelopt_fp4", "modelopt_mxfp8", "modelopt_mixed", "mxfp4"}
 )
 
 
-def _is_modelopt_mxfp8_overlay(
+_MODELOPT_ONLINE_OVERLAY_WEIGHTS = frozenset(
+    {kMxfp8Dynamic, kFp8Static128BlockSym}
+)
+
+
+def _is_modelopt_online_overlay(
     quantization: str | None, args: QuantizationConfigArgs
 ) -> bool:
-    if quantization not in _MODELOPT_MXFP8_OVERLAY_NAMES or args.moe is not None:
+    if quantization not in _MODELOPT_ONLINE_OVERLAY_NAMES or args.moe is not None:
         return False
     specs = [s for s in (args.linear, args.shared_experts) if s is not None]
     if not specs:
@@ -167,7 +172,9 @@ def _is_modelopt_mxfp8_overlay(
         # `ignore` only filters the dense-linear overlay.
         return False
     return all(
-        spec.weight == kMxfp8Dynamic and spec.activation is None for spec in specs
+        spec.weight in _MODELOPT_ONLINE_OVERLAY_WEIGHTS
+        and spec.activation is None
+        for spec in specs
     )
 
 
@@ -181,21 +188,22 @@ def resolve_quantization_config(
     `quantization` may be a CLI shorthand that desugars into a base config via
     `_ONLINE_SHORTHANDS`. `quantization_config` is a dict or pre-built args
     object. When both are online settings, fields explicitly set in
-    `quantization_config` take precedence over the shorthand. ModelOpt also
-    accepts the MXFP8 shared-expert overlay.
+    `quantization_config` take precedence over the shorthand. ModelOpt accepts
+    online overlays for BF16 dense/shared-expert projections.
     """
     if isinstance(quantization_config, dict):
         quantization_config = QuantizationConfigArgs(**quantization_config)
 
     if quantization is not None and quantization not in ONLINE_QUANT_SHORTHAND_NAMES:
-        if quantization_config is not None and not _is_modelopt_mxfp8_overlay(
+        if quantization_config is not None and not _is_modelopt_online_overlay(
             quantization, quantization_config
         ):
             raise ValueError(
                 f"quantization_config is only supported when quantization is "
                 f"one of {sorted(ONLINE_QUANT_SHORTHAND_NAMES)}, or when "
-                f"using the ModelOpt MXFP8 overlay (weight='mxfp8' on "
-                f"'shared_experts' and/or 'linear', optional 'ignore'), "
+                f"using the ModelOpt online overlay (weight='mxfp8' or "
+                f"weight='fp8_per_block_static' on 'shared_experts' and/or "
+                f"'linear', optional 'ignore'), "
                 f"got quantization={quantization!r}"
             )
         return quantization_config
