@@ -4,6 +4,7 @@
 import torch
 
 from vllm.config import get_current_vllm_config
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -31,6 +32,9 @@ from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
+)
+from vllm.model_executor.layers.quantization.online.base import (
+    OnlineQuantizationConfig,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
@@ -251,6 +255,21 @@ class Mxfp4Config(QuantizationConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 return UnquantizedLinearMethod()
+            args = get_current_vllm_config().model_config.quantization_config
+            if isinstance(args, QuantizationConfigArgs) and (
+                args.linear is not None or args.shared_experts is not None
+            ):
+                online_config = OnlineQuantizationConfig(args)
+                online_config.packed_modules_mapping = self.packed_modules_mapping
+                method = online_config.get_quant_method(layer, prefix)
+                if not isinstance(method, UnquantizedLinearMethod):
+                    logger.info_once(
+                        "MXFP4 dense-linear online overlay: quantizing BF16 "
+                        "linear weights at load time while keeping routed "
+                        "experts on the MXFP4 MoE path (module example: %s).",
+                        prefix,
+                    )
+                return method
             logger.debug_once(
                 "MXFP4 linear layer is not implemented - falling back to "
                 "UnquantizedLinearMethod.",

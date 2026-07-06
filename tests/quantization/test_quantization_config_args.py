@@ -137,6 +137,26 @@ def test_resolve_allows_modelopt_dense_linear_overlay():
     assert args == QuantizationConfigArgs(linear={"weight": "mxfp8"})
 
 
+def test_resolve_allows_mxfp4_dense_linear_mxfp8_overlay():
+    args = resolve_quantization_config(
+        "mxfp4",
+        {"linear": {"weight": "mxfp8"}},
+    )
+    assert args == QuantizationConfigArgs(linear={"weight": "mxfp8"})
+
+
+def test_resolve_allows_mxfp4_dense_linear_fp8_overlay():
+    args = resolve_quantization_config(
+        "mxfp4",
+        {
+            "linear": {"weight": "fp8_per_block_static"},
+            "ignore": ["re:.*indexer\\.weights_proj"],
+        },
+    )
+    assert args.linear == QuantSpec(weight=kFp8Static128BlockSym)
+    assert args.ignore == ["re:.*indexer\\.weights_proj"]
+
+
 def test_resolve_allows_modelopt_combined_overlay_with_ignore():
     args = resolve_quantization_config(
         "modelopt_fp4",
@@ -152,7 +172,7 @@ def test_resolve_allows_modelopt_combined_overlay_with_ignore():
 
 
 def test_resolve_rejects_modelopt_ignore_without_linear():
-    with pytest.raises(ValueError, match="MXFP8 overlay"):
+    with pytest.raises(ValueError, match="online overlay"):
         resolve_quantization_config(
             "modelopt_fp4",
             {"shared_experts": "mxfp8", "ignore": ["re:.*o_proj"]},
@@ -160,7 +180,7 @@ def test_resolve_rejects_modelopt_ignore_without_linear():
 
 
 def test_resolve_rejects_modelopt_moe_override():
-    with pytest.raises(ValueError, match="MXFP8 overlay"):
+    with pytest.raises(ValueError, match="online overlay"):
         resolve_quantization_config(
             "modelopt_fp4",
             {"linear": {"weight": "mxfp8"}, "moe": "mxfp8"},
