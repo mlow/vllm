@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.config.virtual_tp import VIRTUAL_TP_PLAN_ATTR
 from vllm.distributed import (
@@ -1376,14 +1375,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "intermediate_tensors": 0,
-        "inputs_embeds": 0,
-    }
-)
 class DeepseekV4Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
