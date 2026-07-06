@@ -228,6 +228,40 @@ class FixFunctionalizationPass(VllmInductorPass):
             ):
                 mutated_args = {1: "x"}
                 self.defunctionalize(graph, node, mutated_args=mutated_args)
+            elif (
+                at_target
+                == torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.default
+            ):
+                # k_cache is mutated (see torch_bindings.cpp: Tensor! k_cache).
+                # Returns Tensor, so getitem[0]=output, getitem[1]=k_cache.
+                mutated_args = {1: "k_cache"}
+                self.defunctionalize(graph, node, mutated_args=mutated_args)
+            elif (
+                at_target
+                == torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert.default
+            ):
+                # Returns void; q and k_cache are mutated (Tensor! q, Tensor! k_cache).
+                # getitem[0]=q, getitem[1]=k_cache — no return value.
+                getitem_nodes = self.getitem_users(node)
+                for idx, arg_name in [(0, "q"), (1, "k_cache")]:
+                    user = getitem_nodes[idx]
+                    user.replace_all_uses_with(node.kwargs[arg_name])
+                    self._remove(user)
+                self.insert_defunctionalized(graph, node)
+                self._remove(node)
+            elif (
+                at_target
+                == torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert.default
+            ):
+                # Returns void; q_fp8 and k_cache are mutated.
+                # getitem[0]=q_fp8, getitem[1]=k_cache — no return value.
+                getitem_nodes = self.getitem_users(node)
+                for idx, arg_name in [(0, "q_fp8"), (1, "k_cache")]:
+                    user = getitem_nodes[idx]
+                    user.replace_all_uses_with(node.kwargs[arg_name])
+                    self._remove(user)
+                self.insert_defunctionalized(graph, node)
+                self._remove(node)
             else:
                 continue  # skip the count
 
