@@ -36,6 +36,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.online.base import (
     OnlineQuantizationConfig,
 )
+from vllm.model_executor.layers.quantization.online.mxfp8 import (
+    is_shared_expert_projection,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
@@ -176,8 +179,7 @@ def _mxfp4_realign_w2_fp4_e8m0_to_local_k32(
             byte_start = k_start // 2
             byte_count = _ceil_div(group_k, 2)
             source_groups = (
-                (source_k_offset + k_start + local_cols[:group_k])
-                // _MXFP4_GROUP_SIZE
+                (source_k_offset + k_start + local_cols[:group_k]) // _MXFP4_GROUP_SIZE
             ).to(torch.long)
 
             for row_start in range(0, w2_flat.shape[0], row_chunk):
@@ -256,8 +258,16 @@ class Mxfp4Config(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
             args = get_current_vllm_config().model_config.quantization_config
-            if isinstance(args, QuantizationConfigArgs) and (
-                args.linear is not None or args.shared_experts is not None
+            if (
+                isinstance(args, QuantizationConfigArgs)
+                and (args.linear is not None or args.shared_experts is not None)
+                # Match the ModelOpt overlay semantics: the `linear` spec never
+                # touches shared-expert projections; those are quantized only
+                # when a `shared_experts` spec is given explicitly.
+                and (
+                    args.shared_experts is not None
+                    or not is_shared_expert_projection(prefix)
+                )
             ):
                 online_config = OnlineQuantizationConfig(args)
                 online_config.packed_modules_mapping = self.packed_modules_mapping
