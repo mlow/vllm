@@ -201,6 +201,16 @@ def _try_b12x_dcp_lse_reduce(
         )
         return None
 
+    # Sparse MLA backends can return head-sliced views (e.g. GLM TP6 pads
+    # 64 -> 66 heads and slices the kernel output back), and the PCIe pool
+    # requires contiguous operands. The NCCL packers take explicit strides,
+    # so only this fast path needs the copy; LSE is tiny and the output is
+    # already contiguous on unpadded head counts.
+    if not cp_attn_out.is_contiguous():
+        cp_attn_out = cp_attn_out.contiguous()
+    if not cp_attn_lse.is_contiguous():
+        cp_attn_lse = cp_attn_lse.contiguous()
+
     return pool.lse_reduce_scatter(
         cp_attn_out,
         cp_attn_lse,

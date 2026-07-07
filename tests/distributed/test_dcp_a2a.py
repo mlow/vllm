@@ -509,6 +509,49 @@ def test_b12x_query_gather_honors_token_cap(monkeypatch: pytest.MonkeyPatch):
     assert result is None
 
 
+@pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
+def test_b12x_lse_reduce_makes_views_contiguous(monkeypatch: pytest.MonkeyPatch):
+    """Head-sliced attention views must reach the PCIe pool contiguous."""
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    received: dict[str, Any] = {}
+    sentinel = torch.zeros(1)
+
+    class _FakePool:
+        def lse_reduce_scatter(self, out, lse, *, is_lse_base_on_e):
+            received.update(out=out, lse=lse)
+            return sentinel
+
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_get_b12x_dcp_a2a_pool",
+        lambda *a, **k: _FakePool(),
+    )
+    group = _FakeCPGroup(4, None)  # type: ignore[arg-type]
+
+    # Simulate the GLM TP6 head66 pattern: kernel-padded buffers sliced back
+    # in the head dim produce non-contiguous views.
+    out_padded = torch.zeros(4, 24, 64, dtype=torch.bfloat16, device="cuda")
+    lse_padded = torch.zeros(4, 24, dtype=torch.float32, device="cuda")
+    out_view = out_padded[:, :16]
+    lse_view = lse_padded[:, :16]
+    assert not out_view.is_contiguous() and not lse_view.is_contiguous()
+
+    result = dcp_alltoall._try_b12x_dcp_lse_reduce(
+        out_view,
+        lse_view,
+        group,  # type: ignore[arg-type]
+        return_lse=False,
+        is_lse_base_on_e=True,
+        max_batch_size=8192,
+        query_head_dim=64,
+    )
+    assert result is sentinel
+    assert received["out"].is_contiguous()
+    assert received["lse"].is_contiguous()
+
+
 def test_b12x_query_gather_requires_env(monkeypatch: pytest.MonkeyPatch):
     from vllm.v1.attention.ops import dcp_alltoall
 
