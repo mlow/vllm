@@ -993,6 +993,9 @@ class ModelConfig:
                 "modelopt",
                 "modelopt_fp4",
                 "modelopt_mxfp8",
+                # "mxfp8" aliases ModelOptMxFp8Config for MiniMax-style
+                # checkpoints, so it participates in override detection too.
+                "mxfp8",
                 "modelopt_mixed",
                 # Ensure heavy backends are probed last to avoid unnecessary
                 # imports during override detection (e.g., MXFP4 imports Triton)
