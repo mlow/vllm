@@ -92,7 +92,10 @@ def test_dflash_speculators_preserves_swa_config():
 def _compute_dflash_hash(hf_config: SimpleNamespace) -> str:
     config = object.__new__(SpeculativeConfig)
     config.method = "dflash"
-    config.draft_model_config = SimpleNamespace(hf_config=hf_config)
+    config.draft_model_config = SimpleNamespace(
+        hf_config=hf_config,
+        compute_hash=lambda: "draft-model-hash",
+    )
     return config.compute_hash()
 
 
