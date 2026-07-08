@@ -1,0 +1,647 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+import numpy as np
+import torch
+
+from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.worker.gpu.async_utils import async_copy_to_np
+from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+from vllm.v1.worker.gpu.input_batch import (
+    combine_sampled_and_draft_tokens,
+    expand_idx_mapping,
+    prepare_pos_seq_lens,
+    prepare_prefill_inputs,
+)
+
+logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.attn_utils import AttentionCGSupportInfo
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+    from vllm.v1.worker.gpu.states import RequestState
+
+
+@triton.jit
+def _compact_token_inputs_kernel(
+    input_ids_ptr,
+    positions_ptr,
+    old_query_start_loc_ptr,
+    new_query_start_loc_ptr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    old_start = tl.load(old_query_start_loc_ptr + req_idx)
+    new_start = tl.load(new_query_start_loc_ptr + req_idx)
+    new_end = tl.load(new_query_start_loc_ptr + req_idx + 1)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < (new_end - new_start)
+    input_ids = tl.load(input_ids_ptr + old_start + offsets, mask=mask)
+    positions = tl.load(positions_ptr + old_start + offsets, mask=mask)
+    tl.store(input_ids_ptr + new_start + offsets, input_ids, mask=mask)
+    tl.store(positions_ptr + new_start + offsets, positions, mask=mask)
+
+
+def get_draft_token_capacities(
+    idx_mapping_np: np.ndarray,
+    draft_token_capacity_np: np.ndarray,
+    valid_draft_tokens_per_req: np.ndarray | None = None,
+) -> np.ndarray:
+    capacities = draft_token_capacity_np[idx_mapping_np]
+    if valid_draft_tokens_per_req is not None:
+        capacities = np.minimum(capacities, valid_draft_tokens_per_req)
+    return capacities
+
+
+def count_valid_draft_tokens(
+    draft_token_lists: Sequence[Sequence[int]],
+    num_reqs: int,
+) -> np.ndarray:
+    """Grammar-validated draft ids round-trip through the scheduler; negative
+    ids mark invalidated drafts."""
+    return np.fromiter(
+        (sum(token_id >= 0 for token_id in tokens) for tokens in draft_token_lists),
+        dtype=np.int32,
+        count=num_reqs,
+    )
+
+
+class CapacityBasedVerificationManager:
+    def __init__(
+        self,
+        max_num_tokens: int,
+        req_states: "RequestState",
+        device: torch.device,
+    ):
+        self.max_num_tokens = max_num_tokens
+        self.device = device
+        self.req_states = req_states
+        # Debug (VLLM_DSPARK_TP_CHECK={1,2}): cross-check capacity-derived
+        # batch shapes (=2 also GPU-side capacity/STS state) across TP ranks
+        # each step via check_dspark_tp_consistency; divergence otherwise
+        # surfaces as a collective-size-mismatch hang far downstream.
+        self.tp_check_level = int(os.environ.get("VLLM_DSPARK_TP_CHECK", "0") or "0")
+        self.draft_token_capacity_np = np.full(
+            req_states.max_num_reqs,
+            req_states.num_speculative_steps,
+            dtype=np.int32,
+        )
+        self.copy_stream = torch.cuda.Stream(device)
+        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
+        self.copy_event = torch.cuda.Event(blocking=True)
+
+        self.req_ids: list[str] = []
+        self.idx_mapping_np: np.ndarray | None = None
+        self.copied_draft_token_capacity_np: np.ndarray | None = None
+        self.copied_req_ids: list[str] = []
+        self.copied_idx_mapping_np: np.ndarray | None = None
+        self.num_draft_tokens: int = 0
+        self.copy_event_pending = False
+        self.varlen_spec_decode = False
+
+    def add_request(self, req_idx: int) -> None:
+        self.draft_token_capacity_np[req_idx] = self.req_states.num_speculative_steps
+
+    def _stage_draft_token_capacity_copy(
+        self,
+        draft_token_capacity: torch.Tensor,
+    ) -> None:
+        self.num_draft_tokens = self.req_states.num_speculative_steps
+        self.copied_draft_token_capacity_np = None
+        self.copied_req_ids = self.req_ids
+        assert self.idx_mapping_np is not None
+        self.copied_idx_mapping_np = self.idx_mapping_np
+        self.copy_event_pending = False
+
+        current_stream = torch.cuda.current_stream(self.device)
+        self.copy_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.copy_stream):
+            self.copied_draft_token_capacity_np = async_copy_to_np(draft_token_capacity)
+            draft_token_capacity.record_stream(self.copy_stream)
+            self.copy_event.record()
+            self.copy_event_pending = True
+
+    def update_capacities(self, draft_token_capacity: torch.Tensor) -> None:
+        self._flush_draft_token_capacity_copy()
+        assert self.idx_mapping_np is not None
+        self._stage_draft_token_capacity_copy(draft_token_capacity)
+
+    def get_num_tokens(
+        self,
+        num_tokens_per_req: dict[str, int],
+        draft_tokens: dict[str, list[int]],
+        has_structured_output_requests: bool = False,
+    ) -> int:
+        raise NotImplementedError
+
+    def _flush_draft_token_capacity_copy(self) -> None:
+        if self.copied_draft_token_capacity_np is None:
+            return
+        if self.copy_event_pending:
+            # Block until the staged copy lands: batch shapes derived from the
+            # capacities must be identical on every TP rank, so an
+            # opportunistic query() (timing-dependent per rank) could diverge
+            # graph dispatch.
+            self.copy_event.synchronize()
+            self.copy_event_pending = False
+        capacities = np.clip(
+            self.copied_draft_token_capacity_np, 0, self.num_draft_tokens
+        )
+        num_copied = capacities.shape[0]
+        req_ids = self.copied_req_ids[:num_copied]
+        assert self.copied_idx_mapping_np is not None
+        idx_mapping_np = self.copied_idx_mapping_np[:num_copied]
+        req_id_to_index = self.req_states.req_id_to_index
+        active = np.fromiter(
+            (req_id in req_id_to_index for req_id in req_ids),
+            dtype=np.bool_,
+            count=len(req_ids),
+        )
+        self.draft_token_capacity_np[idx_mapping_np[active]] = capacities[active]
+        self.copied_draft_token_capacity_np = None
+
+    def warmup(self, input_buffers: "InputBuffers") -> None:
+        pass
+
+    def _remember_batch(self, input_batch: "InputBatch") -> None:
+        self.req_ids = list(input_batch.req_ids)
+        self.idx_mapping_np = input_batch.idx_mapping_np
+
+    @staticmethod
+    def _get_num_bonus_tokens(input_batch: "InputBatch") -> int:
+        num_logits = np.diff(input_batch.cu_num_logits_np)
+        num_bonus_tokens_per_req = num_logits - input_batch.num_draft_tokens_per_req
+        num_bonus_tokens = int(num_bonus_tokens_per_req[0])
+        assert np.all(num_bonus_tokens_per_req == num_bonus_tokens)
+        return num_bonus_tokens
+
+    def _set_token_views(
+        self,
+        input_batch: "InputBatch",
+        num_tokens: int | None = None,
+    ) -> "InputBatch":
+        n = input_batch.num_tokens_after_padding if num_tokens is None else num_tokens
+        input_batch.input_ids = input_batch.input_ids.as_strided((n,), (1,))
+        input_batch.positions = input_batch.positions.as_strided((n,), (1,))
+        input_batch.is_padding = input_batch.is_padding.as_strided((n,), (1,))
+        return input_batch
+
+    def trim_batch(
+        self,
+        input_batch: "InputBatch",
+    ) -> "InputBatch":
+        raise NotImplementedError
+
+
+class VarlenCapacityBasedVerificationManager(CapacityBasedVerificationManager):
+    def __init__(
+        self,
+        max_num_tokens: int,
+        req_states: "RequestState",
+        device: torch.device,
+    ):
+        super().__init__(max_num_tokens, req_states, device)
+        self.varlen_spec_decode = True
+
+    def get_num_tokens(
+        self,
+        num_tokens_per_req: dict[str, int],
+        draft_tokens: dict[str, list[int]],
+        has_structured_output_requests: bool = False,
+    ) -> int:
+        self._flush_draft_token_capacity_copy()
+        num_reqs = len(num_tokens_per_req)
+        req_ids = sorted(
+            num_tokens_per_req,
+            key=num_tokens_per_req.get,  # type: ignore[arg-type]
+        )
+        num_scheduled_tokens = np.fromiter(
+            (num_tokens_per_req[req_id] for req_id in req_ids),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        draft_token_lists = [draft_tokens.get(req_id, ()) for req_id in req_ids]
+        num_draft_tokens_per_req = np.fromiter(
+            (len(tokens) for tokens in draft_token_lists),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        if has_structured_output_requests:
+            valid_num_draft_tokens_per_req = count_valid_draft_tokens(
+                draft_token_lists, num_reqs
+            )
+        else:
+            # Otherwise the scheduler only sees -1 placeholders (real draft ids
+            # stay on the GPU), so every scheduled slot counts.
+            valid_num_draft_tokens_per_req = num_draft_tokens_per_req
+        idx_mapping_np = np.fromiter(
+            (self.req_states.req_id_to_index[req_id] for req_id in req_ids),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        total_num_draft_tokens = int(
+            get_draft_token_capacities(
+                idx_mapping_np,
+                self.draft_token_capacity_np,
+                valid_num_draft_tokens_per_req,
+            ).sum()
+        )
+        return int(
+            num_scheduled_tokens.sum()
+            - num_draft_tokens_per_req.sum()
+            + total_num_draft_tokens
+        )
+
+    def warmup(self, input_buffers: "InputBuffers") -> None:
+        max_query_len = self.req_states.num_speculative_steps + 1
+        num_reqs = max(
+            1,
+            min(
+                self.req_states.max_num_reqs,
+                self.max_num_tokens // max_query_len,
+            ),
+        )
+        lengths = set()
+        max_warmup_query_len = min(self.max_num_tokens, 2048)
+        block_size = 1
+        while block_size <= max_warmup_query_len:
+            lengths.add(block_size)
+            block_size *= 2
+        lengths.add(max_query_len)
+
+        idx_mapping_np = np.arange(num_reqs, dtype=np.int32)
+        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        for query_len in sorted(lengths):
+            reqs_for_len = max(1, min(num_reqs, self.max_num_tokens // query_len))
+            num_tokens = reqs_for_len * query_len
+            query_start_loc_np = np.arange(
+                0,
+                num_tokens + 1,
+                query_len,
+                dtype=np.int32,
+            )
+            query_start_loc = input_buffers.query_start_loc[: reqs_for_len + 1]
+            async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+            input_ids = input_buffers.input_ids[:num_tokens]
+            positions = input_buffers.positions[:num_tokens]
+            seq_lens = input_buffers.seq_lens
+
+            _compact_token_inputs_kernel[(reqs_for_len,)](
+                input_ids,
+                positions,
+                query_start_loc,
+                query_start_loc,
+                BLOCK_SIZE=triton.next_power_of_2(query_len),
+            )
+            prepare_pos_seq_lens(
+                idx_mapping[:reqs_for_len],
+                query_start_loc,
+                self.req_states.num_computed_tokens.gpu,
+                positions,
+                seq_lens,
+            )
+            expand_idx_mapping(
+                idx_mapping[:reqs_for_len],
+                num_tokens,
+                query_start_loc,
+                query_len,
+            )
+            combine_sampled_and_draft_tokens(
+                input_ids,
+                idx_mapping[:reqs_for_len],
+                self.req_states.last_sampled_tokens,
+                query_start_loc,
+                seq_lens,
+                self.req_states.prefill_len.gpu,
+                self.req_states.draft_tokens,
+                query_start_loc,
+                num_tokens,
+            )
+
+    def _rewrite_compact_batch(
+        self,
+        input_batch: "InputBatch",
+        num_scheduled_tokens: np.ndarray,
+        num_draft_tokens_per_req: np.ndarray,
+        num_bonus_tokens: int,
+    ) -> None:
+        num_tokens = int(num_scheduled_tokens.sum())
+        old_query_start_loc = async_copy_to_gpu(
+            input_batch.query_start_loc_np[: input_batch.num_reqs + 1],
+            device=self.device,
+        )
+
+        input_batch.num_scheduled_tokens = num_scheduled_tokens
+        input_batch.num_tokens = num_tokens
+        input_batch.num_draft_tokens_per_req = num_draft_tokens_per_req
+        input_batch.num_draft_tokens = int(num_draft_tokens_per_req.sum())
+
+        num_logits = num_draft_tokens_per_req + num_bonus_tokens
+        input_batch.cu_num_logits_np = np.empty(
+            input_batch.num_reqs + 1, dtype=np.int32
+        )
+        input_batch.cu_num_logits_np[0] = 0
+        np.cumsum(num_logits, out=input_batch.cu_num_logits_np[1:])
+        input_batch.cu_num_logits = async_copy_to_gpu(
+            input_batch.cu_num_logits_np,
+            device=self.device,
+        )
+        (
+            input_batch.expanded_idx_mapping,
+            input_batch.expanded_local_pos,
+        ) = expand_idx_mapping(
+            input_batch.idx_mapping,
+            int(input_batch.cu_num_logits_np[-1]),
+            input_batch.cu_num_logits,
+            max(1, int(num_logits.max())),
+        )
+
+        query_start_loc_np = np.empty(self.req_states.max_num_reqs + 1, dtype=np.int32)
+        query_start_loc_np[0] = 0
+        np.cumsum(
+            num_scheduled_tokens,
+            out=query_start_loc_np[1 : input_batch.num_reqs + 1],
+        )
+        query_start_loc_np[input_batch.num_reqs + 1 :] = input_batch.num_tokens
+        input_batch.query_start_loc_np = query_start_loc_np[
+            : input_batch.num_reqs_after_padding + 1
+        ]
+        async_copy_to_gpu(
+            input_batch.query_start_loc_np,
+            out=input_batch.query_start_loc,
+        )
+        _compact_token_inputs_kernel[(input_batch.num_reqs,)](
+            input_batch.input_ids,
+            input_batch.positions,
+            old_query_start_loc,
+            input_batch.query_start_loc,
+            BLOCK_SIZE=triton.next_power_of_2(max(1, int(num_scheduled_tokens.max()))),
+        )
+        old_query_start_loc.record_stream(torch.cuda.current_stream(self.device))
+
+        if np.any(input_batch.is_prefilling_np):
+            prepare_prefill_inputs(
+                input_batch.input_ids,
+                self.req_states.next_prefill_tokens,
+                input_batch.idx_mapping,
+                input_batch.query_start_loc,
+                self.req_states.all_token_ids.gpu,
+                self.req_states.prefill_len.gpu,
+                self.req_states.num_computed_tokens.gpu,
+            )
+        prepare_pos_seq_lens(
+            input_batch.idx_mapping,
+            input_batch.query_start_loc,
+            self.req_states.num_computed_tokens.gpu,
+            input_batch.positions,
+            input_batch.seq_lens,
+        )
+        input_batch.logits_indices = combine_sampled_and_draft_tokens(
+            input_batch.input_ids,
+            input_batch.idx_mapping,
+            self.req_states.last_sampled_tokens,
+            input_batch.query_start_loc,
+            input_batch.seq_lens,
+            self.req_states.prefill_len.gpu,
+            self.req_states.draft_tokens,
+            input_batch.cu_num_logits,
+            int(input_batch.cu_num_logits_np[-1]),
+            num_bonus_tokens,
+        )
+
+        seq_lens_cpu_upper_bound_np = np.zeros(
+            input_batch.num_reqs_after_padding,
+            dtype=np.int32,
+        )
+        np.add(
+            input_batch.num_computed_tokens_np,
+            num_scheduled_tokens,
+            out=seq_lens_cpu_upper_bound_np[: input_batch.num_reqs],
+        )
+        input_batch.seq_lens_cpu_upper_bound = torch.from_numpy(
+            seq_lens_cpu_upper_bound_np
+        )
+        input_batch.is_padding[: input_batch.num_tokens].fill_(False)
+
+    def trim_batch(
+        self,
+        input_batch: "InputBatch",
+    ) -> "InputBatch":
+        self._flush_draft_token_capacity_copy()
+        self._remember_batch(input_batch)
+        self._set_token_views(
+            input_batch,
+            max(input_batch.num_tokens, input_batch.num_tokens_after_padding),
+        )
+        input_batch.is_padding[: input_batch.num_tokens].fill_(False)
+        if (
+            input_batch.num_draft_tokens == 0
+            or input_batch.num_draft_tokens_per_req is None
+        ):
+            return self._set_token_views(input_batch)
+
+        num_bonus_tokens = self._get_num_bonus_tokens(input_batch)
+        num_draft_tokens_per_req = get_draft_token_capacities(
+            input_batch.idx_mapping_np,
+            self.draft_token_capacity_np,
+            input_batch.valid_num_draft_tokens_per_req,
+        )
+        if int(num_draft_tokens_per_req.sum()) != input_batch.num_draft_tokens:
+            num_scheduled_tokens = (
+                input_batch.num_scheduled_tokens
+                - input_batch.num_draft_tokens_per_req
+                + num_draft_tokens_per_req
+            )
+            self._rewrite_compact_batch(
+                input_batch,
+                num_scheduled_tokens,
+                num_draft_tokens_per_req,
+                num_bonus_tokens,
+            )
+            self._remember_batch(input_batch)
+        return self._set_token_views(input_batch)
+
+
+class MaskedCapacityBasedVerificationManager(CapacityBasedVerificationManager):
+    def __init__(
+        self,
+        max_num_tokens: int,
+        req_states: "RequestState",
+        device: torch.device,
+    ):
+        super().__init__(max_num_tokens, req_states, device)
+        self.forward_skip_mask = torch.empty(
+            max_num_tokens, dtype=torch.bool, device=device
+        )
+        self.forward_skip_mask_np = np.zeros(max_num_tokens, dtype=np.bool_)
+        self.forward_skip_mask_len = 0
+        self.has_forward_skip_mask = False
+
+    def _prepare_forward_skip_mask(
+        self,
+        input_batch: "InputBatch",
+        num_bonus_tokens: int,
+    ) -> None:
+        assert input_batch.num_draft_tokens_per_req is not None
+        self.forward_skip_mask_np[: input_batch.num_tokens_after_padding] = False
+        capacities = get_draft_token_capacities(
+            input_batch.idx_mapping_np,
+            self.draft_token_capacity_np,
+            input_batch.valid_num_draft_tokens_per_req,
+        )
+        for req_idx, (num_draft_tokens, capacity) in enumerate(
+            zip(input_batch.num_draft_tokens_per_req, capacities)
+        ):
+            num_kept = int(capacity)
+            if num_kept == num_draft_tokens:
+                continue
+            start = int(input_batch.query_start_loc_np[req_idx])
+            prune_start = start + num_bonus_tokens + num_kept
+            prune_end = start + num_bonus_tokens + int(num_draft_tokens)
+            self.forward_skip_mask_np[prune_start:prune_end] = True
+        self.forward_skip_mask_len = input_batch.num_tokens_after_padding
+        self.has_forward_skip_mask = bool(
+            np.any(self.forward_skip_mask_np[: input_batch.num_tokens])
+        )
+        if self.has_forward_skip_mask:
+            async_copy_to_gpu(
+                self.forward_skip_mask_np[: self.forward_skip_mask_len],
+                out=self.forward_skip_mask[: self.forward_skip_mask_len],
+            )
+
+    def trim_batch(
+        self,
+        input_batch: "InputBatch",
+    ) -> "InputBatch":
+        self._flush_draft_token_capacity_copy()
+        self._remember_batch(input_batch)
+        input_batch.is_padding[: input_batch.num_tokens].fill_(False)
+        self.forward_skip_mask_len = 0
+        self.has_forward_skip_mask = False
+        if (
+            input_batch.num_draft_tokens == 0
+            or input_batch.num_draft_tokens_per_req is None
+        ):
+            return self._set_token_views(input_batch)
+
+        num_bonus_tokens = self._get_num_bonus_tokens(input_batch)
+        self._prepare_forward_skip_mask(input_batch, num_bonus_tokens)
+        if self.has_forward_skip_mask:
+            input_batch.is_padding[: input_batch.num_tokens].logical_or_(
+                self.forward_skip_mask[: input_batch.num_tokens]
+            )
+            input_batch.input_ids[: input_batch.num_tokens].masked_fill_(
+                input_batch.is_padding[: input_batch.num_tokens],
+                0,
+            )
+        return self._set_token_views(input_batch)
+
+
+def check_dspark_tp_consistency(
+    num_toks: int,
+    manager: CapacityBasedVerificationManager,
+    speculator: "DSparkSpeculator",
+) -> None:
+    """Debug-only (VLLM_DSPARK_TP_CHECK={1,2}): fail fast, with per-rank
+    state dumps, if the capacity-derived dispatch shape diverges across TP.
+
+    Request->slot binding may legitimately differ across ranks, so slot-keyed
+    state is re-keyed by req_id before hashing.
+    """
+    import hashlib
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp_group = get_tp_group()
+    if tp_group.world_size <= 1:
+        return
+    req_states = manager.req_states
+    capacities = manager.draft_token_capacity_np
+    req_ids = sorted(req_states.req_id_to_index)
+    slots_np = np.fromiter(
+        (req_states.req_id_to_index[req_id] for req_id in req_ids),
+        dtype=np.int64,
+        count=len(req_ids),
+    )
+    slots = torch.from_numpy(slots_np).to(manager.device)
+
+    def gpu_md5(x: torch.Tensor) -> str:
+        return hashlib.md5(x.cpu().numpy().tobytes()).hexdigest()
+
+    sts = speculator.online_sts
+    payload: list[object] = [
+        num_toks,
+        hashlib.md5(capacities[slots_np].tobytes()).hexdigest(),
+    ]
+    if manager.tp_check_level >= 2:
+        # GPU-side state hashes; cheap here since the capacity flush just
+        # drained the previous step.
+        if speculator.draft_logits is not None:
+            payload.append(gpu_md5(speculator.draft_logits[slots]))
+        payload.append(gpu_md5(req_states.draft_tokens[slots]))
+        if sts is not None:
+            payload.append(gpu_md5(sts.logits_by_state[slots]))
+            payload.append(gpu_md5(sts.bin_trials))
+            payload.append(gpu_md5(sts.temperatures))
+    payload_tuple = tuple(payload)
+    all_payloads: list[tuple | None] = [None] * tp_group.world_size
+    torch.distributed.all_gather_object(
+        all_payloads, payload_tuple, group=tp_group.cpu_group
+    )
+    if all(p == all_payloads[0] for p in all_payloads):
+        return
+    dump = {
+        "rank": tp_group.rank_in_group,
+        "payloads": all_payloads,
+        "req_id_to_index": dict(req_states.req_id_to_index),
+        "draft_token_capacity_np": capacities.copy(),
+        "draft_tokens_tail": req_states.draft_tokens[-8:].cpu(),
+        "seeds_tail": speculator.seeds[-8:].cpu(),
+        "confidence_logits": speculator.draft_token_confidence_logits.cpu(),
+        "sts_bin_trials": sts.bin_trials.cpu() if sts else None,
+        "sts_bin_hits": sts.bin_hits.cpu() if sts else None,
+        "sts_temperatures": sts.temperatures.cpu() if sts else None,
+        "sts_logits_by_state": sts.logits_by_state.cpu() if sts else None,
+    }
+    path = f"/tmp/dspark_tp_divergence_rank{tp_group.rank_in_group}.pt"
+    torch.save(dump, path)
+    raise RuntimeError(
+        f"DSpark capacity TP divergence: rank {tp_group.rank_in_group} "
+        f"payloads {all_payloads}; state dumped to {path}"
+    )
+
+
+def make_capacity_based_verification_manager(
+    mode: str,
+    attn_cg_support: "AttentionCGSupportInfo",
+    max_num_tokens: int,
+    req_states: "RequestState",
+    device: torch.device,
+) -> CapacityBasedVerificationManager:
+    if mode == "varlen" and attn_cg_support.min_cg_support != AttentionCGSupport.ALWAYS:
+        logger.info_once(
+            "Falling back to masked DSpark capacity verification because "
+            "%s reports CUDA graph support %s.",
+            attn_cg_support.min_cg_attn_backend,
+            attn_cg_support.min_cg_support.name,
+        )
+        mode = "mask"
+    if mode == "varlen":
+        return VarlenCapacityBasedVerificationManager(
+            max_num_tokens,
+            req_states,
+            device,
+        )
+    if mode == "mask":
+        return MaskedCapacityBasedVerificationManager(
+            max_num_tokens,
+            req_states,
+            device,
+        )
+    raise ValueError(f"Unknown DSpark capacity verification mode: {mode}")

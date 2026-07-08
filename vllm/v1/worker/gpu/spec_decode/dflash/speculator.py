@@ -10,8 +10,9 @@ layer, and written into the draft KV cache.
 """
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -38,6 +39,14 @@ from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
 
 logger = init_logger(__name__)
+
+
+class _DFlashInputBatch(NamedTuple):
+    num_reqs: int
+    num_scheduled_tokens: np.ndarray
+    positions: torch.Tensor
+    query_start_loc: torch.Tensor
+    idx_mapping: torch.Tensor
 
 
 class DFlashSpeculator(DraftModelSpeculator):
@@ -100,9 +109,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos = torch.zeros(
             max_num_sampled_tokens, dtype=torch.int64, device=device
         )
-        # -1 marks an inert sampling row. CUDA graph capture can execute the
-        # full buffer before a real batch has populated it, so zero would make
-        # every padding row race while scattering into request slot 0.
+        # -1 = inert row for the sampling kernel; unfilled rows must never
+        # scatter (see the tail fill in propose).
         self.sample_idx_mapping = torch.full(
             (max_num_sampled_tokens,), -1, dtype=torch.int32, device=device
         )
@@ -158,8 +166,11 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def capture(self, attn_states: dict | None = None) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
-        # Reset sampling indices to prevent stale values from prior dummy runs
-        # from being baked into the captured graph. Mapping rows stay inert.
+        # Reset sampling indices to prevent stale values from prior dummy
+        # runs from being baked into the captured graph. sample_idx_mapping
+        # gets the -1 sentinel (inert row): capturing with all rows on slot 0
+        # would execute a duplicate-index scatter into draft_logits row 0,
+        # leaving rank-nondeterministic garbage behind.
         self.sample_indices.zero_()
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
@@ -174,6 +185,88 @@ class DFlashSpeculator(DraftModelSpeculator):
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
+
+    def _warmup_prepare_inputs_kernel(self) -> None:
+        if self.draft_kv_cache_group_id < 0:
+            return
+
+        target_query_lens = {
+            self.num_query_per_req + 1,
+            32,
+            128,
+            256,
+            1024,
+        }
+        for target_query_len in sorted(target_query_lens):
+            num_reqs = max(
+                1,
+                min(
+                    self.max_num_reqs,
+                    self.max_num_tokens // target_query_len,
+                ),
+            )
+            num_tokens = num_reqs * target_query_len
+            positions = torch.arange(
+                num_tokens,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            query_start_loc = torch.arange(
+                0,
+                num_tokens + 1,
+                target_query_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            idx_mapping = torch.arange(
+                num_reqs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            input_batch = _DFlashInputBatch(
+                num_reqs,
+                np.full(
+                    num_reqs,
+                    target_query_len,
+                    dtype=np.int32,
+                ),
+                positions,
+                query_start_loc,
+                idx_mapping,
+            )
+            num_sampled = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+            num_rejected = torch.zeros_like(num_sampled)
+            last_sampled = torch.zeros(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            next_prefill_tokens = torch.zeros_like(last_sampled)
+
+            for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                prepare_dflash_inputs(
+                    self.input_buffers,
+                    self.block_tables.slot_mappings[gid],
+                    self.context_positions,
+                    self._context_slot_mappings[i],
+                    self.sample_indices,
+                    self.sample_pos,
+                    self.sample_idx_mapping,
+                    input_batch,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    self.block_tables.input_block_tables[gid],
+                    self.block_tables.block_sizes[gid],
+                    self.parallel_drafting_token_id,
+                    self.num_query_per_req,
+                    self.num_speculative_steps,
+                    self.max_num_reqs,
+                    self.max_num_tokens,
+                    self.max_model_len,
+                    self.sample_from_anchor,
+                )
 
     def load_draft_model(
         self,
@@ -287,6 +380,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        is_profile: bool = False,
     ) -> None:
         last_hidden_states = self._run_model(
             num_tokens_padded,
@@ -409,6 +503,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 slot_mappings=None,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                is_profile=is_profile,
             )
             return self.draft_tokens[:num_reqs]
 
@@ -441,6 +536,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.max_model_len,
                 self.sample_from_anchor,
             )
+
+        # Rows past this batch keep stale req-state ids from earlier (larger)
+        # batches. A padded FULL-graph replay would otherwise scatter through
+        # those ids and can make TP ranks diverge.
+        self.sample_idx_mapping[num_reqs * self.num_speculative_steps :].fill_(-1)
 
         # Cache-restored tokens (e.g. prefix-cache hits) never flowed through
         # the target forward, so their draft context KV was never written and
@@ -488,6 +588,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs,
             num_query_tokens,
             uniform_token_count=self.num_query_per_req,
+            max_req_tokens=None,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
@@ -524,6 +625,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 draft_slot_mappings_by_layer,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
+                is_profile=is_profile,
             )
 
         return self.draft_tokens[:num_reqs]
@@ -578,6 +680,7 @@ def _prepare_dflash_inputs_kernel(
 
     num_rejected = tl.load(num_rejected_ptr + req_idx)
     valid_ctx_end = ctx_end - num_rejected
+    num_valid_ctx = valid_ctx_end - ctx_start
 
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     if num_sampled > 0:
@@ -591,17 +694,18 @@ def _prepare_dflash_inputs_kernel(
 
     j = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     is_ctx = j < num_ctx
-    is_query = (j >= num_ctx) & (j < num_ctx + num_query_per_req)
-    query_off = j - num_ctx
+    is_valid_ctx = j < num_valid_ctx
+    is_query = (j >= num_valid_ctx) & (j < num_valid_ctx + num_query_per_req)
+    query_off = j - num_valid_ctx
 
     # --- Context positions / slots ---
     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
-    ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_ctx, other=0)
+    ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
     ctx_block_num = ctx_pos // block_size
     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
     ctx_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
-        mask=is_ctx,
+        mask=is_valid_ctx,
         other=0,
     ).to(tl.int64)
     # Sliding-window draft KV: old context positions can be evicted and point
@@ -614,7 +718,11 @@ def _prepare_dflash_inputs_kernel(
         PAD_SLOT_ID,
     )
     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
-    tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
+    tl.store(
+        out_context_slot_mapping_ptr + ctx_start + j,
+        tl.where(is_valid_ctx, ctx_slot, PAD_SLOT_ID),
+        mask=is_ctx,
+    )
 
     # --- Query positions / input_ids / slots ---
     query_pos = last_valid_pos + 1 + query_off
@@ -718,7 +826,7 @@ def prepare_dflash_inputs(
     sample_indices: torch.Tensor,
     sample_pos: torch.Tensor,
     sample_idx_mapping: torch.Tensor,
-    input_batch: InputBatch,
+    input_batch: InputBatch | _DFlashInputBatch,
     # [num_reqs]
     num_sampled: torch.Tensor,
     # [num_reqs]

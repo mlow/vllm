@@ -342,9 +342,84 @@ def warmup_kernels(
         worker_execute_model(decode_output)
         worker_sample_tokens(None)
 
+        if model_runner.verification_capacity_manager is not None:
+            model_runner.verification_capacity_manager.warmup(
+                model_runner.input_buffers
+            )
+            assert model_runner.speculator is not None
+            model_runner.speculator.warmup_capacity_kernels()
+            if model_runner.speculator.wants_auto_sps_curve:
+                _profile_sps_curve(model_runner)
+
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()
+
+
+def _profile_sps_curve(
+    model_runner: GPUModelRunner,
+    warmup_iters: int = 3,
+    timed_iters: int = 15,
+) -> None:
+    """Profile the engine step-rate curve for ``dspark_sps_curve="auto"``.
+
+    Times uniform-decode dummy runs per power-of-two request count — the same
+    self-contained path DP idle steps use (``execute_dummy_batch``), which
+    replays the captured verify graph AND the full DSpark draft step
+    (``propose(dummy_run=True)``) with no request bookkeeping. Runs after
+    graph capture with the placeholder flat table active, so the theta-argmax
+    verifies every candidate and B is exactly reqs * decode_query_len.
+    Real-step host prep, sampling, and true attention lengths are not
+    visible here; account for them via ``dspark_sps_overhead_ms``. Rank 0's
+    measurements are broadcast so every TP rank builds the identical table
+    (capacities feed batch-shape decisions, which must agree across ranks).
+    """
+    import time
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    decode_query_len = model_runner.decode_query_len
+    max_reqs = min(
+        model_runner.max_num_reqs,
+        model_runner.max_num_tokens // decode_query_len,
+    )
+    req_counts = []
+    count = 1
+    while count < max_reqs:
+        req_counts.append(count)
+        count *= 2
+    req_counts.append(max_reqs)
+
+    step_ms = []
+    for num_reqs in req_counts:
+        num_tokens = num_reqs * decode_query_len
+        for _ in range(warmup_iters):
+            model_runner._dummy_run(num_tokens, uniform_decode=True)
+        torch.accelerator.synchronize()
+        start = time.perf_counter()
+        for _ in range(timed_iters):
+            model_runner._dummy_run(num_tokens, uniform_decode=True)
+        torch.accelerator.synchronize()
+        step_ms.append((time.perf_counter() - start) * 1000.0 / timed_iters)
+
+    timings = torch.tensor(step_ms, dtype=torch.float64, device=model_runner.device)
+    tp_group = get_tp_group()
+    if tp_group.world_size > 1:
+        tp_group.broadcast(timings, src=0)
+    step_ms = timings.cpu().tolist()
+
+    assert model_runner.speculative_config is not None
+    overhead_ms = model_runner.speculative_config.dspark_sps_overhead_ms
+    sps_curve = [
+        (num_reqs * decode_query_len, 1000.0 / (ms + overhead_ms))
+        for num_reqs, ms in zip(req_counts, step_ms)
+    ]
+    assert model_runner.speculator is not None
+    model_runner.speculator.set_sps_curve(sps_curve)
+    logger.info(
+        "DSpark auto-profiled SPS curve (tokens, steps/s): %s",
+        [(b, round(s, 2)) for b, s in sps_curve],
+    )

@@ -29,8 +29,15 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.triton_utils import triton
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dspark.capacity import (
+    build_sps_table,
+    compute_draft_token_capacity_from_confidence,
+)
+from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
 from vllm.v1.worker.gpu.spec_decode.utils import draft_gumbel_pos
 
@@ -66,14 +73,79 @@ class DSparkSpeculator(DFlashSpeculator):
             self.num_speculative_steps, dtype=torch.int32, device=device
         )
 
-        self._anchor_idx = (
-            torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
-            * self.num_query_per_req
-        )
-
         # Reduced-vocab probabilistic drafting only; set in load_draft_model.
         self._d2t_scatter_index: torch.Tensor | None = None
         self._draft_scatter_buf: torch.Tensor | None = None
+
+        self.draft_token_confidence_logits = torch.empty(
+            self.max_num_reqs,
+            self.num_speculative_steps,
+            dtype=torch.float32,
+            device=device,
+        )
+        self.draft_token_survival_probs = torch.empty_like(
+            self.draft_token_confidence_logits
+        )
+        self.draft_token_capacity = torch.full(
+            (self.max_num_reqs,),
+            self.num_speculative_steps,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._runtime_num_reqs_for_capacity = torch.zeros(
+            (1,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.draft_token_valid_lengths = torch.empty(
+            (self.max_num_reqs,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.min_survival_probability = (
+            self.speculative_config.dspark_confidence_threshold
+        )
+        self.capacity_budget_frac = self.speculative_config.dspark_budget_frac
+        self.confidence_temperature = (
+            self.speculative_config.dspark_confidence_temperature
+        )
+        sps_curve = self.speculative_config.dspark_sps_curve
+        self.sps_table: torch.Tensor | None = None
+        self.wants_auto_sps_curve = sps_curve == "auto"
+        if sps_curve is not None:
+            # Sized for the pow2-padded request count the allocator kernel
+            # can index under CUDA graph capture.
+            padded_reqs = triton.next_power_of_2(max(self.max_num_reqs, 1))
+            max_batch_tokens = padded_reqs * (1 + self.num_speculative_steps)
+            if self.wants_auto_sps_curve:
+                # Flat placeholder (theta argmax verifies everything) until
+                # the post-capture profiling refreshes the contents in place;
+                # the captured allocator kernel bakes this buffer's address.
+                self.sps_table = torch.ones(
+                    max_batch_tokens + 1, dtype=torch.float32, device=device
+                )
+            else:
+                assert isinstance(sps_curve, list)
+                self.sps_table = build_sps_table(
+                    sps_curve,
+                    max_batch_tokens,
+                    device,
+                )
+        self.use_draft_token_capacity = (
+            self.min_survival_probability > 0.0
+            or self.capacity_budget_frac < 1.0
+            or self.sps_table is not None
+        )
+        self.online_sts: DSparkOnlineSTS | None = None
+        if self.use_draft_token_capacity and self.speculative_config.dspark_online_sts:
+            self.online_sts = DSparkOnlineSTS(
+                self.max_num_reqs, self.num_speculative_steps, device
+            )
+            # Calibrated survival buffer consumed by the capacity kernels
+            # inside the captured draft graph.
+            self.calibrated_confidence_logits = torch.zeros_like(
+                self.draft_token_confidence_logits
+            )
 
     def load_draft_model(
         self,
@@ -81,11 +153,20 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        if (
+            self.use_draft_token_capacity
+            and getattr(model, "compute_confidence", None) is None
+        ):
+            raise ValueError(
+                "DSpark draft-token capacity requires a draft model with a "
+                f"confidence head; {type(model).__name__} does not implement "
+                "compute_confidence."
+            )
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
-        if self.draft_logits is not None and model.draft_id_to_target_id is not None:
-            d2t = model.draft_id_to_target_id
+        d2t = getattr(model, "draft_id_to_target_id", None)
+        if self.draft_logits is not None and d2t is not None:
             self._d2t_scatter_index = (
                 torch.arange(d2t.shape[0], device=d2t.device) + d2t
             )
@@ -99,27 +180,51 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         return model
 
-    def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+    def _sample_sequential(
+        self,
+        num_reqs: int,
+        head_hidden: torch.Tensor,
+        is_profile: bool = False,
+    ) -> None:
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = self.num_speculative_steps
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+        sample_hidden = sample_hidden.view(num_reqs, n_spec, -1)
         # Draft-vocab logits; sampled ids are remapped to target vocab below.
-        base_logits = self.model.compute_draft_logits(sample_hidden)
+        base_logits = self.model.compute_draft_logits(
+            sample_hidden.reshape(num_sample, -1)
+        )
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        confidence_logits = self.draft_token_confidence_logits[:num_reqs]
+        min_survival_probability = self.min_survival_probability
+        use_confidence_capacity = self.use_draft_token_capacity
 
         # Anchor (bonus) token per request = the input id at query offset 0,
-        # read via the precomputed persistent index (fixed buffer for capture).
-        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+        # laid out as one row per request in the draft query block.
+        prev = self.input_buffers.input_ids[
+            : num_reqs * self.num_query_per_req : self.num_query_per_req
+        ]
+        valid_prefix = torch.ones(num_reqs, dtype=torch.bool, device=self.device)
+        valid_lengths = self.draft_token_valid_lengths[:num_reqs]
+        valid_lengths.zero_()
 
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
+            if use_confidence_capacity:
+                confidence_i = self.model.compute_confidence(
+                    sample_hidden[:, i], markov_embed
+                )
+                if confidence_i is None:
+                    use_confidence_capacity = False
+                else:
+                    confidence_logits[:, i] = confidence_i
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
             if self.draft_logits is not None:
@@ -150,8 +255,101 @@ class DSparkSpeculator(DFlashSpeculator):
                 draft_sampled_i = self.model.map_draft_to_target(
                     logits_i.argmax(dim=-1)
                 )
+            valid_prefix.logical_and_(
+                (draft_sampled_i >= 0) & (draft_sampled_i < self.vocab_size)
+            )
+            draft_sampled_i = torch.where(
+                valid_prefix, draft_sampled_i, torch.zeros_like(draft_sampled_i)
+            )
+            valid_lengths.add_(valid_prefix.to(torch.int32))
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
+
+        if use_confidence_capacity and not is_profile:
+            capacity_confidence = self.draft_token_confidence_logits
+            capacity_temperature = self.confidence_temperature
+            if self.online_sts is not None:
+                self.online_sts.calibrate(
+                    confidence_logits,
+                    out=self.calibrated_confidence_logits[:num_reqs],
+                )
+                capacity_confidence = self.calibrated_confidence_logits
+                capacity_temperature = 1.0
+            compute_draft_token_capacity_from_confidence(
+                capacity_confidence,
+                self.draft_token_capacity,
+                min_survival_probability,
+                num_reqs,
+                self.num_speculative_steps,
+                self._runtime_num_reqs_for_capacity,
+                self.draft_token_survival_probs,
+                self.capacity_budget_frac,
+                sps_table=self.sps_table,
+                confidence_temperature=capacity_temperature,
+            )
+        else:
+            self.draft_token_capacity[:num_reqs].fill_(self.num_speculative_steps)
+        torch.minimum(
+            self.draft_token_capacity[:num_reqs],
+            valid_lengths,
+            out=self.draft_token_capacity[:num_reqs],
+        )
+
+    def set_sps_curve(self, sps_curve: list[tuple[int, float]]) -> None:
+        """Refresh the SPS lookup table in place (its address is baked into
+        the captured allocator kernel)."""
+        assert self.sps_table is not None
+        dense = build_sps_table(
+            sps_curve, self.sps_table.shape[0] - 1, self.sps_table.device
+        )
+        self.sps_table.copy_(dense)
+
+    def compute_capacities(self, input_batch: InputBatch) -> torch.Tensor | None:
+        if not self.use_draft_token_capacity:
+            return None
+        num_reqs = input_batch.num_reqs
+        if self.online_sts is not None:
+            # Join key for verification outcomes arriving next step. Staged
+            # eagerly (not in the captured graph): a padded replay would
+            # index_put through stale padding-row ids, and -1 sentinels wrap
+            # to the last row, so neither is safe for a scatter by slot.
+            n_spec = self.num_speculative_steps
+            self.online_sts.stage_proposal(
+                self.sample_idx_mapping[: num_reqs * n_spec : n_spec],
+                self.draft_token_confidence_logits[:num_reqs],
+            )
+        return self.draft_token_capacity[:num_reqs]
+
+    def warmup_capacity_kernels(self) -> None:
+        self._warmup_prepare_inputs_kernel()
+        if not self.use_draft_token_capacity:
+            return
+
+        self.draft_token_confidence_logits.zero_()
+        sizes = {self.max_num_reqs}
+        num_reqs = 1
+        while num_reqs < self.max_num_reqs:
+            sizes.add(num_reqs)
+            num_reqs *= 2
+        for num_reqs in sorted(sizes):
+            self._runtime_num_reqs_for_capacity.fill_(num_reqs)
+            compute_draft_token_capacity_from_confidence(
+                self.draft_token_confidence_logits,
+                self.draft_token_capacity,
+                self.min_survival_probability,
+                num_reqs,
+                self.num_speculative_steps,
+                self._runtime_num_reqs_for_capacity,
+                self.draft_token_survival_probs,
+                self.capacity_budget_frac,
+                sps_table=self.sps_table,
+                confidence_temperature=self.confidence_temperature,
+            )
+
+    def propose(self, input_batch: InputBatch, *args, **kwargs) -> torch.Tensor:
+        if self.use_draft_token_capacity:
+            self._runtime_num_reqs_for_capacity.fill_(input_batch.num_reqs)
+        return super().propose(input_batch, *args, **kwargs)
 
     def _generate_draft(
         self,
@@ -161,6 +359,7 @@ class DSparkSpeculator(DFlashSpeculator):
         slot_mappings: dict[str, torch.Tensor] | None,
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+        is_profile: bool = False,
     ) -> None:
         # Full draft step (captured under CUDA graph): parallel backbone forward
         # then sequential Markov sampling over its hidden state outputs.
@@ -171,4 +370,4 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        self._sample_sequential(num_reqs, head_hidden)
+        self._sample_sequential(num_reqs, head_hidden, is_profile=is_profile)

@@ -6,6 +6,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.model_loader import get_model
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
     _should_share,
     get_target_lm_head,
@@ -28,13 +29,14 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             draft_cache_config,
             cache_dtype=speculative_config.draft_kv_cache_dtype,
         )
+    backend = speculative_config.attention_backend or AttentionBackendEnum.FLASH_ATTN
     draft_vllm_config = replace(
         vllm_config,
         cache_config=draft_cache_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=not causal,
-            backend=speculative_config.attention_backend,
+            backend=backend,
         ),
     )
 

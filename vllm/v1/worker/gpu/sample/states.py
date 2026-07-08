@@ -19,8 +19,13 @@ class SamplingStates:
         self.max_num_reqs = max_num_reqs
         self.vocab_size = vocab_size
 
-        # Every TP rank must derive the same fallback request seeds. A private
-        # stream avoids rank-local consumers perturbing NumPy's global RNG.
+        # Fallback per-request seeds must be identical on every TP rank: the
+        # gumbel noise they key drives sampling redundantly on all ranks, and
+        # a mismatch desyncs per-rank model state (and with capacity-based
+        # spec decode, batch shapes). Drawing from the global np.random
+        # stream only works while every rank consumes it in lockstep, which
+        # rank-dependent consumers (e.g. autotuners) silently break, so use
+        # a dedicated stream seeded from the engine seed.
         self._fallback_seed_rng = np.random.default_rng(seed if seed is not None else 0)
 
         self.temperature = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
