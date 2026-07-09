@@ -97,7 +97,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 DCP_SIZE="${DCP_SIZE:-1}"
 TP_SIZE="${TP_SIZE:-8}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.92}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.95}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-auto}"
@@ -300,7 +300,6 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve "${MODEL}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --long-prefill-token-threshold 2048 \
-  --quantization modelopt_fp4 \
   --moe-backend "${MOE_BACKEND}" \
   --attention-backend "${ATTENTION_BACKEND}" \
   --kv-cache-dtype "${KV_CACHE_DTYPE}" \
