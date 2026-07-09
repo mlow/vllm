@@ -78,6 +78,78 @@ def triton_convert_dcp_local_topk_to_global(
     )
 
 
+@triton.jit
+def _gather_topk_ids_by_position_kernel(
+    candidate_ids_ptr,
+    positions_ptr,
+    out_ptr,
+    cand_stride0,
+    cand_stride1,
+    pos_stride0,
+    pos_stride1,
+    out_stride0,
+    out_stride1,
+    topk: tl.constexpr,
+    candidate_width: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < topk
+    pos = tl.load(
+        positions_ptr + row * pos_stride0 + offs * pos_stride1,
+        mask=mask,
+        other=-1,
+    )
+    valid = (pos >= 0) & (pos < candidate_width)
+    gathered = tl.load(
+        candidate_ids_ptr + row * cand_stride0 + pos * cand_stride1,
+        mask=mask & valid,
+        other=-1,
+    )
+    tl.store(
+        out_ptr + row * out_stride0 + offs * out_stride1,
+        tl.where(valid, gathered, -1),
+        mask=mask,
+    )
+
+
+def triton_gather_topk_ids_by_position(
+    candidate_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    BLOCK_N: int = 128,
+) -> None:
+    """Gather final ids from flattened candidate ids using int32 top-k positions."""
+    assert candidate_ids.dtype == torch.int32
+    assert positions.dtype == torch.int32
+    assert out.dtype == torch.int32
+    assert candidate_ids.ndim == 2
+    assert positions.ndim == 2
+    assert out.shape == positions.shape
+    assert candidate_ids.shape[0] == positions.shape[0]
+    assert positions.shape[1] % BLOCK_N == 0, (
+        f"top-k width ({positions.shape[1]}) must be divisible by BLOCK_N ({BLOCK_N})"
+    )
+    grid = (positions.shape[0], positions.shape[1] // BLOCK_N)
+    _gather_topk_ids_by_position_kernel[grid](
+        candidate_ids,
+        positions,
+        out,
+        candidate_ids.stride(0),
+        candidate_ids.stride(1),
+        positions.stride(0),
+        positions.stride(1),
+        out.stride(0),
+        out.stride(1),
+        positions.shape[1],
+        candidate_ids.shape[1],
+        BLOCK_N=BLOCK_N,
+    )
+
+
 # Kernel with prefill workspace support and valid count tracking
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
