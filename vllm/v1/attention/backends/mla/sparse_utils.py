@@ -7,6 +7,77 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
+@triton.jit
+def _convert_dcp_local_topk_to_global_kernel(
+    token_indices_ptr,
+    scores_ptr,
+    ti_stride0,
+    ti_stride1,
+    scores_stride0,
+    scores_stride1,
+    width: tl.constexpr,
+    DCP_WORLD_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = offs < width
+    idx_ptrs = token_indices_ptr + row * ti_stride0 + offs * ti_stride1
+    local_idx = tl.load(idx_ptrs, mask=mask, other=-1)
+    valid = local_idx >= 0
+
+    interleave_block = local_idx // CP_KV_CACHE_INTERLEAVE_SIZE
+    interleave_offset = local_idx % CP_KV_CACHE_INTERLEAVE_SIZE
+    global_idx = (
+        (interleave_block * DCP_WORLD_SIZE + DCP_RANK)
+        * CP_KV_CACHE_INTERLEAVE_SIZE
+        + interleave_offset
+    )
+    tl.store(idx_ptrs, tl.where(valid, global_idx, -1), mask=mask)
+
+    score_ptrs = scores_ptr + row * scores_stride0 + offs * scores_stride1
+    scores = tl.load(score_ptrs, mask=mask, other=-float("inf"))
+    tl.store(score_ptrs, tl.where(valid, scores, -float("inf")), mask=mask)
+
+
+def triton_convert_dcp_local_topk_to_global(
+    token_indices: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    dcp_rank: int,
+    cp_kv_cache_interleave_size: int,
+    BLOCK_N: int = 128,
+) -> None:
+    """Convert local DCP top-k ids in-place to global logical token ids."""
+    assert token_indices.dtype == torch.int32
+    assert scores.dtype == torch.float32
+    assert token_indices.shape == scores.shape
+    assert token_indices.is_contiguous()
+    assert scores.is_contiguous()
+    width = token_indices.shape[1]
+    assert width % BLOCK_N == 0, (
+        f"top-k width ({width}) must be divisible by BLOCK_N ({BLOCK_N})"
+    )
+    grid = (token_indices.shape[0], width // BLOCK_N)
+    _convert_dcp_local_topk_to_global_kernel[grid](
+        token_indices,
+        scores,
+        token_indices.stride(0),
+        token_indices.stride(1),
+        scores.stride(0),
+        scores.stride(1),
+        width,
+        DCP_WORLD_SIZE=dcp_world_size,
+        DCP_RANK=dcp_rank,
+        CP_KV_CACHE_INTERLEAVE_SIZE=cp_kv_cache_interleave_size,
+        BLOCK_N=BLOCK_N,
+    )
+
+
 # Kernel with prefill workspace support and valid count tracking
 @triton.jit
 def _convert_req_index_to_global_index_kernel(
