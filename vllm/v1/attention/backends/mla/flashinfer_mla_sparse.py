@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -379,7 +380,7 @@ _fi_sparse_workspace_by_device: dict[torch.device, torch.Tensor] = {}
 def _normalize_workspace_device(device: torch.device) -> torch.device:
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        device = torch.device("cuda", torch.accelerator.current_device_index())
     return device
 
 

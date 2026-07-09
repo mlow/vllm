@@ -620,9 +620,7 @@ def build_attn_metadata(
         )
         group_spec = kv_cache_config.kv_cache_groups[i].kv_cache_spec
         group_dcp_local_seq_lens = (
-            None
-            if getattr(group_spec, "dcp_replicated", False)
-            else dcp_local_seq_lens
+            None if getattr(group_spec, "dcp_replicated", False) else dcp_local_seq_lens
         )
 
         common_attn_metadata_extra_kwargs = (

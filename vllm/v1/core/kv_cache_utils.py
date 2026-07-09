@@ -1589,9 +1589,9 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[
-        tuple[int, int, bool], dict[str, KVCacheSpec]
-    ] = defaultdict(dict)
+    grouped_swa_mla_specs: dict[tuple[int, int, bool], dict[str, KVCacheSpec]] = (
+        defaultdict(dict)
+    )
     # dcp_replicated non-MLA groups (e.g. the DFlash draft), keyed by block_size.
     grouped_repl_specs: dict[tuple[int], dict[str, KVCacheSpec]] = defaultdict(dict)
     # NOTE: Here we group SWA layers by (block_size, sliding_window,

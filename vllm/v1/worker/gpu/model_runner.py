@@ -801,7 +801,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._init_kv_zero_meta()
         assert self.kv_block_zeroer is not None
         self.kv_block_zeroer.zero_block_ids([0])
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
@@ -1417,16 +1417,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_active_loras=batch_desc.num_active_loras,
             )
 
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=batch_desc.cg_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
-                batch_descriptor=batch_descriptor,
-                slot_mapping=slot_mappings_by_layer,
-                skip_compiled=skip_compiled,
-                is_padding=input_batch.is_padding,
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=batch_desc.cg_mode,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    batch_descriptor=batch_descriptor,
+                    slot_mapping=slot_mappings_by_layer,
+                    skip_compiled=skip_compiled,
+                    is_padding=input_batch.is_padding,
+                ),
+                record_function_or_nullcontext(forward_scope),
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
