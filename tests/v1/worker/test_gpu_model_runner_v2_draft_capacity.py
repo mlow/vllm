@@ -387,6 +387,7 @@ def test_varlen_capacity_manager_compacts_verifier_batch():
             [0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.int32, device=device
         ),
         num_scheduled_tokens=np.array([4, 4], dtype=np.int32),
+        max_query_len=4,
         num_tokens=8,
         num_tokens_after_padding=5,
         num_draft_tokens=6,
@@ -395,6 +396,7 @@ def test_varlen_capacity_manager_compacts_verifier_batch():
         query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
         seq_lens=torch.zeros(2, dtype=torch.int32, device=device),
         seq_lens_cpu_upper_bound=torch.tensor([4, 4], dtype=torch.int32),
+        max_seq_len_upper_bound=4,
         dcp_local_seq_lens=None,
         num_computed_tokens_np=np.array([0, 0], dtype=np.int32),
         prefill_len_np=np.array([0, 0], dtype=np.int32),
@@ -475,6 +477,7 @@ def test_masked_capacity_manager_marks_pruned_tokens_for_forward_and_sampler():
             [0, 1, 2, 3, 0, 1, 2, 3], dtype=torch.int32, device=device
         ),
         num_scheduled_tokens=np.array([4, 4], dtype=np.int32),
+        max_query_len=4,
         num_tokens=8,
         num_tokens_after_padding=10,
         num_draft_tokens=6,
@@ -483,6 +486,7 @@ def test_masked_capacity_manager_marks_pruned_tokens_for_forward_and_sampler():
         query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
         seq_lens=torch.tensor([4, 4], dtype=torch.int32, device=device),
         seq_lens_cpu_upper_bound=torch.tensor([4, 4], dtype=torch.int32),
+        max_seq_len_upper_bound=4,
         dcp_local_seq_lens=None,
         num_computed_tokens_np=np.array([0, 0], dtype=np.int32),
         prefill_len_np=np.array([0, 0], dtype=np.int32),
