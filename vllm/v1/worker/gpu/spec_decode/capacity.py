@@ -104,6 +104,11 @@ class CapacityBasedVerificationManager:
         self.num_draft_tokens: int = 0
         self.copy_event_pending = False
         self.varlen_spec_decode = False
+        self.capacity_log_interval = int(
+            os.environ.get("VLLM_DSPARK_CAPACITY_LOG_INTERVAL", "0") or "0"
+        )
+        self._capacity_log_step = 0
+        self._capacity_log_snapshot: np.ndarray | None = None
 
     def add_request(self, req_idx: int) -> None:
         self.draft_token_capacity_np[req_idx] = self.req_states.num_speculative_steps
@@ -172,6 +177,40 @@ class CapacityBasedVerificationManager:
     def _remember_batch(self, input_batch: "InputBatch") -> None:
         self.req_ids = list(input_batch.req_ids)
         self.idx_mapping_np = input_batch.idx_mapping_np
+
+    def _remember_capacity_log_snapshot(self, capacities: np.ndarray) -> None:
+        if self.capacity_log_interval > 0:
+            self._capacity_log_snapshot = capacities.copy()
+
+    def maybe_log_dispatch(self, num_tokens: int, batch_desc: object) -> None:
+        """Log the effective capacity and graph shape for opt-in diagnostics."""
+        if self.capacity_log_interval <= 0:
+            return
+        self._capacity_log_step += 1
+        if self._capacity_log_step % self.capacity_log_interval:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+        capacities = self._capacity_log_snapshot
+        if capacities is None or capacities.size == 0:
+            return
+        histogram = np.bincount(
+            capacities,
+            minlength=self.req_states.num_speculative_steps + 1,
+        )
+        logger.info(
+            "DSpark capacity dispatch: reqs=%d kept=%d/%d mean=%.3f hist=%s "
+            "tokens=%d padded=%s cg=%s max_req=%s",
+            capacities.size,
+            int(capacities.sum()),
+            capacities.size * self.req_states.num_speculative_steps,
+            float(capacities.mean()),
+            histogram.tolist(),
+            num_tokens,
+            getattr(batch_desc, "num_tokens", None),
+            getattr(batch_desc, "cg_mode", None),
+            getattr(batch_desc, "max_req_tokens", None),
+        )
 
     @staticmethod
     def _get_num_bonus_tokens(input_batch: "InputBatch") -> int:
@@ -245,13 +284,13 @@ class VarlenCapacityBasedVerificationManager(CapacityBasedVerificationManager):
             dtype=np.int32,
             count=num_reqs,
         )
-        total_num_draft_tokens = int(
-            get_draft_token_capacities(
-                idx_mapping_np,
-                self.draft_token_capacity_np,
-                valid_num_draft_tokens_per_req,
-            ).sum()
+        capacities = get_draft_token_capacities(
+            idx_mapping_np,
+            self.draft_token_capacity_np,
+            valid_num_draft_tokens_per_req,
         )
+        self._remember_capacity_log_snapshot(capacities)
+        total_num_draft_tokens = int(capacities.sum())
         return int(
             num_scheduled_tokens.sum()
             - num_draft_tokens_per_req.sum()

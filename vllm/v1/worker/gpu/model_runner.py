@@ -1377,6 +1377,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 need_eager=is_profile or skip_compiled,
                 num_active_loras=num_active_loras,
             )
+        if use_varlen_capacity:
+            assert verification_capacity_manager is not None
+            verification_capacity_manager.maybe_log_dispatch(num_toks, batch_desc)
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.

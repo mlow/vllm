@@ -633,3 +633,36 @@ def test_varlen_cudagraph_capture_adds_full_desc():
         desc.max_req_tokens == manager.decode_query_len
         for desc in manager._capture_descs[CUDAGraphMode.FULL]
     )
+
+
+def test_varlen_cudagraph_dispatch_skips_incompatible_uniform_grid():
+    manager = object.__new__(CudaGraphManager)
+    manager.vllm_config = SimpleNamespace(speculative_config=None)
+    manager.compilation_config = SimpleNamespace(
+        cudagraph_capture_sizes=[96, 104],
+        max_cudagraph_capture_size=512,
+    )
+    manager.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    manager.decode_query_len = 4
+    manager.varlen_spec_decode = True
+    manager.max_num_reqs = 128
+    manager.lora_capture_cases = [0]
+    manager._lora_dispatch_map = {}
+    manager._max_lora_case = 0
+    manager._candidates = {}
+    manager._capture_descs = {}
+
+    manager._init_candidates()
+    manager._graphs_captured = True
+
+    desc = manager.dispatch(
+        num_reqs=32,
+        num_tokens=97,
+        uniform_token_count=None,
+        num_active_loras=0,
+        max_req_tokens=4,
+    )
+
+    assert desc.cg_mode == CUDAGraphMode.FULL
+    assert desc.num_tokens == 104
+    assert desc.max_req_tokens == 4

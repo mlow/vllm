@@ -266,7 +266,11 @@ class CudaGraphManager:
                 if num_tokens > max_decode_tokens or num_tokens > max_cg_capture_size:
                     return
                 max_requests = min(num_tokens, self.max_num_reqs)
+                min_requests = (num_tokens + self.decode_query_len - 1) // (
+                    self.decode_query_len
+                )
                 request_counts = {
+                    min_requests,
                     (max_requests + 1) // 2,
                     (3 * max_requests + 3) // 4,
                     max_requests,
@@ -336,7 +340,7 @@ class CudaGraphManager:
         # length, independent of the configured capture-size list: a missing
         # (depth, num_reqs) point would otherwise pad requests or fall off
         # the FULL-graph path.
-        if separate_decode_routine and decode_mode:
+        if separate_decode_routine and decode_mode and not self.varlen_spec_decode:
             for decode_query_len, num_reqs in product(
                 decode_query_lens, range(1, min(self.max_num_reqs, 32) + 1)
             ):
