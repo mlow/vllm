@@ -114,6 +114,10 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
+        # Manual CUDA graphs keep raw addresses for model intermediates. Retain
+        # each captured backbone output so its storage cannot be recycled while
+        # a graph still reads it during sampling.
+        self._captured_backbone_outputs: list[torch.Tensor] = []
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
@@ -291,6 +295,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
+        if torch.cuda.is_current_stream_capturing():
+            self._captured_backbone_outputs.append(last_hidden_states)
 
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
