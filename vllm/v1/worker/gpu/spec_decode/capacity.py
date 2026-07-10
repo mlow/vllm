@@ -633,6 +633,7 @@ def make_capacity_based_verification_manager(
         )
         mode = "mask"
     if mode == "varlen":
+        logger.info_once("Using compact varlen DSpark capacity verification.")
         return VarlenCapacityBasedVerificationManager(
             max_num_tokens,
             req_states,
