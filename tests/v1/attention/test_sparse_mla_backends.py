@@ -141,6 +141,57 @@ def test_b12x_sparse_dcp_metadata_uses_local_causal_lens(
     assert result.nsa_cache_seqlens is not None
 
 
+def test_b12x_sparse_dcp1_metadata_uses_exact_gpu_positions() -> None:
+    batch_spec = BatchSpec(seq_lens=[5, 8], query_lens=[2, 3])
+    hf_config = SimpleNamespace(
+        index_topk=512,
+        kv_lora_rank=512,
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        v_head_dim=512,
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+    )
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            cp_kv_cache_interleave_size=1,
+        ),
+        scheduler_config=SimpleNamespace(
+            max_num_batched_tokens=8,
+            max_num_seqs=2,
+        ),
+    )
+    metadata = create_common_attn_metadata(
+        batch_spec,
+        block_size=64,
+        device=torch.device(DEVICE_TYPE),
+    )
+    metadata.positions = torch.tensor(
+        [3, 4, 5, 6, 7], dtype=torch.int64, device=DEVICE_TYPE
+    )
+    # Async scheduling may expose a stale conservative CPU bound after a request
+    # slot is recycled. It must not become the verifier's causal attention mask.
+    metadata.seq_lens_cpu_upper_bound = torch.tensor([500, 800], dtype=torch.int32)
+    builder = B12xMLASparseMetadataBuilder(
+        SimpleNamespace(block_size=64),
+        ["placeholder"],
+        vllm_config,
+        torch.device(DEVICE_TYPE),
+    )
+
+    result = builder.build(0, metadata)
+
+    assert metadata.positions is not None
+    assert result.cache_seq_lens_per_token.tolist() == [4, 5, 6, 7, 8]
+    assert result.req_id_per_token is None
+    assert result.page_table_1 is None
+    assert result.nsa_cache_seqlens is None
+
+
 @pytest.mark.parametrize(
     ("dcp_world_size", "output_physical_slots", "expected_output"),
     [
