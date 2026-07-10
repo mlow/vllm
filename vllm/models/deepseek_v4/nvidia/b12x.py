@@ -437,6 +437,7 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
         DeepseekV4B12xMLASparseBackend
     )
     enqueue_default_before_indexer: ClassVar[bool] = True
+    enable_post_gemm_aux_streams: ClassVar[bool] = False
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:

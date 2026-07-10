@@ -126,6 +126,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # launch loop can enqueue the independent default-stream Q branch first.
     # The stream/event dependency graph remains identical.
     enqueue_default_before_indexer: ClassVar[bool] = False
+    # Some custom attention kernels are captured as part of a larger FULL graph
+    # and cannot safely replay the C4 post-GEMM work from auxiliary streams.
+    enable_post_gemm_aux_streams: ClassVar[bool] = True
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
@@ -301,10 +304,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
         # Will be None on ROCm for now.
         self.aux_stream_list = aux_stream_list
-        # [0]: GEMM start / post-GEMM event0. [1..3]: GEMM done events;
-        # [1] doubles as post-GEMM event1. Reuse is safe: GEMM fully joins
-        # before post-GEMM starts.
+        # Keep the GEMM and post-GEMM event generations independent. The first
+        # join only enqueues waits on the default stream; re-recording those
+        # events for cache/indexer overlap before the waits execute can race.
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
+        self.attn_events = [torch.cuda.Event() for _ in range(3)]
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
@@ -667,10 +671,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     ),
                     lambda: compressor(kv_score, positions, self.rotary_emb),
                 ],
-                self.ln_events[0],
-                [self.ln_events[1], self.ln_events[2]],
+                self.attn_events[0],
+                [self.attn_events[1], self.attn_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=aux_streams is not None,
+                enable=(
+                    aux_streams is not None and self.enable_post_gemm_aux_streams
+                ),
                 enqueue_default_first=self.enqueue_default_before_indexer,
             )
         elif self.compressor is not None:
@@ -688,8 +694,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             q, _ = maybe_execute_in_parallel(
                 wq_b_kv_insert,
                 lambda: compressor(kv_score, positions, self.rotary_emb),
-                self.ln_events[0],
-                self.ln_events[1],
+                self.attn_events[0],
+                self.attn_events[1],
                 aux_stream,
             )
         else:
