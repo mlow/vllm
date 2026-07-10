@@ -91,9 +91,7 @@ def test_draft_argmax_agreement_bf16_vs_fp8_emulated():
     # rejected draft token during verification, never a wrong output.
     top2 = ref_logits.topk(2, dim=-1).values
     margin = (top2[:, 0] - top2[:, 1]).abs()
-    err_scale = (
-        ref_logits.abs().amax(dim=-1) * 2.0 * _ROUNDTRIP_REL_BOUND * 2.0
-    )
+    err_scale = ref_logits.abs().amax(dim=-1) * 2.0 * _ROUNDTRIP_REL_BOUND * 2.0
     disagree = ref_argmax != fp8_argmax
     assert (margin[disagree] <= err_scale[disagree]).all(), (
         "fp8 draft head flipped an argmax with a large top-2 margin"
@@ -129,9 +127,7 @@ def test_fp8_draft_head_logits_cuda_matches_emulation():
     device = torch.device("cuda")
     weight = torch.randn(VOCAB, HIDDEN, dtype=torch.bfloat16, device=device)
     weight *= 0.02
-    hidden = torch.randn(
-        NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device=device
-    )
+    hidden = torch.randn(NUM_TOKENS, HIDDEN, dtype=torch.bfloat16, device=device)
 
     head = quantize_draft_head(weight)
     real = fp8_draft_head_logits(hidden, head).float()

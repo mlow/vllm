@@ -17,9 +17,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     shift_draft_block_tables,
 )
 
-pytestmark = pytest.mark.skipif(
-    not current_platform.is_cuda(), reason="Requires CUDA"
-)
+pytestmark = pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 
 DEVICE = "cuda"
 BLOCK_SIZE = 16
@@ -63,9 +61,7 @@ def test_shift_single_request(num_cached: int, expected_shift: int):
     )
 
     kept = MAX_BLOCKS - expected_shift
-    torch.testing.assert_close(
-        block_table[0, :kept], original[0, expected_shift:]
-    )
+    torch.testing.assert_close(block_table[0, :kept], original[0, expected_shift:])
 
 
 def test_shift_per_request_and_idx_mapping():
@@ -76,9 +72,7 @@ def test_shift_per_request_and_idx_mapping():
     original = block_table.clone()
     idx_mapping = torch.tensor([3, 2, 1, 0], dtype=torch.int32, device=DEVICE)
     # Slot i has i whole cached blocks.
-    num_cached_tokens = torch.zeros(
-        MAX_NUM_REQS, dtype=torch.int32, device=DEVICE
-    )
+    num_cached_tokens = torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device=DEVICE)
     num_cached_tokens[:4] = (
         torch.arange(4, dtype=torch.int32, device=DEVICE) * BLOCK_SIZE
     )
@@ -128,9 +122,7 @@ def test_shift_large_row_in_place_overlap():
         block_table, idx_mapping, num_cached_tokens, seq_lens, BLOCK_SIZE
     )
 
-    torch.testing.assert_close(
-        block_table[0, : max_blocks - 7], original[0, 7:]
-    )
+    torch.testing.assert_close(block_table[0, : max_blocks - 7], original[0, 7:])
 
 
 def test_shift_copy_bounded_by_seq_len():

@@ -1599,8 +1599,8 @@ def _make_dsv4_heterogeneous_kv_cache_specs():
         prefix = f"layers.{layer_idx}"
         kv_cache_specs[f"{prefix}.mla_attn"] = full_mla_spec(ratio)
         kv_cache_specs[f"{prefix}.swa_cache"] = swa_cache_spec()
-        kv_cache_specs[f"{prefix}.compressor.state_cache"] = (
-            compressor_state_spec(ratio)
+        kv_cache_specs[f"{prefix}.compressor.state_cache"] = compressor_state_spec(
+            ratio
         )
         if ratio == 4:
             kv_cache_specs[f"{prefix}.indexer.k_cache"] = indexer_spec()
@@ -2830,6 +2830,8 @@ def test_unify_kv_cache_spec_page_size_mamba():
         "attn_layer": new_kv_cache_spec(),
     }
     assert kv_cache_utils.unify_kv_cache_spec_page_size(specs) == specs
+
+
 def new_swa_mla_spec(
     kv_quant_mode=KVQuantMode.FP8_PER_TENSOR,
     cache_dtype_str="fp8_ds_mla",

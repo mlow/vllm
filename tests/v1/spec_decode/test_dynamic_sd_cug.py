@@ -371,7 +371,6 @@ def test_dynamic_sd_skips_zero_draft_tokens_in_cudagraph_schedule(monkeypatch):
         desc.uniform_token_count
         for descs in manager._candidates.values()
         for desc in descs
-        if desc.cg_mode == CUDAGraphMode.FULL
-        and desc.uniform_token_count is not None
+        if desc.cg_mode == CUDAGraphMode.FULL and desc.uniform_token_count is not None
     }
     assert captured_query_lens == scheduled_query_lens
