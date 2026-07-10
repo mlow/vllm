@@ -306,20 +306,16 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
 
-        # Handle MTP: adjust decode_threshold like the indexer does
+        # Keep the decode/prefill split identical to the DeepSeek V4 C128A
+        # metadata and indexer. Target verification contains the bonus token
+        # plus N speculative tokens even for parallel drafters such as DSpark;
+        # the generic parallel-drafting threshold (1 + 2N) is not applicable.
         spec_config = self.vllm_config.speculative_config
         self.num_speculative_tokens = (
             spec_config.num_speculative_tokens if spec_config else 0
         )
-        # Decode can have query_len up to
-        #   1 + (2 if parallel drafting else 1) * num_speculative_tokens.
-        # This MUST match the flashmla_sparse / indexer threshold so that
-        # all backends agree on the decode/prefill split.
-        spec_mult = (
-            2 if (spec_config is not None and spec_config.parallel_drafting) else 1
-        )
         self.decode_threshold = (
-            self.reorder_batch_threshold + spec_mult * self.num_speculative_tokens
+            self.reorder_batch_threshold + self.num_speculative_tokens
         )
         self._skip_tile_scheduler_platform = (
             current_platform.is_rocm()
@@ -329,9 +325,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         parallel_config = self.vllm_config.parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
-        self.cp_kv_cache_interleave_size = (
-            parallel_config.cp_kv_cache_interleave_size
-        )
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.dcp_rank = 0
         if self.dcp_world_size > 1:
             assert self.pcp_world_size == 1, (
@@ -981,8 +975,7 @@ def _compute_dcp_swa_indices_and_lens_kernel(
             virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
         ) % DCP_WORLD_SIZE == DCP_RANK
         local_block_offsets = (
-            virtual_block_offsets
-            // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+            virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
         ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
             virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
         )

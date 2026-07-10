@@ -89,8 +89,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos = torch.zeros(
             max_num_sampled_tokens, dtype=torch.int64, device=device
         )
-        self.sample_idx_mapping = torch.zeros(
-            max_num_sampled_tokens, dtype=torch.int32, device=device
+        # -1 marks an inert sampling row. CUDA graph capture can execute the
+        # full buffer before a real batch has populated it, so zero would make
+        # every padding row race while scattering into request slot 0.
+        self.sample_idx_mapping = torch.full(
+            (max_num_sampled_tokens,), -1, dtype=torch.int32, device=device
         )
         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
         # draft_logits[req, step, :].
@@ -117,11 +120,11 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def capture(self, attn_states: dict | None = None) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
-        # Reset sampling indices to zero to prevent stale values from prior
-        # dummy runs from being baked into the captured graph.
+        # Reset sampling indices to prevent stale values from prior dummy runs
+        # from being baked into the captured graph. Mapping rows stay inert.
         self.sample_indices.zero_()
         self.sample_pos.zero_()
-        self.sample_idx_mapping.zero_()
+        self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
@@ -608,6 +611,8 @@ def _prepare_dflash_inputs_kernel(
             for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
                 mask = block < max_num_tokens
+                tl.store(out_input_ids_ptr + block, 0, mask=mask)
+                tl.store(out_query_positions_ptr + block, 0, mask=mask)
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 
