@@ -171,6 +171,8 @@ if TYPE_CHECKING:
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
+    VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH: bool = False
+    VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW: int = 8
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1437,6 +1439,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GPUs. Requires fp8 tensor cores (SM89+).
     "VLLM_DSPARK_FP8_DRAFT_HEAD": lambda: bool(
         int(os.getenv("VLLM_DSPARK_FP8_DRAFT_HEAD", "0"))
+    ),
+    # Physically shorten DSpark's next draft block from the historical
+    # confidence-scheduled verification capacity. This captures/replays one
+    # draft graph per K instead of computing Kmax and slicing afterwards.
+    "VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH": lambda: bool(
+        int(os.getenv("VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH", "0"))
+    ),
+    "VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW": lambda: int(
+        os.getenv("VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW", "8")
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,

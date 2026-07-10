@@ -1645,6 +1645,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         num_spec_tokens_to_schedule = execute_model_state.num_spec_tokens_to_schedule
+        if self.verification_capacity_manager is not None:
+            num_spec_tokens_to_schedule = (
+                self.verification_capacity_manager.recommended_draft_depth(
+                    num_spec_tokens_to_schedule
+                )
+            )
 
         # Last rank: sample tokens
         phase = _profile_batch_phase(input_batch)

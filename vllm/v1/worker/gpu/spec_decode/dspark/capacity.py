@@ -11,18 +11,20 @@ def _compute_prefix_survival_probabilities_kernel(
     confidence_logits_ptr,
     survival_probs_ptr,
     inv_temperature,
+    CONFIDENCE_STRIDE: tl.constexpr,
+    SURVIVAL_STRIDE: tl.constexpr,
     NUM_SPECULATIVE_STEPS: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     survival_prob = tl.full((), 1.0, tl.float32)
     for step in tl.static_range(0, NUM_SPECULATIVE_STEPS):
         confidence_logit = tl.load(
-            confidence_logits_ptr + req_idx * NUM_SPECULATIVE_STEPS + step
+            confidence_logits_ptr + req_idx * CONFIDENCE_STRIDE + step
         ).to(tl.float32)
         confidence_prob = 1.0 / (1.0 + tl.exp(-confidence_logit * inv_temperature))
         survival_prob *= confidence_prob
         tl.store(
-            survival_probs_ptr + req_idx * NUM_SPECULATIVE_STEPS + step,
+            survival_probs_ptr + req_idx * SURVIVAL_STRIDE + step,
             survival_prob,
         )
 
@@ -40,6 +42,7 @@ def _allocate_draft_token_capacity_kernel(
     USE_BUDGET: tl.constexpr,
     BUDGET_FRAC: tl.constexpr,
     USE_SPS: tl.constexpr,
+    SURVIVAL_STRIDE: tl.constexpr,
 ):
     offsets = tl.arange(0, REQ_BLOCK)
     runtime_num_reqs = tl.load(runtime_num_reqs_ptr).to(tl.int32)
@@ -73,7 +76,7 @@ def _allocate_draft_token_capacity_kernel(
                 & (lengths < NUM_SPECULATIVE_STEPS)
             )
             next_scores = tl.load(
-                survival_probs_ptr + offsets * NUM_SPECULATIVE_STEPS + lengths,
+                survival_probs_ptr + offsets * SURVIVAL_STRIDE + lengths,
                 mask=has_next,
                 other=-1.0,
             )
@@ -92,7 +95,7 @@ def _allocate_draft_token_capacity_kernel(
         capacities = tl.full((REQ_BLOCK,), 0, tl.int32)
         for step in tl.static_range(0, NUM_SPECULATIVE_STEPS):
             scores = tl.load(
-                survival_probs_ptr + offsets * NUM_SPECULATIVE_STEPS + step,
+                survival_probs_ptr + offsets * SURVIVAL_STRIDE + step,
                 mask=active,
                 other=-1.0,
             )
@@ -135,6 +138,8 @@ def compute_draft_token_capacity_from_confidence(
         confidence_logits,
         survival_probs,
         1.0 / confidence_temperature,
+        CONFIDENCE_STRIDE=confidence_logits.stride(0),
+        SURVIVAL_STRIDE=survival_probs.stride(0),
         NUM_SPECULATIVE_STEPS=num_speculative_steps,
     )
     # Even when the budget covers every token, zero-survival tokens are
@@ -165,4 +170,5 @@ def compute_draft_token_capacity_from_confidence(
         USE_BUDGET=use_budget,
         BUDGET_FRAC=budget_frac,
         USE_SPS=use_sps,
+        SURVIVAL_STRIDE=survival_probs.stride(0),
     )

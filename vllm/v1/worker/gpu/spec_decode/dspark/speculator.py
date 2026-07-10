@@ -102,6 +102,7 @@ class DSparkSpeculator(DFlashSpeculator):
             dtype=torch.int32,
             device=device,
         )
+        self._last_num_speculative_steps = self.num_speculative_steps
         self.min_survival_probability = (
             self.speculative_config.dspark_confidence_threshold
         )
@@ -184,10 +185,12 @@ class DSparkSpeculator(DFlashSpeculator):
         self,
         num_reqs: int,
         head_hidden: torch.Tensor,
+        num_speculative_steps: int,
+        num_query_per_req: int,
         is_profile: bool = False,
     ) -> None:
         # Sequential Markov sampling over the backbone's output hidden states.
-        n_spec = self.num_speculative_steps
+        n_spec = num_speculative_steps
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
@@ -201,14 +204,14 @@ class DSparkSpeculator(DFlashSpeculator):
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
-        confidence_logits = self.draft_token_confidence_logits[:num_reqs]
+        confidence_logits = self.draft_token_confidence_logits[:num_reqs, :n_spec]
         min_survival_probability = self.min_survival_probability
         use_confidence_capacity = self.use_draft_token_capacity
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # laid out as one row per request in the draft query block.
         prev = self.input_buffers.input_ids[
-            : num_reqs * self.num_query_per_req : self.num_query_per_req
+            : num_reqs * num_query_per_req : num_query_per_req
         ]
         valid_prefix = torch.ones(num_reqs, dtype=torch.bool, device=self.device)
         valid_lengths = self.draft_token_valid_lengths[:num_reqs]
@@ -271,7 +274,7 @@ class DSparkSpeculator(DFlashSpeculator):
             if self.online_sts is not None:
                 self.online_sts.calibrate(
                     confidence_logits,
-                    out=self.calibrated_confidence_logits[:num_reqs],
+                    out=self.calibrated_confidence_logits[:num_reqs, :n_spec],
                 )
                 capacity_confidence = self.calibrated_confidence_logits
                 capacity_temperature = 1.0
@@ -280,7 +283,7 @@ class DSparkSpeculator(DFlashSpeculator):
                 self.draft_token_capacity,
                 min_survival_probability,
                 num_reqs,
-                self.num_speculative_steps,
+                n_spec,
                 self._runtime_num_reqs_for_capacity,
                 self.draft_token_survival_probs,
                 self.capacity_budget_frac,
@@ -288,7 +291,7 @@ class DSparkSpeculator(DFlashSpeculator):
                 confidence_temperature=capacity_temperature,
             )
         else:
-            self.draft_token_capacity[:num_reqs].fill_(self.num_speculative_steps)
+            self.draft_token_capacity[:num_reqs].fill_(n_spec)
         torch.minimum(
             self.draft_token_capacity[:num_reqs],
             valid_lengths,
@@ -313,10 +316,10 @@ class DSparkSpeculator(DFlashSpeculator):
             # eagerly (not in the captured graph): a padded replay would
             # index_put through stale padding-row ids, and -1 sentinels wrap
             # to the last row, so neither is safe for a scatter by slot.
-            n_spec = self.num_speculative_steps
+            n_spec = self._last_num_speculative_steps
             self.online_sts.stage_proposal(
                 self.sample_idx_mapping[: num_reqs * n_spec : n_spec],
-                self.draft_token_confidence_logits[:num_reqs],
+                self.draft_token_confidence_logits[:num_reqs, :n_spec],
             )
         return self.draft_token_capacity[:num_reqs]
 
@@ -346,10 +349,26 @@ class DSparkSpeculator(DFlashSpeculator):
                 confidence_temperature=self.confidence_temperature,
             )
 
-    def propose(self, input_batch: InputBatch, *args, **kwargs) -> torch.Tensor:
+    def propose(
+        self,
+        input_batch: InputBatch,
+        *args,
+        num_speculative_tokens: int | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
         if self.use_draft_token_capacity:
             self._runtime_num_reqs_for_capacity.fill_(input_batch.num_reqs)
-        return super().propose(input_batch, *args, **kwargs)
+        self._last_num_speculative_steps = (
+            num_speculative_tokens
+            if self.dynamic_physical_depth and num_speculative_tokens is not None
+            else self.num_speculative_steps
+        )
+        return super().propose(
+            input_batch,
+            *args,
+            num_speculative_tokens=num_speculative_tokens,
+            **kwargs,
+        )
 
     def _generate_draft(
         self,
@@ -360,7 +379,11 @@ class DSparkSpeculator(DFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         is_profile: bool = False,
+        num_query_per_req: int | None = None,
     ) -> None:
+        if num_query_per_req is None:
+            num_query_per_req = self.num_query_per_req
+        num_speculative_steps = self._speculative_steps_for_query_len(num_query_per_req)
         # Full draft step (captured under CUDA graph): parallel backbone forward
         # then sequential Markov sampling over its hidden state outputs.
         head_hidden = self._run_model(
@@ -370,4 +393,10 @@ class DSparkSpeculator(DFlashSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        self._sample_sequential(num_reqs, head_hidden, is_profile=is_profile)
+        self._sample_sequential(
+            num_reqs,
+            head_hidden,
+            num_speculative_steps,
+            num_query_per_req,
+            is_profile=is_profile,
+        )

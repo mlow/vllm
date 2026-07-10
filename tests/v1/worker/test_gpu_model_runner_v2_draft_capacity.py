@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.spec_decode.capacity import (
+    DSparkDynamicDraftDepthController,
     MaskedCapacityBasedVerificationManager,
     VarlenCapacityBasedVerificationManager,
 )
@@ -28,6 +29,76 @@ from vllm.v1.worker.gpu.spec_decode.dspark.capacity import (
 )
 from vllm.v1.worker.gpu.spec_decode.dspark.online_sts import DSparkOnlineSTS
 from vllm.v1.worker.gpu.states import RequestState
+
+
+def test_dynamic_draft_depth_tracks_capacity_and_probes_upward():
+    controller = DSparkDynamicDraftDepthController(max_depth=5, observation_window=2)
+    attempted_5 = np.array([5, 5], dtype=np.int32)
+    capacities_2_3 = np.array([2, 3], dtype=np.int32)
+
+    assert controller.observe(capacities_2_3, attempted_5) == 5
+    assert controller.observe(capacities_2_3, attempted_5) == 3
+
+    attempted_3 = np.array([3, 3], dtype=np.int32)
+    capacities_3 = np.array([3, 3], dtype=np.int32)
+    for _ in range(controller._PROBE_AFTER_WINDOWS * 2 - 1):
+        assert controller.observe(capacities_3, attempted_3) == 3
+    assert controller.observe(capacities_3, attempted_3) == 4
+
+    # A substantial load decrease resets the next proposal to the maximum.
+    assert (
+        controller.observe(
+            np.array([3, 0], dtype=np.int32),
+            np.array([3, 0], dtype=np.int32),
+        )
+        == 5
+    )
+
+
+def test_dynamic_draft_depth_preserves_longest_useful_request():
+    controller = DSparkDynamicDraftDepthController(max_depth=5, observation_window=2)
+    attempted = np.array([5, 5, 5], dtype=np.int32)
+    capacities = np.array([2, 3, 5], dtype=np.int32)
+
+    assert controller.observe(capacities, attempted) == 5
+    assert controller.observe(capacities, attempted) == 5
+
+
+def test_dynamic_draft_depth_applies_profiled_load_budget():
+    controller = DSparkDynamicDraftDepthController(max_depth=5, observation_window=2)
+    controller.set_draft_token_budget(160)
+    attempted = np.full(64, 5, dtype=np.int32)
+    capacities = np.full(64, 5, dtype=np.int32)
+
+    assert controller.observe(capacities, attempted) == 5
+    assert controller.observe(capacities, attempted) == 3
+
+    # At half the load, the same profiled budget exposes the full K5 again.
+    attempted[32:] = 0
+    capacities[32:] = 0
+    assert controller.observe(capacities, attempted) == 5
+
+
+def test_capacity_kernel_supports_shorter_logical_width_than_storage_stride():
+    device = torch.device("cuda")
+    confidence_probs = torch.full((2, 5), 0.01, device=device)
+    confidence_probs[:, :2] = torch.tensor([[0.9, 0.9], [0.8, 0.8]], device=device)
+    confidence_logits = torch.logit(confidence_probs)
+    capacities = torch.full((2,), -1, dtype=torch.int32, device=device)
+    survival = torch.empty_like(confidence_logits)
+
+    compute_draft_token_capacity_from_confidence(
+        confidence_logits,
+        capacities,
+        min_survival_probability=0.7,
+        num_reqs=2,
+        num_speculative_steps=2,
+        runtime_num_reqs=torch.tensor([2], dtype=torch.int32, device=device),
+        survival_probs=survival,
+    )
+
+    torch.accelerator.synchronize()
+    assert capacities.cpu().tolist() == [2, 1]
 
 
 def test_compute_draft_token_capacity_from_confidence_uses_global_prefix_order():

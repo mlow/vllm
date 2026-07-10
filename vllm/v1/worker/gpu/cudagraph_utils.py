@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
+import vllm.envs as envs
 from vllm.compilation.b12x_capture import (
     b12x_cuda_graph_prewarm_enabled,
     guard_b12x_kernel_resolution,
@@ -248,6 +249,21 @@ class CudaGraphManager:
             # runtime; capture a uniform-decode graph per depth so a reduced
             # depth verifies fewer tokens instead of replaying padded
             # max-depth graphs.
+            num_new_sampled_tokens_per_step = (
+                self.decode_query_len - self.vllm_config.num_speculative_tokens
+            )
+            decode_query_lens = [
+                n + num_new_sampled_tokens_per_step
+                for n in range(1, self.vllm_config.num_speculative_tokens + 1)
+            ]
+        elif (
+            speculative_config
+            and speculative_config.use_dspark()
+            and envs.VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH
+        ):
+            # The confidence-capacity controller selects the next physical
+            # DSpark width on the worker. Capture every K so dispatch can
+            # avoid computing and then slicing the unused draft suffix.
             num_new_sampled_tokens_per_step = (
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
             )

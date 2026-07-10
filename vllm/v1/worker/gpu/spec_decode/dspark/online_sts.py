@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class DSparkOnlineSTS:
@@ -75,16 +81,23 @@ class DSparkOnlineSTS:
             self._bin_mids.unsqueeze(0) / self._temp_grid.unsqueeze(1)
         )
         self._log_temp_grid = self._temp_grid.log()
+        self._log_interval = int(
+            os.environ.get("VLLM_DSPARK_STS_LOG_INTERVAL", "0") or "0"
+        )
+        self._record_count = 0
 
     def stage_proposal(self, req_state_indices: torch.Tensor, logits: torch.Tensor):
         """Remember the raw head logits of the current proposal."""
-        self.logits_by_state[req_state_indices] = logits
+        rows = self.logits_by_state[req_state_indices]
+        rows.zero_()
+        rows[:, : logits.shape[1]] = logits
+        self.logits_by_state[req_state_indices] = rows
 
     def calibrate(
         self, logits: torch.Tensor, out: torch.Tensor | None = None
     ) -> torch.Tensor:
         """Apply the per-position temperatures (order-preserving)."""
-        return torch.div(logits, self.temperatures, out=out)
+        return torch.div(logits, self.temperatures[: logits.shape[-1]], out=out)
 
     def record(
         self,
@@ -129,3 +142,30 @@ class DSparkOnlineSTS:
         # Blend toward the identity until enough outcomes accumulate.
         total = self.bin_trials.sum(-1)
         torch.exp(log_t * (total / (total + self.PRIOR_WEIGHT)), out=self.temperatures)
+        self._maybe_log_diagnostics(total)
+
+    def _maybe_log_diagnostics(self, total_trials: torch.Tensor) -> None:
+        if self._log_interval <= 0:
+            return
+        self._record_count += 1
+        if self._record_count % self._log_interval:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+
+        denom = total_trials.clamp(min=1e-6)
+        empirical_mean = self.bin_hits.sum(-1) / denom
+        calibrated_bin_probs = torch.sigmoid(
+            self._bin_mids.unsqueeze(0) / self.temperatures.unsqueeze(1)
+        )
+        predicted_mean = (calibrated_bin_probs * self.bin_trials).sum(-1) / denom
+        raw_logit_mean = (self._bin_mids.unsqueeze(0) * self.bin_trials).sum(-1) / denom
+        logger.info(
+            "DSpark online STS: trials=%s empirical_cond=%s "
+            "predicted_cond=%s temperatures=%s raw_logit_mean=%s",
+            [round(x, 1) for x in total_trials.tolist()],
+            [round(x, 4) for x in empirical_mean.tolist()],
+            [round(x, 4) for x in predicted_mean.tolist()],
+            [round(x, 4) for x in self.temperatures.tolist()],
+            [round(x, 4) for x in raw_logit_mean.tolist()],
+        )
