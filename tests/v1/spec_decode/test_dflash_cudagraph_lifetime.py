@@ -16,6 +16,8 @@ def _make_speculator() -> SimpleNamespace:
         _run_model=Mock(return_value=hidden_states),
         _captured_backbone_outputs=[],
         num_speculative_steps=2,
+        num_query_per_req=3,
+        _speculative_steps_for_query_len=lambda query_len: query_len - 1,
         sample_indices=torch.tensor([0, 1]),
         sample_pos=torch.tensor([1, 2]),
         sample_idx_mapping=torch.tensor([0, 0]),
