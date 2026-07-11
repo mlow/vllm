@@ -442,10 +442,10 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
 
     @staticmethod
     def _allow_post_gemm_aux_streams(vllm_config: VllmConfig) -> bool:
-        # Verifier graphs can replay several target rows per request and still
-        # require the conservative single-stream path. Standard serving has no
-        # verifier and can retain the overlap used by v9/v15.
-        return vllm_config.speculative_config is None
+        spec_config = vllm_config.speculative_config
+        # MTP uses the causal verifier path that was stable with this overlap
+        # in v9/v15. Keep DSpark's dynamic, non-causal verifier serialized.
+        return spec_config is None or spec_config.method == "mtp"
 
     def __init__(
         self,

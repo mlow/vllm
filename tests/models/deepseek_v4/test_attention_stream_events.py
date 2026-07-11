@@ -12,13 +12,16 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
 )
 
 
-def test_b12x_only_disables_post_gemm_aux_streams_for_spec_decode() -> None:
+def test_b12x_only_disables_post_gemm_aux_streams_for_dspark() -> None:
     assert DeepseekV4B12xMLAAttention.enable_post_gemm_aux_streams is True
     assert DeepseekV4B12xMLAAttention._allow_post_gemm_aux_streams(
         SimpleNamespace(speculative_config=None)
     )
+    assert DeepseekV4B12xMLAAttention._allow_post_gemm_aux_streams(
+        SimpleNamespace(speculative_config=SimpleNamespace(method="mtp"))
+    )
     assert not DeepseekV4B12xMLAAttention._allow_post_gemm_aux_streams(
-        SimpleNamespace(speculative_config=object())
+        SimpleNamespace(speculative_config=SimpleNamespace(method="dspark"))
     )
 
 
