@@ -20,6 +20,27 @@ def test_flashinfer_sm120_disables_c4_post_gemm_aux_streams() -> None:
     assert DeepseekV4FlashInferSM120Attention.enable_post_gemm_aux_streams is False
 
 
+def test_post_gemm_aux_stream_gate_covers_every_attention_path() -> None:
+    streams = [object(), object(), object()]
+    layer = SimpleNamespace(
+        aux_stream_list=streams,
+        enable_post_gemm_aux_streams=False,
+    )
+
+    for index in range(len(streams)):
+        assert (
+            attention_module.DeepseekV4Attention._post_gemm_aux_stream(layer, index)
+            is None
+        )
+
+    layer.enable_post_gemm_aux_streams = True
+    for index, stream in enumerate(streams):
+        assert (
+            attention_module.DeepseekV4Attention._post_gemm_aux_stream(layer, index)
+            is stream
+        )
+
+
 def test_gemm_and_attention_overlap_use_distinct_event_sets(monkeypatch) -> None:
     calls = []
 

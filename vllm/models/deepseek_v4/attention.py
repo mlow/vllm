@@ -166,6 +166,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """Return whether this instance stores fp8 KV in fp8_ds_mla layout."""
         return self.use_fp8_ds_mla_layout
 
+    def _post_gemm_aux_stream(self, index: int) -> torch.cuda.Stream | None:
+        if not self.enable_post_gemm_aux_streams or self.aux_stream_list is None:
+            return None
+        return self.aux_stream_list[index]
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -280,15 +285,16 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         self.indexer_rotary_emb = self.rotary_emb
         self.topk_indices_buffer = topk_indices_buffer
 
+        # Will be None on ROCm for now.
+        self.aux_stream_list = aux_stream_list
+
         self.indexer = None
         if self.compress_ratio == 4:
             # Only C4A uses sparse attention and hence has indexer.
             # aux_stream_list[2] is free here (outer GEMMs joined) for the inner
             # overlap of wq_b+fused_indexer_q_rope_quant vs compressor. None on
             # ROCm, where aux_stream_list is None.
-            indexer_aux_stream = (
-                aux_stream_list[2] if aux_stream_list is not None else None
-            )
+            indexer_aux_stream = self._post_gemm_aux_stream(2)
             self.indexer = DeepseekV4Indexer(
                 vllm_config,
                 config=config,
@@ -302,8 +308,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 aux_stream=indexer_aux_stream,
             )
 
-        # Will be None on ROCm for now.
-        self.aux_stream_list = aux_stream_list
         # Keep the GEMM and post-GEMM event generations independent. The first
         # join only enqueues waits on the default stream; re-recording those
         # events for cache/indexer overlap before the waits execute can race.
@@ -674,16 +678,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 self.attn_events[0],
                 [self.attn_events[1], self.attn_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=(
-                    aux_streams is not None and self.enable_post_gemm_aux_streams
-                ),
+                enable=(aux_streams is not None and self.enable_post_gemm_aux_streams),
                 enqueue_default_first=self.enqueue_default_before_indexer,
             )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
-            aux_stream = (
-                self.aux_stream_list[0] if self.aux_stream_list is not None else None
-            )
+            aux_stream = self._post_gemm_aux_stream(0)
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
