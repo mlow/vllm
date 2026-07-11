@@ -278,8 +278,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         "parallel is not supported."
                     )
 
-        # Draft tokens propagation - for spec-dec + struct outputs.
-        self.draft_tokens_handler = DraftTokensHandler(self.device)
+        # Draft token propagation for structured outputs and block speculators
+        # whose returned draft prefix can be shorter than the configured width.
+        self.draft_tokens_handler = DraftTokensHandler(
+            self.device,
+            needs_real_draft_tokens=(
+                self.speculative_config is not None
+                and self.speculative_config.requires_host_draft_token_ids()
+            ),
+        )
 
         # Pooling models.
         self.is_pooling_model = self.model_config.runner_type == "pooling"

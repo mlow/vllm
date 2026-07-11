@@ -1476,6 +1476,15 @@ class SpeculativeConfig:
     def use_causal_cascade(self) -> bool:
         return self.method == "causal_cascade"
 
+    def requires_host_draft_token_ids(self) -> bool:
+        """Whether async scheduling needs the actual draft ids on the host.
+
+        Fixed-width speculators can use scheduler placeholders and keep draft
+        ids on the worker. Block speculators may return a shorter prefix using
+        ``-1`` sentinels, so the scheduler must receive their real draft ids.
+        """
+        return self.method in ("dflash", "dspark", "causal_cascade")
+
     def uses_batch_size_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None
 

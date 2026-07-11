@@ -52,8 +52,13 @@ def limit_draft_tokens(
 
 
 class DraftTokensHandler:
-    def __init__(self, device: torch.device | None = None):
+    def __init__(
+        self,
+        device: torch.device | None = None,
+        needs_real_draft_tokens: bool = False,
+    ):
         self.device = device
+        self.needs_real_draft_tokens = needs_real_draft_tokens
         self.copy_stream = torch.cuda.Stream(device)
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
@@ -67,6 +72,14 @@ class DraftTokensHandler:
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
+        if (
+            not self.needs_real_draft_tokens
+            and not input_batch.has_structured_output_reqs
+        ):
+            # Fixed-width speculators use scheduler placeholders. Avoid a D2H
+            # copy and per-step event synchronization on their decode path.
+            self.draft_tokens_np = None
+            return
 
         # The scheduler needs the real draft lengths. Some speculators use
         # -1 as a sentinel for fallback/no-draft slots; sending placeholder
@@ -86,14 +99,15 @@ class DraftTokensHandler:
         if self.draft_tokens_np is not None:
             self.copy_event.synchronize()
             draft_token_ids = self.draft_tokens_np.tolist()
+            for token_ids in draft_token_ids:
+                for i, token_id in enumerate(token_ids):
+                    if token_id < 0:
+                        del token_ids[i:]
+                        break
         else:
-            # This case only happens when async scheduling is disabled.
+            # Fixed-width async scheduling only needs the draft count. The
+            # worker retains the actual token ids for verification.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
-        for token_ids in draft_token_ids:
-            for i, token_id in enumerate(token_ids):
-                if token_id < 0:
-                    del token_ids[i:]
-                    break
         return DraftTokenIds(self.req_ids, draft_token_ids)
 
 

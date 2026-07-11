@@ -160,6 +160,11 @@ class EngineCore:
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
         )
+        speculative_config = vllm_config.speculative_config
+        self.requires_host_draft_token_ids = (
+            speculative_config is not None
+            and speculative_config.requires_host_draft_token_ids()
+        )
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
@@ -505,7 +510,7 @@ class EngineCore:
             scheduler_output, model_output
         )
         if (
-            self.check_for_draft_tokens
+            self.requires_host_draft_token_ids
             and self.async_scheduling
             and scheduler_output.total_num_scheduled_tokens > 0
         ):
@@ -612,7 +617,7 @@ class EngineCore:
             scheduler_output, model_output
         )
         if (
-            self.check_for_draft_tokens
+            self.requires_host_draft_token_ids
             and self.async_scheduling
             and scheduler_output.total_num_scheduled_tokens > 0
         ):
