@@ -375,6 +375,8 @@ class CustomAllreduce {
   int world_size_;
   // Full NVLink or xGMI connection between GPUs.
   bool fully_connected_;
+  // 0 = automatic, 1 = one-stage, 2 = two-stage.
+  int algo_;
 
   RankSignals sg_;
   // Stores a map from a pointer to its peer pointers from all ranks.
@@ -414,10 +416,12 @@ class CustomAllreduce {
    * are passed in from the constructor.
    */
   CustomAllreduce(Signal** signals, void* rank_data, size_t rank_data_sz,
-                  int rank, int world_size, bool fully_connected = true)
+                  int rank, int world_size, bool fully_connected = true,
+                  int algo = 0)
       : rank_(rank),
         world_size_(world_size),
         fully_connected_(fully_connected),
+        algo_(algo),
         self_sg_(signals[rank]),
         d_rank_data_base_(reinterpret_cast<RankData*>(rank_data)),
         d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)) {
@@ -558,16 +562,19 @@ class CustomAllreduce {
     auto bytes = size * sizeof(typename packed_t<T>::P);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 
-    // Check environment variable once
+    bool force_1stage = algo_ == 1;
+    bool force_2stage = algo_ == 2;
+
+    // An explicit process-wide override remains available for debugging.
     const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
-    bool force_1stage = false;
-    bool force_2stage = false;
     if (env_algo != nullptr) {
       if (std::strcmp(env_algo, "1stage") == 0 ||
           std::strcmp(env_algo, "oneshot") == 0) {
         force_1stage = true;
+        force_2stage = false;
       } else if (std::strcmp(env_algo, "2stage") == 0 ||
                  std::strcmp(env_algo, "twoshot") == 0) {
+        force_1stage = false;
         force_2stage = true;
       } else {
         throw std::runtime_error(

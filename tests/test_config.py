@@ -1662,7 +1662,7 @@ def test_dspark_capacity_config_validation():
         == 0.0
     )
 
-    for threshold in (-0.1, 1.1):
+    for threshold in (-0.1, 1.1, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="dspark_confidence_threshold"):
             SpeculativeConfig(
                 method="ngram",
@@ -1670,13 +1670,33 @@ def test_dspark_capacity_config_validation():
                 dspark_confidence_threshold=threshold,
             )
 
-    for budget_frac in (0.0, -0.1, 1.1):
+    for budget_frac in (0.0, -0.1, 1.1, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="dspark_budget_frac"):
             SpeculativeConfig(
                 method="ngram",
                 num_speculative_tokens=1,
                 dspark_budget_frac=budget_frac,
             )
+
+    for config_field, value in (
+        ("dspark_confidence_temperature", float("nan")),
+        ("dspark_confidence_temperature", float("inf")),
+        ("dspark_sps_overhead_ms", float("nan")),
+        ("dspark_sps_overhead_ms", float("inf")),
+    ):
+        with pytest.raises(ValueError, match=config_field):
+            SpeculativeConfig(
+                method="ngram",
+                num_speculative_tokens=1,
+                **{config_field: value},
+            )
+
+    with pytest.raises(ValueError, match="dspark_sps_curve"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            dspark_sps_curve=[(1, float("nan"))],
+        )
 
 
 def test_ir_op_priority_default():

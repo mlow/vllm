@@ -34,8 +34,8 @@ def _fake_pynvml(statuses):
 @pytest.mark.parametrize(
     "statuses,expected",
     [
-        ([0, 0, 0, 0, 0, 0], True),  # all six pairs of 4 GPUs OK
-        ([0, 5], False),  # second pair reports NOT_SUPPORTED
+        ([0] * 12, True),  # both directions for all six 4-GPU pairs
+        ([0, 5], False),  # second directed pair reports NOT_SUPPORTED
         ([RuntimeError("nvml")], False),  # query failure -> assume absent
     ],
 )
@@ -82,9 +82,7 @@ def barrier_env(monkeypatch):
     drv = _FakeDriver()
     monkeypatch.setattr(spb, "_drv", drv)
     spb.reset_pcie_barrier_state()
-    monkeypatch.setattr(
-        "torch.cuda.is_current_stream_capturing", lambda: False
-    )
+    monkeypatch.setattr("torch.cuda.is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
         "torch.cuda.current_stream", lambda: SimpleNamespace(cuda_stream=0)
     )
@@ -140,11 +138,14 @@ def test_pcie_barrier_ring_slots_and_sequence(barrier_env):
 
 
 def test_pcie_barrier_rejects_graph_capture(barrier_env, monkeypatch):
-    monkeypatch.setattr(
-        "torch.cuda.is_current_stream_capturing", lambda: True
-    )
+    monkeypatch.setattr("torch.cuda.is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="captured"):
         spb._pcie_safe_barrier(_fake_handle(), channel=0)
+
+
+def test_pcie_barrier_rejects_unsupported_timeout(barrier_env):
+    with pytest.raises(NotImplementedError, match="does not support timeouts"):
+        spb._pcie_safe_barrier(_fake_handle(), timeout_ms=1)
 
 
 def test_pcie_barrier_rejects_bad_channel(barrier_env):

@@ -811,7 +811,7 @@ class NvmlCudaPlatform(CudaPlatformBase):
         handles = [pynvml.nvmlDeviceGetHandleByIndex(i) for i in physical_device_ids]
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
-                if i < j:
+                if i != j:
                     try:
                         p2p_status = pynvml.nvmlDeviceGetP2PStatus(
                             handle,

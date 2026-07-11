@@ -185,7 +185,7 @@ def test_compute_draft_token_capacity_keeps_threshold_ties():
     )
 
     torch.accelerator.synchronize()
-    assert draft_token_capacity.cpu().tolist() == [1, 1]
+    assert draft_token_capacity.cpu().tolist() == [1, 0]
 
 
 def test_compute_draft_token_capacity_budget_is_hard_cap_under_ties():
@@ -212,7 +212,7 @@ def test_compute_draft_token_capacity_budget_is_hard_cap_under_ties():
 
     torch.accelerator.synchronize()
     capacities = draft_token_capacity.cpu()
-    assert int(capacities.sum()) == int(4 * 7 * 0.5) + 1
+    assert int(capacities.sum()) == int(4 * 7 * 0.5)
     assert int(capacities.max()) <= 7
 
 

@@ -315,10 +315,12 @@ if [[ "${sp_async_tp}" == "1" ]]; then
 fi
 
 if [[ -z "${gpu_memory_utilization}" ]]; then
+  # The v10 profiler includes attention and FULL-graph allocations. These
+  # defaults preserve the 262k serving limit used by v9 after that accounting.
   if [[ "${mode}" == "dspark" ]]; then
-    gpu_memory_utilization=0.93
+    gpu_memory_utilization=0.95
   else
-    gpu_memory_utilization=0.90
+    gpu_memory_utilization=0.91
   fi
 fi
 
@@ -337,7 +339,10 @@ if [[ "${capture_sizes}" == "auto" ]]; then
   sizes=(1)
   n=2
   while (( n < graph_cap )); do sizes+=("${n}"); n=$((n * 2)); done
-  sizes+=("${max_num_seqs}" "${graph_cap}")
+  if (( max_num_seqs <= graph_cap )); then
+    sizes+=("${max_num_seqs}")
+  fi
+  sizes+=("${graph_cap}")
   mapfile -t sizes < <(printf '%s\n' "${sizes[@]}" | sort -n -u)
   capture_args=(--cudagraph-capture-sizes "${sizes[@]}")
 elif [[ "${capture_sizes}" != "default" && "${capture_sizes}" != "none" ]]; then

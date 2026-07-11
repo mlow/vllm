@@ -29,7 +29,9 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             draft_cache_config,
             cache_dtype=speculative_config.draft_kv_cache_dtype,
         )
-    backend = speculative_config.attention_backend or AttentionBackendEnum.FLASH_ATTN
+    backend = speculative_config.draft_attention_backend
+    if backend is None or backend == "auto":
+        backend = AttentionBackendEnum.FLASH_ATTN
     draft_vllm_config = replace(
         vllm_config,
         cache_config=draft_cache_config,

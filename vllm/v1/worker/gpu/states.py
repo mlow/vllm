@@ -88,6 +88,7 @@ class RequestState:
         self.num_cached_tokens = StagedWriteTensor(
             self.max_num_reqs, dtype=torch.int32, device=device
         )
+        self.num_cached_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
 
     @property
     def num_reqs(self) -> int:
@@ -119,6 +120,7 @@ class RequestState:
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
         self.num_cached_tokens.stage_write_elem(req_idx, num_computed_tokens)
+        self.num_cached_tokens_np[req_idx] = num_computed_tokens
 
         self.draft_tokens[req_idx].zero_()
 

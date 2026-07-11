@@ -3,6 +3,7 @@
 
 import copy
 import functools
+import math
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, get_args
@@ -1302,21 +1303,31 @@ class SpeculativeConfig:
                 "are only valid with rejection_sample_method='synthetic'."
             )
 
-        if not 0.0 <= self.dspark_confidence_threshold <= 1.0:
+        if not math.isfinite(self.dspark_confidence_threshold) or not (
+            0.0 <= self.dspark_confidence_threshold <= 1.0
+        ):
             raise ValueError(
                 "dspark_confidence_threshold must be in [0, 1], got "
                 f"{self.dspark_confidence_threshold}."
             )
-        if not 0.0 < self.dspark_budget_frac <= 1.0:
+        if not math.isfinite(self.dspark_budget_frac) or not (
+            0.0 < self.dspark_budget_frac <= 1.0
+        ):
             raise ValueError(
                 f"dspark_budget_frac must be in (0, 1], got {self.dspark_budget_frac}."
             )
-        if self.dspark_confidence_temperature <= 0.0:
+        if (
+            not math.isfinite(self.dspark_confidence_temperature)
+            or self.dspark_confidence_temperature <= 0.0
+        ):
             raise ValueError(
                 "dspark_confidence_temperature must be > 0, got "
                 f"{self.dspark_confidence_temperature}."
             )
-        if self.dspark_sps_overhead_ms < 0.0:
+        if (
+            not math.isfinite(self.dspark_sps_overhead_ms)
+            or self.dspark_sps_overhead_ms < 0.0
+        ):
             raise ValueError(
                 "dspark_sps_overhead_ms must be >= 0, got "
                 f"{self.dspark_sps_overhead_ms}."
@@ -1334,7 +1345,8 @@ class SpeculativeConfig:
             ]
             batch_sizes = [b for b, _ in self.dspark_sps_curve]
             if not self.dspark_sps_curve or any(
-                b <= 0 or s <= 0.0 for b, s in self.dspark_sps_curve
+                b <= 0 or not math.isfinite(s) or s <= 0.0
+                for b, s in self.dspark_sps_curve
             ):
                 raise ValueError(
                     "dspark_sps_curve entries must have positive batch token "

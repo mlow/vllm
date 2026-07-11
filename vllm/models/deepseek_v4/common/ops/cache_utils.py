@@ -590,8 +590,7 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
             virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
         ) % DCP_WORLD_SIZE == DCP_RANK
         local_block_offsets = (
-            virtual_block_offsets
-            // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
+            virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
         ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
             virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
         )
@@ -769,6 +768,7 @@ def build_flashinfer_mixed_sparse_indices(
     assert decode_swa_indices.dim() == 2
     swa_index_width = decode_swa_indices.shape[-1]
     assert swa_index_width >= window_size
+    assert swa_index_width % 4 == 0
     if decode_compressed_topk_lens is not None:
         assert decode_compressed_topk_lens.dtype == torch.int32
     assert prefill_topk_indices.dtype == torch.int32

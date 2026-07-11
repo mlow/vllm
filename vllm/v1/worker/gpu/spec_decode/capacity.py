@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import tempfile
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -31,8 +32,10 @@ if TYPE_CHECKING:
 
 @triton.jit
 def _compact_token_inputs_kernel(
-    input_ids_ptr,
-    positions_ptr,
+    source_input_ids_ptr,
+    source_positions_ptr,
+    output_input_ids_ptr,
+    output_positions_ptr,
     old_query_start_loc_ptr,
     new_query_start_loc_ptr,
     BLOCK_SIZE: tl.constexpr,
@@ -43,10 +46,10 @@ def _compact_token_inputs_kernel(
     new_end = tl.load(new_query_start_loc_ptr + req_idx + 1)
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < (new_end - new_start)
-    input_ids = tl.load(input_ids_ptr + old_start + offsets, mask=mask)
-    positions = tl.load(positions_ptr + old_start + offsets, mask=mask)
-    tl.store(input_ids_ptr + new_start + offsets, input_ids, mask=mask)
-    tl.store(positions_ptr + new_start + offsets, positions, mask=mask)
+    input_ids = tl.load(source_input_ids_ptr + old_start + offsets, mask=mask)
+    positions = tl.load(source_positions_ptr + old_start + offsets, mask=mask)
+    tl.store(output_input_ids_ptr + new_start + offsets, input_ids, mask=mask)
+    tl.store(output_positions_ptr + new_start + offsets, positions, mask=mask)
 
 
 def get_draft_token_capacities(
@@ -552,10 +555,19 @@ class VarlenCapacityBasedVerificationManager(CapacityBasedVerificationManager):
         num_bonus_tokens: int,
     ) -> None:
         num_tokens = int(num_scheduled_tokens.sum())
+        old_num_tokens = input_batch.num_tokens
         old_query_start_loc = async_copy_to_gpu(
             input_batch.query_start_loc_np[: input_batch.num_reqs + 1],
             device=self.device,
         )
+        # The active views may already be trimmed below the old packed size,
+        # while their backing allocations still contain every source row.
+        source_input_ids = input_batch.input_ids.as_strided(
+            (old_num_tokens,), (1,)
+        ).clone()
+        source_positions = input_batch.positions.as_strided(
+            (old_num_tokens,), (1,)
+        ).clone()
 
         input_batch.num_scheduled_tokens = num_scheduled_tokens
         input_batch.num_tokens = num_tokens
@@ -597,6 +609,8 @@ class VarlenCapacityBasedVerificationManager(CapacityBasedVerificationManager):
             out=input_batch.query_start_loc,
         )
         _compact_token_inputs_kernel[(input_batch.num_reqs,)](
+            source_input_ids,
+            source_positions,
             input_batch.input_ids,
             input_batch.positions,
             old_query_start_loc,
@@ -604,6 +618,8 @@ class VarlenCapacityBasedVerificationManager(CapacityBasedVerificationManager):
             BLOCK_SIZE=triton.next_power_of_2(max(1, int(num_scheduled_tokens.max()))),
         )
         old_query_start_loc.record_stream(torch.cuda.current_stream(self.device))
+        source_input_ids.record_stream(torch.cuda.current_stream(self.device))
+        source_positions.record_stream(torch.cuda.current_stream(self.device))
 
         if np.any(input_batch.is_prefilling_np):
             prepare_prefill_inputs(
@@ -831,7 +847,12 @@ def check_dspark_tp_consistency(
         "sts_temperatures": sts.temperatures.cpu() if sts else None,
         "sts_logits_by_state": sts.logits_by_state.cpu() if sts else None,
     }
-    path = f"/tmp/dspark_tp_divergence_rank{tp_group.rank_in_group}.pt"
+    with tempfile.NamedTemporaryFile(
+        prefix=f"dspark_tp_divergence_rank{tp_group.rank_in_group}_",
+        suffix=".pt",
+        delete=False,
+    ) as dump_file:
+        path = dump_file.name
     torch.save(dump, path)
     raise RuntimeError(
         f"DSpark capacity TP divergence: rank {tp_group.rank_in_group} "

@@ -351,6 +351,7 @@ def warmup_kernels(
             model_runner.speculator.warmup_capacity_kernels()
             if model_runner.speculator.wants_auto_sps_curve:
                 _profile_sps_curve(model_runner)
+                model_runner.kv_connector.set_disabled(True)
 
     # Clean up - process finish_req_ids.
     cleanup_output = SchedulerOutput.make_empty()

@@ -1534,9 +1534,9 @@ class CompilationConfig:
         # padded virtual requests just because the original capture-size list
         # skipped that request count.
         small_decode_sizes = {
-            multiple_of * num_reqs
+            _round_for(multiple_of * num_reqs)
             for num_reqs in range(1, 33)
-            if multiple_of * num_reqs <= self.max_cudagraph_capture_size
+            if _round_for(multiple_of * num_reqs) <= self.max_cudagraph_capture_size
         }
         rounded_sizes = sorted(set(rounded_sizes) | small_decode_sizes)
 

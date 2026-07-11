@@ -51,7 +51,7 @@ def _allocate_draft_token_capacity_kernel(
     if USE_BUDGET:
         total_admissions = runtime_num_reqs * NUM_SPECULATIVE_STEPS
         max_admissions = tl.minimum(
-            (total_admissions.to(tl.float32) * BUDGET_FRAC).to(tl.int32) + 1,
+            tl.ceil(total_admissions.to(tl.float32) * BUDGET_FRAC).to(tl.int32),
             total_admissions,
         )
         # DSpark Algorithm 1: greedy global admission over the candidate set

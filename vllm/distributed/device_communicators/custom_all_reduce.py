@@ -244,6 +244,7 @@ class CustomAllreduce:
         self._pcie_fused_add_rms_norm_max_size: int | None = None
         self._cpp_ar_cutoff_size: int | None = None
         self._cpp_ar_ignore_cutoff_max_rows = 0
+        self._cpp_ar_algo = 0
         self._pcie_cpp_backend = False
         self._pcie_logged_first_allreduce = False
         self._ptr = 0
@@ -359,12 +360,11 @@ class CustomAllreduce:
                 # The vLLM C++ protocol is atomics-free. Force the 2-stage
                 # algorithm because the default C++ dispatch otherwise skips
                 # non-fully-connected world sizes above two.
-                os.environ.setdefault("VLLM_CUSTOM_ALLREDUCE_ALGO", "2stage")
+                self._cpp_ar_algo = 2
                 logger.info_once(
                     "Custom allreduce enabled on %d PCIe-only GPUs by "
-                    "VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE (algo=%s).",
+                    "VLLM_ALLOW_CUSTOM_ALLREDUCE_PCIE (algo=2stage).",
                     world_size,
-                    os.environ["VLLM_CUSTOM_ALLREDUCE_ALGO"],
                 )
             elif envs.VLLM_ENABLE_PCIE_ALLREDUCE:
                 pcie_backend = _get_pcie_allreduce_backend()
@@ -625,7 +625,11 @@ class CustomAllreduce:
                 self._cpp_ar_ignore_cutoff_max_rows,
             )
         self._ptr = ops.init_custom_ar(
-            self.meta_ptrs, self.rank_data, rank, self.fully_connected
+            self.meta_ptrs,
+            self.rank_data,
+            rank,
+            self.fully_connected,
+            self._cpp_ar_algo,
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
 

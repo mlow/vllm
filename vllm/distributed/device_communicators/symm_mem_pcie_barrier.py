@@ -76,9 +76,9 @@ logger = init_logger(__name__)
 #   * if growth does happen, drain the device and keep the old tensor
 #     alive forever (bounded leak, rare) so parked ops keep polling
 #     stable memory.
-_WORKSPACE_FLOOR = int(
-    os.getenv("VLLM_SYMM_MEM_WORKSPACE_FLOOR_MB", "256")
-) * 1024 * 1024
+_WORKSPACE_FLOOR = (
+    int(os.getenv("VLLM_SYMM_MEM_WORKSPACE_FLOOR_MB", "256")) * 1024 * 1024
+)
 _workspace_graveyard: list = []
 _orig_get_workspace = None
 
@@ -93,6 +93,10 @@ _drv = None
 
 
 def _pcie_safe_barrier(self, channel: int = 0, timeout_ms: int = 0) -> None:
+    if timeout_ms:
+        raise NotImplementedError(
+            "The PCIe-safe stream-memops barrier does not support timeouts."
+        )
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "The PCIe-safe symm-mem barrier cannot be captured in a CUDA "
@@ -197,18 +201,14 @@ _orig_multi_ag = None
 def _comm_stream_produce_and_all2all(
     chunk_producer, output, group_name, out_chunk_dim=0
 ):
-    import torch.distributed.distributed_c10d as c10d
     import torch.distributed._symmetric_memory as tsm
+    import torch.distributed.distributed_c10d as c10d
 
     out_chunks = output.chunk(
         c10d._get_group_size_by_name(group_name), dim=out_chunk_dim
     )
-    p2p_workspace_size_req = (
-        out_chunks[0].numel() * out_chunks[0].element_size() * 2
-    )
-    symm_mem = tsm.get_symm_mem_workspace(
-        group_name, min_size=p2p_workspace_size_req
-    )
+    p2p_workspace_size_req = out_chunks[0].numel() * out_chunks[0].element_size() * 2
+    symm_mem = tsm.get_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
     group_size = symm_mem.world_size
     rank = symm_mem.rank
 
@@ -220,9 +220,7 @@ def _comm_stream_produce_and_all2all(
 
     def get_p2p_buf(r: int, idx: int) -> torch.Tensor:
         offset = 0 if idx == 0 else out_chunks[0].numel()
-        return symm_mem.get_buffer(
-            r, out_chunks[0].shape, out_chunks[0].dtype, offset
-        )
+        return symm_mem.get_buffer(r, out_chunks[0].shape, out_chunks[0].dtype, offset)
 
     # reuse-fence events: producer of step k+2 must wait until peers
     # finished reading the same buffer at step k (second barrier done)
@@ -235,8 +233,7 @@ def _comm_stream_produce_and_all2all(
         if reuse_evt[buf_id] is not None:
             prod.wait_event(reuse_evt[buf_id])
         with torch.cuda.stream(prod):
-            chunk_producer((rank + step) % group_size,
-                           get_p2p_buf(rank, buf_id))
+            chunk_producer((rank + step) % group_size, get_p2p_buf(rank, buf_id))
         done = torch.cuda.Event()
         done.record(prod)
 
@@ -263,9 +260,7 @@ def _comm_stream_multi_all_gather_and_consume(
     p2p_workspace_size_req = 0
     for x in shard:
         p2p_workspace_size_req += x.numel() * x.element_size()
-    symm_mem = tsm.get_symm_mem_workspace(
-        group_name, min_size=p2p_workspace_size_req
-    )
+    symm_mem = tsm.get_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
     group_size = symm_mem.world_size
     rank = symm_mem.rank
 
@@ -364,6 +359,6 @@ def install_pcie_safe_barrier() -> None:
     logger.info_once(
         "torch symm-mem group barrier replaced with the PCIe-safe "
         "stream-memops protocol (no native P2P atomics on this platform); "
-        "fused-op workspace floored at %d MiB with growth guard."
-        % (_WORKSPACE_FLOOR // (1024 * 1024))
+        "fused-op workspace floored at %d MiB with growth guard.",
+        _WORKSPACE_FLOOR // (1024 * 1024),
     )

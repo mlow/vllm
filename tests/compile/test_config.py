@@ -519,11 +519,24 @@ def test_spec_decode_capture_rounding_scoped_by_sp_threshold():
     # so only spec-decode divisibility applies.
     config = make_config(sp_min_token_num=1024)
     config.adjust_cudagraph_sizes_for_spec_decode(3, 4)
-    assert config.cudagraph_capture_sizes == [3, 9]
+    assert config.cudagraph_capture_sizes == list(range(3, 97, 3))
 
     # With captured sizes at or above the threshold the conflict is real.
     with pytest.raises(ValueError, match="Can't determine cudagraph shapes"):
         make_config(sp_min_token_num=256).adjust_cudagraph_sizes_for_spec_decode(3, 4)
+
+
+def test_spec_decode_small_capture_sizes_respect_sp_rounding():
+    config = CompilationConfig(
+        pass_config=PassConfig(enable_sp=True, sp_min_token_num=8),
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_capture_sizes=[1, 2, 8, 64],
+        max_cudagraph_capture_size=64,
+    )
+
+    config.adjust_cudagraph_sizes_for_spec_decode(2, 4)
+
+    assert all(size < 8 or size % 4 == 0 for size in config.cudagraph_capture_sizes)
 
 
 @pytest.mark.skipif(

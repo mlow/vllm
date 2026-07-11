@@ -154,9 +154,12 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
-        if (
-            self.use_draft_token_capacity
-            and getattr(model, "compute_confidence", None) is None
+        confidence_head = getattr(
+            getattr(model, "model", None), "confidence_head", None
+        )
+        if self.use_draft_token_capacity and (
+            getattr(model, "compute_confidence", None) is None
+            or confidence_head is None
         ):
             raise ValueError(
                 "DSpark draft-token capacity requires a draft model with a "
@@ -225,9 +228,11 @@ class DSparkSpeculator(DFlashSpeculator):
                     sample_hidden[:, i], markov_embed
                 )
                 if confidence_i is None:
-                    use_confidence_capacity = False
-                else:
-                    confidence_logits[:, i] = confidence_i
+                    raise RuntimeError(
+                        "DSpark draft-token capacity requires loaded "
+                        "confidence-head weights."
+                    )
+                confidence_logits[:, i] = confidence_i
             bias = self.model.markov_bias(markov_embed)
             logits_i = base_logits[:, i] + bias
             if self.draft_logits is not None:
