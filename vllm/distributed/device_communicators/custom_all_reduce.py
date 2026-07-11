@@ -495,8 +495,14 @@ class CustomAllreduce:
             self._pcie_runtime = pcie_runtime
             # Prefill-size DMA allreduce alongside the oneshot. Its fixed
             # lower bound is applied after every rank initializes cleanly.
-            dma_cls = _load_b12x_pcie_dma()
-            if dma_cls is None:
+            dma_cls = _load_b12x_pcie_dma() if envs.VLLM_USE_B12X_PCIE_DMA else None
+            if not envs.VLLM_USE_B12X_PCIE_DMA:
+                if rank == 0:
+                    logger.info(
+                        "b12x PCIe DMA allreduce is disabled; large allreduces "
+                        "stay on PyNCCL. Set VLLM_USE_B12X_PCIE_DMA=1 to opt in."
+                    )
+            elif dma_cls is None:
                 logger.warning(
                     "b12x PCIe DMA allreduce unavailable "
                     "(b12x.distributed.PCIeDmaAllReduce not importable); "

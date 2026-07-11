@@ -121,6 +121,8 @@ export VLLM_PREFIX_CACHE_RETENTION_INTERVAL=${VLLM_PREFIX_CACHE_RETENTION_INTERV
 export VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD=${VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD:-1024}
 
 allreduce_mode=${ALLREDUCE_MODE:-b12x}
+b12x_pcie_dma=$(bool_value B12X_PCIE_DMA "${B12X_PCIE_DMA:-0}")
+export VLLM_USE_B12X_PCIE_DMA=${b12x_pcie_dma}
 allreduce_args=()
 case "${allreduce_mode}" in
   b12x)
@@ -238,6 +240,20 @@ if [[ "${mode}" == "mtp2" || "${mode}" == "mtp3" ]]; then
 elif [[ "${mode}" == "dspark" ]]; then
   spec_tokens=${DSPARK_TOKENS:-5}
   require_positive_int DSPARK_TOKENS "${spec_tokens}"
+  draft_attention_backend=${DSPARK_DRAFT_ATTENTION_BACKEND:-auto}
+  draft_attention_json=
+  if [[ "${draft_attention_backend}" != "auto" ]]; then
+    case "${draft_attention_backend}" in
+      B12X_MLA_SPARSE|FLASHINFER_MLA_SPARSE_DSV4|FLASHMLA_SPARSE_DSV4) ;;
+      *)
+        echo "DSPARK_DRAFT_ATTENTION_BACKEND must be auto, B12X_MLA_SPARSE," \
+          "FLASHINFER_MLA_SPARSE_DSV4, or FLASHMLA_SPARSE_DSV4" >&2
+        exit 2
+        ;;
+    esac
+    draft_attention_json=$(printf \
+      ',"draft_attention_backend":"%s"' "${draft_attention_backend}")
+  fi
   dspark_capacity=$(bool_value DSPARK_CAPACITY "${DSPARK_CAPACITY:-0}")
   capacity_json=
   if [[ "${dspark_capacity}" == "1" ]]; then
@@ -272,9 +288,9 @@ elif [[ "${mode}" == "dspark" ]]; then
       "${DSPARK_SPS_OVERHEAD_MS:-0.0}")
   fi
   spec_json=$(printf \
-    '{"model":"%s","method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"%s","rejection_sample_method":"%s"%s}' \
+    '{"model":"%s","method":"dspark","num_speculative_tokens":%s,"draft_sample_method":"%s","rejection_sample_method":"%s"%s%s}' \
     "${spec_model}" "${spec_tokens}" "${draft_sample_method}" \
-    "${rejection_sample_method}" "${capacity_json}")
+    "${rejection_sample_method}" "${draft_attention_json}" "${capacity_json}")
   spec_args=(--speculative-config "${spec_json}")
   graph_multiplier=8
 
@@ -318,7 +334,11 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
   # The v10 profiler includes attention and FULL-graph allocations. These
   # defaults preserve the 262k serving limit used by v9 after that accounting.
   if [[ "${mode}" == "dspark" ]]; then
-    gpu_memory_utilization=0.95
+    if [[ "${backend}" == lucifer-* ]]; then
+      gpu_memory_utilization=0.9465
+    else
+      gpu_memory_utilization=0.95
+    fi
   else
     gpu_memory_utilization=0.91
   fi
@@ -412,9 +432,10 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: mode=%s backend=%s allreduce=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s model=%s\n' \
-  "${mode}" "${backend}" "${allreduce_mode}" "${indexer_backend}" \
-  "${tp_size}" "${dcp_size}" "${max_num_seqs}" "${graph_cap}" "${model}" >&2
+printf 'DS4 launch: mode=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s model=%s\n' \
+  "${mode}" "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
+  "${indexer_backend}" "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
+  "${graph_cap}" "${model}" >&2
 printf 'Command:' >&2
 printf ' %q' "${command[@]}" >&2
 printf '\n' >&2

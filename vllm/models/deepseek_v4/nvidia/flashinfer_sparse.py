@@ -527,6 +527,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
     """DeepSeek V4 sparse MLA attention through FlashInfer's SM120 kernels."""
 
     backend_cls = DeepseekV4FlashInferMLASparseBackend
+    # FlashInfer's sparse SM120 path can consume the post-GEMM buffers before
+    # the auxiliary indexer/compressor streams have made them visible.
+    enable_post_gemm_aux_streams: ClassVar[bool] = False
     use_fp8_ds_mla_layout: ClassVar[bool] = True
 
     @staticmethod

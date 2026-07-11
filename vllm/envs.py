@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
+    VLLM_USE_B12X_PCIE_DMA: bool = False
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
     VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
@@ -1716,6 +1717,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_PCIE_ALLREDUCE_BACKEND",
         "cpp",
         ["b12x", "cpp"],
+    ),
+    # Opt in to the experimental b12x DMA path for large allreduces. The
+    # stable default keeps b12x oneshot for small tensors and PyNCCL for large
+    # tensors.
+    "VLLM_USE_B12X_PCIE_DMA": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_PCIE_DMA", "0"))
     ),
     # Max input size for the b12x PCIe oneshot allreduce dispatch.
     # Accepts raw bytes or a KB/MB suffix (e.g. "84KB").

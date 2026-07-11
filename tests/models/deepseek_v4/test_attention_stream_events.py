@@ -7,10 +7,17 @@ import torch
 
 from vllm.models.deepseek_v4 import attention as attention_module
 from vllm.models.deepseek_v4.nvidia.b12x import DeepseekV4B12xMLAAttention
+from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
+    DeepseekV4FlashInferSM120Attention,
+)
 
 
 def test_b12x_disables_c4_post_gemm_aux_streams() -> None:
     assert DeepseekV4B12xMLAAttention.enable_post_gemm_aux_streams is False
+
+
+def test_flashinfer_sm120_disables_c4_post_gemm_aux_streams() -> None:
+    assert DeepseekV4FlashInferSM120Attention.enable_post_gemm_aux_streams is False
 
 
 def test_gemm_and_attention_overlap_use_distinct_event_sets(monkeypatch) -> None:
