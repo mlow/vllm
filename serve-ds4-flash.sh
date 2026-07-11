@@ -71,7 +71,7 @@ max_model_len=${MAX_MODEL_LEN:-262144}
 max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS:-8192}
 gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-}
 block_size=${BLOCK_SIZE:-256}
-load_format=${LOAD_FORMAT:-auto}
+load_format=${LOAD_FORMAT:-instanttensor}
 prefix_cache=$(bool_value PREFIX_CACHE "${PREFIX_CACHE:-1}")
 enable_flashinfer_autotune=$(bool_value ENABLE_FLASHINFER_AUTOTUNE "${ENABLE_FLASHINFER_AUTOTUNE:-1}")
 draft_sample_method=${DRAFT_SAMPLE_METHOD:-probabilistic}
@@ -110,6 +110,7 @@ export NCCL_PROTO=${NCCL_PROTO:-LL,LL128,Simple}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-16}
 export LLM_WORKER_MULTIPROC_METHOD=${LLM_WORKER_MULTIPROC_METHOD:-spawn}
 export SAFETENSORS_FAST_GPU=${SAFETENSORS_FAST_GPU:-1}
+export INSTANTTENSOR_BACKEND=${INSTANTTENSOR_BACKEND:-BUFFERED}
 
 export VLLM_USE_AOT_COMPILE=${VLLM_USE_AOT_COMPILE:-1}
 export VLLM_USE_BREAKABLE_CUDAGRAPH=${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}
@@ -432,10 +433,10 @@ if [[ -n "${EXTRA_VLLM_ARGS:-}" ]]; then
 fi
 command+=("$@")
 
-printf 'DS4 launch: mode=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s model=%s\n' \
+printf 'DS4 launch: mode=%s backend=%s allreduce=%s b12x_dma=%s indexer=%s tp=%s dcp=%s max_seqs=%s graph=%s load_format=%s instanttensor_backend=%s model=%s\n' \
   "${mode}" "${backend}" "${allreduce_mode}" "${b12x_pcie_dma}" \
   "${indexer_backend}" "${tp_size}" "${dcp_size}" "${max_num_seqs}" \
-  "${graph_cap}" "${model}" >&2
+  "${graph_cap}" "${load_format}" "${INSTANTTENSOR_BACKEND}" "${model}" >&2
 printf 'Command:' >&2
 printf ' %q' "${command[@]}" >&2
 printf '\n' >&2
