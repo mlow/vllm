@@ -1729,6 +1729,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampled_token_ids=None,  # type: ignore
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
+        copy_draft_with_output = (
+            self.num_speculative_steps > 0
+            and self.scheduler_config.async_scheduling
+            and self.draft_tokens_handler.needs_host_copy(input_batch)
+        )
         # Start async output copy here so that it can overlap with speculator proposal.
         with record_function_or_nullcontext(f"vllm:v2/target/{phase}/async_output"):
             async_output = AsyncOutput(
@@ -1737,6 +1742,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_sampled_tokens=num_sampled,
                 main_stream=self.main_stream,
                 copy_stream=self.output_copy_stream,
+                defer_copy_event=copy_draft_with_output,
             )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
@@ -1830,12 +1836,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             with record_function_or_nullcontext(
                 f"vllm:v2/target/{phase}/set_draft_tokens"
             ):
-                self.draft_tokens_handler.set_draft_tokens(
-                    input_batch,
+                next_draft_tokens = (
                     draft_tokens_for_next_step
                     if draft_tokens_for_next_step is not None
-                    else self.req_states.draft_tokens[input_batch.idx_mapping],
+                    else self.req_states.draft_tokens[input_batch.idx_mapping]
                 )
+                if copy_draft_with_output:
+                    async_output.add_draft_token_ids(
+                        input_batch.req_ids, next_draft_tokens
+                    )
+                else:
+                    self.draft_tokens_handler.set_draft_tokens(
+                        input_batch, next_draft_tokens
+                    )
 
         # Post-step KV connector related operations.
         with record_function_or_nullcontext(f"vllm:v2/target/{phase}/kv_post_forward"):

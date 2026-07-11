@@ -67,15 +67,15 @@ class DraftTokensHandler:
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
 
+    def needs_host_copy(self, input_batch: InputBatch) -> bool:
+        return self.needs_real_draft_tokens or input_batch.has_structured_output_reqs
+
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
-        if (
-            not self.needs_real_draft_tokens
-            and not input_batch.has_structured_output_reqs
-        ):
+        if not self.needs_host_copy(input_batch):
             # Fixed-width speculators use scheduler placeholders. Avoid a D2H
             # copy and per-step event synchronization on their decode path.
             self.draft_tokens_np = None

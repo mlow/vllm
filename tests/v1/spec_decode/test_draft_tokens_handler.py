@@ -33,6 +33,17 @@ def test_fixed_width_drafts_skip_host_copy() -> None:
     assert output.draft_token_ids == [[-1, -1], [-1, -1]]
 
 
+def test_host_copy_requirement() -> None:
+    fixed = _handler(needs_real_draft_tokens=False)
+    variable = _handler(needs_real_draft_tokens=True)
+    plain_batch = SimpleNamespace(has_structured_output_reqs=False)
+    structured_batch = SimpleNamespace(has_structured_output_reqs=True)
+
+    assert not fixed.needs_host_copy(plain_batch)  # type: ignore[arg-type]
+    assert fixed.needs_host_copy(structured_batch)  # type: ignore[arg-type]
+    assert variable.needs_host_copy(plain_batch)  # type: ignore[arg-type]
+
+
 def test_host_draft_ids_trim_negative_suffix() -> None:
     handler = _handler(needs_real_draft_tokens=True)
     handler.req_ids = ["req-0", "req-1"]
