@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 import torch
 
-from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.common.ops import (
     compute_dcp_global_topk_indices_and_lens,
@@ -439,30 +438,6 @@ class DeepseekV4B12xMLAAttention(DeepseekV4FlashMLAAttention):
     )
     enqueue_default_before_indexer: ClassVar[bool] = True
     enable_post_gemm_aux_streams: ClassVar[bool] = True
-
-    @staticmethod
-    def _allow_post_gemm_aux_streams(vllm_config: VllmConfig) -> bool:
-        spec_config = vllm_config.speculative_config
-        # MTP uses the causal verifier path that was stable with this overlap
-        # in v9/v15. Keep DSpark's dynamic, non-causal verifier serialized.
-        return spec_config is None or spec_config.method == "mtp"
-
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        prefix: str,
-        topk_indices_buffer: torch.Tensor | None = None,
-        aux_stream_list: list[torch.cuda.Stream] | None = None,
-    ) -> None:
-        self.enable_post_gemm_aux_streams = self._allow_post_gemm_aux_streams(
-            vllm_config
-        )
-        super().__init__(
-            vllm_config,
-            prefix,
-            topk_indices_buffer=topk_indices_buffer,
-            aux_stream_list=aux_stream_list,
-        )
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
