@@ -142,6 +142,38 @@ def _profile_cg_mode(cg_mode: CUDAGraphMode) -> str:
     return cg_mode.name.lower()
 
 
+def _uses_input_padding_mask(
+    input_batch: InputBatch,
+    has_capacity_manager: bool,
+    moe_skip_padding: bool,
+) -> bool:
+    return bool(
+        has_capacity_manager or input_batch.num_draft_tokens > 0 or moe_skip_padding
+    )
+
+
+def _finalize_input_padding_mask(
+    input_batch: InputBatch,
+    has_capacity_manager: bool,
+    moe_skip_padding: bool,
+) -> None:
+    # CUDA graph capture marks the whole persistent buffer as padding. A
+    # capacity manager rewrites the active mask itself; every other path must
+    # clear the live rows before a consumer opts into the mask. Standard
+    # non-spec decode leaves the stale buffer untouched and does not pass it to
+    # slot mapping, avoiding an extra per-step fill kernel.
+    if not _uses_input_padding_mask(
+        input_batch, has_capacity_manager, moe_skip_padding
+    ):
+        return
+    if not has_capacity_manager:
+        input_batch.is_padding[: input_batch.num_tokens].fill_(False)
+    if moe_skip_padding:
+        input_batch.is_padding[
+            input_batch.num_tokens : input_batch.num_tokens_after_padding
+        ].fill_(True)
+
+
 def _profile_batch_phase(input_batch: InputBatch, dummy_run: bool = False) -> str:
     if dummy_run:
         return "dummy"
@@ -1168,16 +1200,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             f"Batch has {num_tokens} tokens after trimming but was dispatched "
             f"for {num_tokens_after_padding}"
         )
-        if self.verification_capacity_manager is None and (
-            envs.VLLM_MOE_SKIP_PADDING or input_batch.num_draft_tokens > 0
-        ):
-            self.input_buffers.is_padding[:num_tokens].fill_(False)
-        if envs.VLLM_MOE_SKIP_PADDING:
-            # Mark trailing cudagraph-padding rows so kernels can skip work for
-            # them when supported.
-            self.input_buffers.is_padding[num_tokens:num_tokens_after_padding].fill_(
-                True
-            )
+        _finalize_input_padding_mask(
+            input_batch,
+            has_capacity_manager=self.verification_capacity_manager is not None,
+            moe_skip_padding=envs.VLLM_MOE_SKIP_PADDING,
+        )
         return input_batch
 
     def prepare_attn(
@@ -1190,12 +1217,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
+        use_padding_mask = _uses_input_padding_mask(
+            input_batch,
+            has_capacity_manager=self.verification_capacity_manager is not None,
+            moe_skip_padding=envs.VLLM_MOE_SKIP_PADDING,
+        )
         slot_mappings = self.block_tables.compute_slot_mappings(
             input_batch.idx_mapping,
             input_batch.query_start_loc,
             input_batch.positions,
             num_tokens_padded=input_batch.num_tokens_after_padding,
-            is_padding=input_batch.is_padding,
+            is_padding=input_batch.is_padding if use_padding_mask else None,
         )
         return block_tables, slot_mappings
 

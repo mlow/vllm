@@ -288,6 +288,20 @@ def _supports_varlen_paged_mqa_logits() -> bool:
     )
 
 
+def _uses_varlen_dspark_capacity(vllm_config: VllmConfig) -> bool:
+    spec_config = vllm_config.speculative_config
+    return bool(
+        spec_config is not None
+        and spec_config.use_dspark()
+        and spec_config.dspark_capacity_verification_mode == "varlen"
+        and (
+            spec_config.dspark_confidence_threshold > 0.0
+            or spec_config.dspark_budget_frac < 1.0
+            or spec_config.dspark_sps_curve is not None
+        )
+    )
+
+
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int = 1
 
@@ -297,7 +311,9 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
-        if _supports_varlen_paged_mqa_logits():
+        if _supports_varlen_paged_mqa_logits() and _uses_varlen_dspark_capacity(
+            vllm_config
+        ):
             return AttentionCGSupport.ALWAYS
         return AttentionCGSupport.UNIFORM_BATCH
 
@@ -350,7 +366,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # SM100 supports the varlen paged MQA logits kernel (indices-selected,
         # next_n == 1 rows). Only compact spec-decode verification batches opt
         # into it; uniform DFlash draft proposal should keep the native path.
-        self.use_varlen = _supports_varlen_paged_mqa_logits()
+        self.use_varlen = (
+            _supports_varlen_paged_mqa_logits()
+            and _uses_varlen_dspark_capacity(self.vllm_config)
+        )
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s use_varlen=%s "
             "(next_n=%d, use_fp4_indexer_cache=%s)",
