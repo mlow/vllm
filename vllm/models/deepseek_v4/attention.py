@@ -6,6 +6,7 @@ DeepseekV4 MLA Attention Layer
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -172,11 +173,15 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return None
         return self.aux_stream_list[index]
 
-    def _post_gemm_events(self, num_tokens: int) -> list[torch.cuda.Event]:
+    def _post_gemm_event_lease(
+        self,
+    ) -> AbstractContextManager[list[torch.cuda.Event]]:
         pool = getattr(self, "attn_event_pool", None)
-        # attention_impl is an eager break between CUDA graph segments, so
-        # capture-state detection alone cannot distinguish physical K shapes.
-        return self.attn_events if pool is None else pool.get(num_tokens)
+        # attention_impl can execute eagerly between CUDA graph segments. Its
+        # event handles must not be recycled into another graph artifact.
+        if pool is None:
+            return nullcontext(self.attn_events)
+        return pool.lease(private_eager=True)
 
     def __init__(
         self,
@@ -656,7 +661,6 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
             aux_streams = self.aux_stream_list
-            attn_events = self._post_gemm_events(hidden_states.shape[0])
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -671,29 +675,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
             # MLA compressor. Slot [2] is reserved for the indexer's inner
             # overlap. ROCm (aux_streams is None) falls back to sequential.
-            q, _ = execute_in_parallel(
-                wq_b_kv_insert,
-                [
-                    lambda: indexer(
-                        hidden_states,
-                        qr,
-                        indexer_kv_score,
-                        indexer_weights,
-                        positions,
-                        self.indexer_rotary_emb,
+            with self._post_gemm_event_lease() as attn_events:
+                q, _ = execute_in_parallel(
+                    wq_b_kv_insert,
+                    [
+                        lambda: indexer(
+                            hidden_states,
+                            qr,
+                            indexer_kv_score,
+                            indexer_weights,
+                            positions,
+                            self.indexer_rotary_emb,
+                        ),
+                        lambda: compressor(kv_score, positions, self.rotary_emb),
+                    ],
+                    attn_events[0],
+                    [attn_events[1], attn_events[2]],
+                    [aux_streams[0], aux_streams[1]]
+                    if aux_streams is not None
+                    else None,
+                    enable=(
+                        aux_streams is not None and self.enable_post_gemm_aux_streams
                     ),
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
-                ],
-                attn_events[0],
-                [attn_events[1], attn_events[2]],
-                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=(aux_streams is not None and self.enable_post_gemm_aux_streams),
-                enqueue_default_first=self.enqueue_default_before_indexer,
-            )
+                    enqueue_default_first=self.enqueue_default_before_indexer,
+                )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = self._post_gemm_aux_stream(0)
-            attn_events = self._post_gemm_events(hidden_states.shape[0])
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
@@ -701,13 +709,14 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            q, _ = maybe_execute_in_parallel(
-                wq_b_kv_insert,
-                lambda: compressor(kv_score, positions, self.rotary_emb),
-                attn_events[0],
-                attn_events[1],
-                aux_stream,
-            )
+            with self._post_gemm_event_lease() as attn_events:
+                q, _ = maybe_execute_in_parallel(
+                    wq_b_kv_insert,
+                    lambda: compressor(kv_score, positions, self.rotary_emb),
+                    attn_events[0],
+                    attn_events[1],
+                    aux_stream,
+                )
         else:
             # SWA-only layer: no compressor, no overlap.
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
@@ -1117,12 +1126,12 @@ class DeepseekV4Indexer(nn.Module):
 
         # compressor returns None and writes K to the indexer KV cache; the
         # join orders that write before indexer_op (skip_k_cache_insert=True).
-        events = self.event_pool.get(hidden_states.shape[0])
-        (q_quant, weights), k = maybe_execute_in_parallel(
-            wq_b_and_q_quant,
-            lambda: compressor(compressed_kv_score, positions, rotary_emb),
-            events[0],
-            events[1],
-            self.aux_stream,
-        )
+        with self.event_pool.lease(private_eager=True) as events:
+            (q_quant, weights), k = maybe_execute_in_parallel(
+                wq_b_and_q_quant,
+                lambda: compressor(compressed_kv_score, positions, rotary_emb),
+                events[0],
+                events[1],
+                self.aux_stream,
+            )
         return self.indexer_op(hidden_states, q_quant, k, weights)

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -72,7 +73,7 @@ def test_gemm_and_attention_overlap_use_distinct_event_sets(monkeypatch) -> None
         fused_wqa_wkv=object(),
         ln_events=ln_events,
         attn_events=attn_events,
-        _post_gemm_events=lambda _num_tokens: attn_events,
+        _post_gemm_event_lease=lambda: nullcontext(attn_events),
         enqueue_default_before_indexer=True,
         enable_post_gemm_aux_streams=True,
         indexer_rotary_emb=object(),
@@ -132,8 +133,10 @@ def test_attention_overlap_uses_capture_private_events(monkeypatch) -> None:
         compressor=object(),
         indexer=object(),
         attn_events=[object() for _ in range(3)],
-        attn_event_pool=SimpleNamespace(get=lambda _key=None: captured_events),
-        _post_gemm_events=lambda _num_tokens: captured_events,
+        attn_event_pool=SimpleNamespace(
+            lease=lambda **_kwargs: nullcontext(captured_events)
+        ),
+        _post_gemm_event_lease=lambda: nullcontext(captured_events),
         enqueue_default_before_indexer=True,
         enable_post_gemm_aux_streams=True,
         indexer_rotary_emb=object(),

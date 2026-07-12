@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from enum import Enum
 from typing import Any
 
@@ -18,40 +19,49 @@ class EventType(Enum):
 
 
 class CUDAGraphCaptureEventPool:
-    """Keep CUDA event generations private to each graph execution shape.
+    """Keep CUDA event generations private to each graph or eager call.
 
     Reusing one event handle across independently captured graphs is unsafe
     when those graphs can be replayed at different shapes. A replay may record
     a new generation while another graph still has waits bound to the same
     handle. Some custom ops also execute eagerly between CUDA graph segments,
     where capture-state detection is false even though adjacent graph shapes
-    can still overlap event generations. Such callers provide ``eager_key``
-    (normally the physical token count) and reuse one event set per shape.
+    can still overlap event generations.
+
     Every real capture gets a retained private set embedded only in that graph.
+    Eager graph-break callers request a fresh set for every Python invocation;
+    the wrappers stay alive through enqueue and are then released. CUDA event
+    destruction is asynchronous for pending work, which is also the lifetime
+    pattern used by :meth:`torch.cuda.Stream.wait_stream`. Event handles are
+    never recycled into another graph artifact.
     """
 
     def __init__(self, num_events: int) -> None:
         if num_events < 1:
             raise ValueError("num_events must be at least one")
+        self.num_events = num_events
         self.default_events = [torch.cuda.Event() for _ in range(num_events)]
-        self._eager_event_sets: dict[Hashable, list[torch.cuda.Event]] = {}
         self._captured_event_sets: list[list[torch.cuda.Event]] = []
 
-    def get(self, eager_key: Hashable | None = None) -> list[torch.cuda.Event]:
-        if not torch.cuda.is_current_stream_capturing():
-            if eager_key is None:
-                return self.default_events
-            events = self._eager_event_sets.get(eager_key)
-            if events is None:
-                events = [torch.cuda.Event() for _ in self.default_events]
-                self._eager_event_sets[eager_key] = events
-            return events
+    @contextmanager
+    def lease(self, *, private_eager: bool = False) -> Iterator[list[torch.cuda.Event]]:
+        if torch.cuda.is_current_stream_capturing():
+            events = [torch.cuda.Event() for _ in range(self.num_events)]
+            # CUDA graphs retain the event handles, and this list keeps the
+            # wrappers alive for the same lifetime as the owning module.
+            self._captured_event_sets.append(events)
+            yield events
+            return
 
-        events = [torch.cuda.Event() for _ in self.default_events]
-        # CUDA graphs retain the event handles, and this list keeps the Python
-        # wrappers alive for the same lifetime as the owning module.
-        self._captured_event_sets.append(events)
-        return events
+        if not private_eager:
+            yield self.default_events
+            return
+
+        # Keep these wrappers alive until the caller has enqueued every record
+        # and wait. cudaEventDestroy then defers resource release until pending
+        # device work completes, so no Python-side retention is required.
+        events = [torch.cuda.Event() for _ in range(self.num_events)]
+        yield events
 
 
 def maybe_execute_in_parallel(

@@ -37,19 +37,24 @@ def test_cudagraph_capture_event_pool_isolates_capture_generations(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
 
     pool = CUDAGraphCaptureEventPool(2)
-    assert pool.get() is pool.default_events
-    eager_a = pool.get(6)
-    assert pool.get(6) is eager_a
-    eager_b = pool.get(384)
-    assert eager_a is not eager_b
-    assert set(map(id, eager_a)).isdisjoint(map(id, eager_b))
+    with pool.lease() as default_events:
+        assert default_events is pool.default_events
+
+    with pool.lease(private_eager=True) as eager_a:
+        pass
+    with pool.lease(private_eager=True) as eager_b:
+        assert eager_a is not eager_b
+        assert set(map(id, eager_a)).isdisjoint(map(id, eager_b))
+    assert not pool._captured_event_sets
 
     capturing = True
-    capture_a = pool.get()
-    capture_b = pool.get()
-    assert capture_a is not capture_b
-    assert set(map(id, capture_a)).isdisjoint(map(id, capture_b))
-    assert set(map(id, pool.default_events)).isdisjoint(map(id, capture_a))
+    with pool.lease() as capture_a:
+        pass
+    with pool.lease() as capture_b:
+        assert capture_a is not capture_b
+        assert set(map(id, capture_a)).isdisjoint(map(id, capture_b))
+        assert set(map(id, pool.default_events)).isdisjoint(map(id, capture_a))
+    assert len(pool._captured_event_sets) == 2
     assert len(created) == 10
 
 
