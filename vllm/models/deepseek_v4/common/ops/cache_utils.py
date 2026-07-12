@@ -511,6 +511,7 @@ def _compute_global_topk_indices_and_lens_kernel(
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    safe_req_idx = tl.where(is_valid_token, req_idx, 0)
 
     count = tl.zeros((), dtype=tl.int32)
     for i in range(0, topk, TRITON_BLOCK_SIZE):
@@ -526,7 +527,7 @@ def _compute_global_topk_indices_and_lens_kernel(
 
         block_indices = local_idx // block_size
         block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
+            block_table_ptr + safe_req_idx * block_table_stride + block_indices,
             mask=mask & is_valid,
         )
         block_offsets = local_idx % block_size
@@ -565,6 +566,7 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
     token_idx = tl.program_id(0)
     is_valid_token = tl.load(is_valid_token_ptr + token_idx)
     req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+    safe_req_idx = tl.where(is_valid_token, req_idx, 0)
 
     count = tl.zeros((), dtype=tl.int32)
     virtual_block_size = block_size * DCP_WORLD_SIZE
@@ -581,7 +583,7 @@ def _compute_dcp_global_topk_indices_and_lens_kernel(
 
         block_indices = local_idx // virtual_block_size
         block_numbers = tl.load(
-            block_table_ptr + req_idx * block_table_stride + block_indices,
+            block_table_ptr + safe_req_idx * block_table_stride + block_indices,
             mask=offset_mask & valid_local,
         ).to(tl.int64)
 
