@@ -32,10 +32,8 @@ def _convert_dcp_local_topk_to_global_kernel(
     interleave_block = local_idx // CP_KV_CACHE_INTERLEAVE_SIZE
     interleave_offset = local_idx % CP_KV_CACHE_INTERLEAVE_SIZE
     global_idx = (
-        (interleave_block * DCP_WORLD_SIZE + DCP_RANK)
-        * CP_KV_CACHE_INTERLEAVE_SIZE
-        + interleave_offset
-    )
+        interleave_block * DCP_WORLD_SIZE + DCP_RANK
+    ) * CP_KV_CACHE_INTERLEAVE_SIZE + interleave_offset
     tl.store(idx_ptrs, tl.where(valid, global_idx, -1), mask=mask)
 
     score_ptrs = scores_ptr + row * scores_stride0 + offs * scores_stride1
