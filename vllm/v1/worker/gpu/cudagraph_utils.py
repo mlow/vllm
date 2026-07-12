@@ -34,6 +34,7 @@ from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
+from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -458,7 +459,11 @@ class CudaGraphManager:
                 capture.
         """
         attn_states: dict[BatchExecutionDescriptor, AttentionStatePair] = {}
-        with graph_capture(device=self.device):
+        # Keep event handles created by descriptor warmups alive together with
+        # the graph artifacts captured below. Some multi-stream custom ops run
+        # on joined auxiliary streams where CUDA's per-current-stream capture
+        # query is false even though later graph nodes retain those handles.
+        with graph_capture(device=self.device), vllm_cudagraph_capture_scope():
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.
@@ -510,6 +515,7 @@ class CudaGraphManager:
                             guard_b12x_kernel_resolution(
                                 "vLLM full CUDA graph capture after B12X warmup"
                             ),
+                            vllm_cudagraph_capture_scope(),
                             torch.cuda.graph(graph, self.pool),
                         ):
                             forward_fn(CUDAGraphMode.NONE)

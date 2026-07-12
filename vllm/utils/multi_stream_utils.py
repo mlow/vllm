@@ -3,10 +3,34 @@
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from enum import Enum
 from typing import Any
 
 import torch
+
+_vllm_cudagraph_capture_depth: ContextVar[int] = ContextVar(
+    "vllm_cudagraph_capture_depth", default=0
+)
+
+
+@contextmanager
+def vllm_cudagraph_capture_scope() -> Iterator[None]:
+    """Mark Python execution as belonging to a vLLM CUDA graph capture.
+
+    CUDA reports capture status per current stream. Python custom ops can run
+    on auxiliary streams joined to a multi-stream graph, where querying only
+    the current stream is insufficient to establish event-handle lifetime.
+    """
+    token = _vllm_cudagraph_capture_depth.set(_vllm_cudagraph_capture_depth.get() + 1)
+    try:
+        yield
+    finally:
+        _vllm_cudagraph_capture_depth.reset(token)
+
+
+def is_vllm_cudagraph_capture_active() -> bool:
+    return _vllm_cudagraph_capture_depth.get() > 0
 
 
 class AuxStreamType(Enum):
@@ -45,7 +69,10 @@ class CUDAGraphCaptureEventPool:
 
     @contextmanager
     def lease(self, *, private_eager: bool = False) -> Iterator[list[torch.cuda.Event]]:
-        if torch.cuda.is_current_stream_capturing():
+        if (
+            is_vllm_cudagraph_capture_active()
+            or torch.cuda.is_current_stream_capturing()
+        ):
             events = [torch.cuda.Event() for _ in range(self.num_events)]
             # CUDA graphs retain the event handles, and this list keeps the
             # wrappers alive for the same lifetime as the owning module.

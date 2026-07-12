@@ -28,6 +28,7 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
+from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -328,12 +329,16 @@ class CUDAGraphWrapper:
                     get_offloader().sync_prev_onload()
 
                 # mind-exploding: carefully manage the reference and memory.
-                with guard_b12x_kernel_resolution(
-                    "vLLM CUDAGraphWrapper capture after B12X eager warmup"
-                ), torch.cuda.graph(
-                    cudagraph,
-                    pool=self.graph_pool,
-                    stream=current_stream(),
+                with (
+                    guard_b12x_kernel_resolution(
+                        "vLLM CUDAGraphWrapper capture after B12X eager warmup"
+                    ),
+                    vllm_cudagraph_capture_scope(),
+                    torch.cuda.graph(
+                        cudagraph,
+                        pool=self.graph_pool,
+                        stream=current_stream(),
+                    ),
                 ):
                     # `output` is managed by pytorch's cudagraph pool
                     output = self.runnable(*args, **kwargs)

@@ -9,6 +9,8 @@ import torch
 from vllm.utils.multi_stream_utils import (
     CUDAGraphCaptureEventPool,
     execute_in_parallel,
+    is_vllm_cudagraph_capture_active,
+    vllm_cudagraph_capture_scope,
 )
 
 
@@ -22,6 +24,16 @@ class _FakeEvent:
 
     def wait(self) -> None:
         self.calls.append(f"{self.name}.wait")
+
+
+def test_vllm_cudagraph_capture_scope_is_nested_and_exception_safe() -> None:
+    assert not is_vllm_cudagraph_capture_active()
+    with pytest.raises(RuntimeError), vllm_cudagraph_capture_scope():
+        assert is_vllm_cudagraph_capture_active()
+        with vllm_cudagraph_capture_scope():
+            assert is_vllm_cudagraph_capture_active()
+        raise RuntimeError("capture failed")
+    assert not is_vllm_cudagraph_capture_active()
 
 
 def test_cudagraph_capture_event_pool_isolates_capture_generations(monkeypatch):
@@ -47,6 +59,13 @@ def test_cudagraph_capture_event_pool_isolates_capture_generations(monkeypatch):
         assert set(map(id, eager_a)).isdisjoint(map(id, eager_b))
     assert not pool._captured_event_sets
 
+    with (
+        vllm_cudagraph_capture_scope(),
+        pool.lease(private_eager=True) as scoped_capture,
+    ):
+        assert set(map(id, eager_a)).isdisjoint(map(id, scoped_capture))
+    assert pool._captured_event_sets == [scoped_capture]
+
     capturing = True
     with pool.lease() as capture_a:
         pass
@@ -54,8 +73,8 @@ def test_cudagraph_capture_event_pool_isolates_capture_generations(monkeypatch):
         assert capture_a is not capture_b
         assert set(map(id, capture_a)).isdisjoint(map(id, capture_b))
         assert set(map(id, pool.default_events)).isdisjoint(map(id, capture_a))
-    assert len(pool._captured_event_sets) == 2
-    assert len(created) == 10
+    assert len(pool._captured_event_sets) == 3
+    assert len(created) == 12
 
 
 @pytest.mark.parametrize("enqueue_default_first", [False, True])
