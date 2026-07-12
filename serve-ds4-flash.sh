@@ -354,6 +354,11 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
     else
       gpu_memory_utilization=0.95
     fi
+  elif [[ "${backend}" == lucifer-* \
+    && ( "${mode}" == "mtp2" || "${mode}" == "mtp3" ) ]]; then
+    # Lucifer MTP FULL graphs leave about 7.48 GiB at 0.91, just below the
+    # 7.55 GiB needed to preserve the documented 262k serving limit.
+    gpu_memory_utilization=0.912
   else
     gpu_memory_utilization=0.91
   fi
