@@ -241,6 +241,11 @@ if [[ "${mode}" == "mtp2" || "${mode}" == "mtp3" ]]; then
 elif [[ "${mode}" == "dspark" ]]; then
   spec_tokens=${DSPARK_TOKENS:-5}
   require_positive_int DSPARK_TOKENS "${spec_tokens}"
+  # Target verification schedules at most one sampled token plus K drafts per
+  # request. Capturing beyond that physical row count only consumes graph
+  # memory (and can OOM at high concurrency) because those shapes are
+  # unreachable for DSpark.
+  graph_multiplier=$((spec_tokens + 1))
   draft_attention_backend=${DSPARK_DRAFT_ATTENTION_BACKEND:-auto}
   draft_attention_json=
   if [[ "${draft_attention_backend}" != "auto" ]]; then
@@ -293,8 +298,6 @@ elif [[ "${mode}" == "dspark" ]]; then
     "${spec_model}" "${spec_tokens}" "${draft_sample_method}" \
     "${rejection_sample_method}" "${draft_attention_json}" "${capacity_json}")
   spec_args=(--speculative-config "${spec_json}")
-  graph_multiplier=8
-
   export VLLM_DSPARK_FP8_DRAFT_HEAD=$(bool_value DSPARK_FP8_DRAFT_HEAD "${DSPARK_FP8_DRAFT_HEAD:-0}")
   export VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH=$(bool_value DSPARK_DYNAMIC_DRAFT_DEPTH "${DSPARK_DYNAMIC_DRAFT_DEPTH:-0}")
   export VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW=${DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW:-8}
@@ -305,8 +308,8 @@ elif [[ "${mode}" == "dspark" ]]; then
   export VLLM_DSPARK_TP_CHECK=${DSPARK_TP_CHECK:-0}
 fi
 
-# v9 used graph 256 for MTP-off and 512 for speculative modes at cc64. Keep
-# that contract by deriving a 4x/8x cap from MAX_NUM_SEQS.
+# v9 used graph 256 for MTP-off and 512 for MTP modes at cc64. Keep that MTP
+# contract; DSpark uses its exact (K + 1) physical verifier width.
 graph_cap=${MAX_CUDAGRAPH_CAPTURE_SIZE:-${GRAPH:-}}
 if [[ -z "${graph_cap}" || "${graph_cap}" == "auto" ]]; then
   graph_cap=$((max_num_seqs * graph_multiplier))
