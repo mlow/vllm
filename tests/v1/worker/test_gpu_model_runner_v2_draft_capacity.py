@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.spec_decode.capacity import (
+    CapacityBasedVerificationManager,
     DSparkDynamicDraftDepthController,
     MaskedCapacityBasedVerificationManager,
     VarlenCapacityBasedVerificationManager,
@@ -408,6 +409,37 @@ def test_capacity_based_verification_manager_updates_cpu_capacities():
     handler.draft_token_capacity_np.fill(3)
     handler.trim_batch(input_batch)
     assert handler.draft_token_capacity_np.tolist() == [2, 3, 3, 3]
+
+
+def test_capacity_update_canonicalizes_across_tp_before_staging(monkeypatch):
+    events: list[object] = []
+    manager: Any = SimpleNamespace(
+        capacity_bypassed=False,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        _flush_draft_token_capacity_copy=lambda: events.append("flush"),
+        _stage_draft_token_capacity_copy=lambda tensor: events.append(
+            ("stage", tensor.tolist())
+        ),
+    )
+
+    class FakeTPGroup:
+        world_size = 2
+
+        @staticmethod
+        def broadcast(tensor: torch.Tensor, src: int = 0) -> None:
+            events.append(("broadcast", src))
+            tensor.copy_(torch.tensor([3, 1], dtype=tensor.dtype))
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tp_group", lambda: FakeTPGroup()
+    )
+
+    CapacityBasedVerificationManager.update_capacities(
+        manager, torch.tensor([1, 2], dtype=torch.int32)
+    )
+
+    assert events == ["flush", ("broadcast", 0), ("stage", [3, 1])]
 
 
 def test_capacity_manager_bypasses_readback_below_profiled_knee():

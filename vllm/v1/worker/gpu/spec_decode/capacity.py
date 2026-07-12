@@ -308,6 +308,16 @@ class CapacityBasedVerificationManager:
         if self.capacity_bypassed:
             return
         self._flush_draft_token_capacity_copy()
+        if torch.distributed.is_initialized():
+            from vllm.distributed.parallel_state import get_tp_group
+
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                # Varlen dispatch must select the same physical graph on every
+                # TP rank. Canonicalize the tiny capacity vector before its
+                # asynchronous host readback so rank-local confidence jitter
+                # cannot turn into a collective shape mismatch.
+                tp_group.broadcast(draft_token_capacity, src=0)
         assert self.idx_mapping_np is not None
         self._stage_draft_token_capacity_copy(draft_token_capacity)
 
