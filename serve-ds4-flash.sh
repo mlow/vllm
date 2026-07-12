@@ -355,6 +355,12 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
       # DSpark KV requirement. 0.953 profiles 8.03 GiB (266609 tokens) and
       # leaves enough transient headroom for a sustained 128k prefill.
       gpu_memory_utilization=0.953
+    elif [[ "${backend}" == "lucifer-cutlass" ]]; then
+      # FlashInfer CUTLASS allocates a transient MoE workspace on the first
+      # real prefill. At TP4, 0.9465 left only 777 MiB free for a 764 MiB
+      # workspace and could OOM after an otherwise successful warmup. The KV
+      # cache remains well above the 262k serving limit at 0.94.
+      gpu_memory_utilization=0.94
     elif [[ "${backend}" == lucifer-* ]]; then
       gpu_memory_utilization=0.9465
     else
