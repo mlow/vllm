@@ -27,6 +27,14 @@ require_positive_int() {
   fi
 }
 
+require_nonnegative_int() {
+  local name=$1 value=$2
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${name} must be a non-negative integer; got '${value}'" >&2
+    exit 2
+  fi
+}
+
 mode=${MODE:-${SPEC_MODE:-dspark}}
 case "${mode}" in
   off|mtp0|standard-mtp0) mode=mtp0 ;;
@@ -303,6 +311,9 @@ elif [[ "${mode}" == "dspark" ]]; then
   export VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW=${DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW:-8}
   require_positive_int DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW \
     "${VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW}"
+  export VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE=${DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE:-0}
+  require_nonnegative_int DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE \
+    "${VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE}"
   export VLLM_DSPARK_CAPACITY_LOG_INTERVAL=${DSPARK_CAPACITY_LOG_INTERVAL:-0}
   export VLLM_DSPARK_STS_LOG_INTERVAL=${DSPARK_STS_LOG_INTERVAL:-0}
   export VLLM_DSPARK_TP_CHECK=${DSPARK_TP_CHECK:-0}
