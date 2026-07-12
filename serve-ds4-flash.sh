@@ -349,7 +349,12 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
   # The v10 profiler includes attention and FULL-graph allocations. These
   # defaults preserve the 262k serving limit used by v9 after that accounting.
   if [[ "${mode}" == "dspark" ]]; then
-    if [[ "${backend}" == lucifer-* ]]; then
+    if [[ "${backend}" == "lucifer-default" ]]; then
+      # The default DeepGEMM MoE path retains more model/runtime memory than
+      # FlashInfer CUTLASS. At 0.9465 only 7.35 GiB remained for the 7.89 GiB
+      # DSpark KV requirement; 0.954 profiles 8.12 GiB (269741 tokens).
+      gpu_memory_utilization=0.954
+    elif [[ "${backend}" == lucifer-* ]]; then
       gpu_memory_utilization=0.9465
     else
       gpu_memory_utilization=0.95
