@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from enum import Enum
 from typing import Any
 
@@ -18,24 +18,35 @@ class EventType(Enum):
 
 
 class CUDAGraphCaptureEventPool:
-    """Keep CUDA event generations private to each captured graph.
+    """Keep CUDA event generations private to each graph execution shape.
 
     Reusing one event handle across independently captured graphs is unsafe
     when those graphs can be replayed at different shapes. A replay may record
     a new generation while another graph still has waits bound to the same
-    handle. Eager execution can reuse one stable event set, while every capture
-    gets a retained private set that is embedded only in that graph.
+    handle. Some custom ops also execute eagerly between CUDA graph segments,
+    where capture-state detection is false even though adjacent graph shapes
+    can still overlap event generations. Such callers provide ``eager_key``
+    (normally the physical token count) and reuse one event set per shape.
+    Every real capture gets a retained private set embedded only in that graph.
     """
 
     def __init__(self, num_events: int) -> None:
         if num_events < 1:
             raise ValueError("num_events must be at least one")
         self.default_events = [torch.cuda.Event() for _ in range(num_events)]
+        self._eager_event_sets: dict[Hashable, list[torch.cuda.Event]] = {}
         self._captured_event_sets: list[list[torch.cuda.Event]] = []
 
-    def get(self) -> list[torch.cuda.Event]:
+    def get(self, eager_key: Hashable | None = None) -> list[torch.cuda.Event]:
         if not torch.cuda.is_current_stream_capturing():
-            return self.default_events
+            if eager_key is None:
+                return self.default_events
+            events = self._eager_event_sets.get(eager_key)
+            if events is None:
+                events = [torch.cuda.Event() for _ in self.default_events]
+                self._eager_event_sets[eager_key] = events
+            return events
+
         events = [torch.cuda.Event() for _ in self.default_events]
         # CUDA graphs retain the event handles, and this list keeps the Python
         # wrappers alive for the same lifetime as the owning module.

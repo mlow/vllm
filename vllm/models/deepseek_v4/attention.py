@@ -172,9 +172,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             return None
         return self.aux_stream_list[index]
 
-    def _post_gemm_events(self) -> list[torch.cuda.Event]:
+    def _post_gemm_events(self, num_tokens: int) -> list[torch.cuda.Event]:
         pool = getattr(self, "attn_event_pool", None)
-        return self.attn_events if pool is None else pool.get()
+        # attention_impl is an eager break between CUDA graph segments, so
+        # capture-state detection alone cannot distinguish physical K shapes.
+        return self.attn_events if pool is None else pool.get(num_tokens)
 
     def __init__(
         self,
@@ -654,7 +656,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
             aux_streams = self.aux_stream_list
-            attn_events = self._post_gemm_events()
+            attn_events = self._post_gemm_events(hidden_states.shape[0])
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -691,7 +693,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = self._post_gemm_aux_stream(0)
-            attn_events = self._post_gemm_events()
+            attn_events = self._post_gemm_events(hidden_states.shape[0])
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
@@ -1115,7 +1117,7 @@ class DeepseekV4Indexer(nn.Module):
 
         # compressor returns None and writes K to the indexer KV cache; the
         # join orders that write before indexer_op (skip_k_cache_insert=True).
-        events = self.event_pool.get()
+        events = self.event_pool.get(hidden_states.shape[0])
         (q_quant, weights), k = maybe_execute_in_parallel(
             wq_b_and_q_quant,
             lambda: compressor(compressed_kv_score, positions, rotary_emb),

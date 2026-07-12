@@ -38,6 +38,11 @@ def test_cudagraph_capture_event_pool_isolates_capture_generations(monkeypatch):
 
     pool = CUDAGraphCaptureEventPool(2)
     assert pool.get() is pool.default_events
+    eager_a = pool.get(6)
+    assert pool.get(6) is eager_a
+    eager_b = pool.get(384)
+    assert eager_a is not eager_b
+    assert set(map(id, eager_a)).isdisjoint(map(id, eager_b))
 
     capturing = True
     capture_a = pool.get()
@@ -45,7 +50,7 @@ def test_cudagraph_capture_event_pool_isolates_capture_generations(monkeypatch):
     assert capture_a is not capture_b
     assert set(map(id, capture_a)).isdisjoint(map(id, capture_b))
     assert set(map(id, pool.default_events)).isdisjoint(map(id, capture_a))
-    assert len(created) == 6
+    assert len(created) == 10
 
 
 @pytest.mark.parametrize("enqueue_default_first", [False, True])
