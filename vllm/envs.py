@@ -173,6 +173,7 @@ if TYPE_CHECKING:
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW: int = 8
+    VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE: int = 0
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1451,6 +1452,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW": lambda: int(
         os.getenv("VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW", "8")
+    ),
+    # Capture low-load DSpark draft graphs without confidence/capacity kernels.
+    # 0 keeps capacity active at every batch size; a positive value must match
+    # the profiled saturation knee used by the verification manager.
+    "VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE": lambda: int(
+        os.getenv("VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE", "0")
     ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,

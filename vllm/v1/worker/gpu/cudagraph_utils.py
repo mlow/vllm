@@ -152,6 +152,9 @@ class CudaGraphManager:
         self._graphs_captured = False
 
         self._candidates: dict[tuple[int, int], list[BatchExecutionDescriptor]] = {}
+        self._exact_uniform_candidates: dict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = {}
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
 
         self._init_candidates()
@@ -208,6 +211,9 @@ class CudaGraphManager:
         descs_by_mode: defaultdict[CUDAGraphMode, list[BatchExecutionDescriptor]] = (
             defaultdict(list)
         )
+        exact_uniform_descs: defaultdict[
+            tuple[int, int], list[BatchExecutionDescriptor]
+        ] = defaultdict(list)
 
         # When using Dynamic SD, num_speculative_tokens is the max number of
         # draft tokens. The scheduler might use a smaller number so we need
@@ -352,6 +358,41 @@ class CudaGraphManager:
                 descs_by_mode[mixed_mode].append(desc)
                 descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
 
+        # Capacity-based DSpark uses generic varlen target graphs once the
+        # batch is large enough to benefit from compaction. Below that knee,
+        # the capacity manager deliberately bypasses compaction and verifies
+        # the full draft width. Capture exact uniform graphs for that range so
+        # the bypass does not replay a more expensive varlen graph. Keep them
+        # out of the generic token buckets: adding their intermediate token
+        # counts there would split varlen padding ranges and force eager runs.
+        # Dispatch checks this exact-match map before the generic candidates.
+        capacity_activation_batch_size = envs.VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE
+        if (
+            separate_decode_routine
+            and decode_mode
+            and self.varlen_spec_decode
+            and capacity_activation_batch_size > 1
+        ):
+            max_uniform_reqs = min(
+                self.max_num_reqs,
+                capacity_activation_batch_size - 1,
+            )
+            for num_reqs in range(1, max_uniform_reqs + 1):
+                num_tokens = self.decode_query_len * num_reqs
+                if num_tokens > max_decode_tokens or num_tokens > max_cg_capture_size:
+                    continue
+                for num_active_loras in self.lora_capture_cases:
+                    desc = BatchExecutionDescriptor(
+                        cg_mode=decode_mode,
+                        num_tokens=num_tokens,
+                        num_reqs=num_reqs,
+                        uniform_token_count=self.decode_query_len,
+                        num_active_loras=num_active_loras,
+                    )
+                    if desc not in descs_by_mode[decode_mode]:
+                        descs_by_mode[decode_mode].append(desc)
+                        exact_uniform_descs[(num_tokens, num_active_loras)].append(desc)
+
         # Guarantee the small-request grid for every selectable decode query
         # length, independent of the configured capture-size list: a missing
         # (depth, num_reqs) point would otherwise pad requests or fall off
@@ -377,6 +418,8 @@ class CudaGraphManager:
 
         if not descs_by_token_lora:
             return
+
+        self._exact_uniform_candidates = dict(exact_uniform_descs)
 
         all_token_counts = sorted({k[0] for k in descs_by_token_lora})
         current_range_start = 0
@@ -492,8 +535,19 @@ class CudaGraphManager:
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
         key = (num_tokens, effective_loras)
-        if self._graphs_captured and num_tokens > 0 and key in self._candidates:
-            for desc in self._candidates[key]:
+        if self._graphs_captured and num_tokens > 0:
+            if uniform_token_count is not None:
+                for desc in getattr(self, "_exact_uniform_candidates", {}).get(key, ()):
+                    if _is_compatible(
+                        desc,
+                        num_reqs,
+                        num_tokens,
+                        uniform_token_count,
+                        effective_loras,
+                        max_req_tokens,
+                    ):
+                        return desc
+            for desc in self._candidates.get(key, ()):
                 if _is_compatible(
                     desc,
                     num_reqs,

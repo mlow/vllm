@@ -302,6 +302,20 @@ def _uses_varlen_dspark_capacity(vllm_config: VllmConfig) -> bool:
     )
 
 
+def _needs_varlen_decode(
+    use_varlen_decode: bool,
+    all_uniform_width: bool,
+    max_decode_len: int,
+    max_query_len: int,
+) -> bool:
+    """Use the compact scorer only when verification is actually ragged."""
+    return (
+        use_varlen_decode
+        and not all_uniform_width
+        and (max_decode_len > 1 or max_query_len > 1)
+    )
+
+
 class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int = 1
 
@@ -570,7 +584,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.decode_seq_lens_buffer[:actual_expanded] = (
                     expanded_offsets + self.arange_buffer[:actual_expanded] + 1
                 )
-                self.decode_seq_lens_buffer[actual_expanded:] = 0
+                # FULL graphs may pad the compact varlen token batch past the
+                # final real row. B12X paged scoring cannot launch a zero-K
+                # row, so point graph-only rows at one safe compressed token;
+                # their slot mappings stay padded and their outputs are ignored.
+                padding_seq_len = (
+                    self.compress_ratio
+                    if force_flatten and envs.VLLM_USE_B12X_SPARSE_INDEXER
+                    else 0
+                )
+                self.decode_seq_lens_buffer[actual_expanded:num_decode_tokens] = (
+                    padding_seq_len
+                )
+                self.decode_seq_lens_buffer[num_decode_tokens:] = 0
                 seq_lens = self.decode_seq_lens_buffer[:num_decode_tokens]
 
                 # Give each of the flattened entries the same block table row as the
@@ -921,8 +947,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             max_decode_len = int(decode_lens_cpu.max().item())
             next_n = 1 + self.num_speculative_tokens
-            use_varlen = use_varlen_decode and (
-                max_decode_len > 1 or common_attn_metadata.max_query_len > 1
+            use_varlen = _needs_varlen_decode(
+                use_varlen_decode=use_varlen_decode,
+                all_uniform_width=bool(
+                    (decode_lens_cpu == max_decode_len).all().item()
+                ),
+                max_decode_len=max_decode_len,
+                max_query_len=common_attn_metadata.max_query_len,
             )
             use_native = (
                 not (self.use_flattening or use_varlen) and max_decode_len <= next_n

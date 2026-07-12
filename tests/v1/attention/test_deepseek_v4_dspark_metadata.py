@@ -5,7 +5,10 @@ from types import SimpleNamespace
 
 import torch
 
-from vllm.v1.attention.backends.mla.indexer import _uses_varlen_dspark_capacity
+from vllm.v1.attention.backends.mla.indexer import (
+    _needs_varlen_decode,
+    _uses_varlen_dspark_capacity,
+)
 from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadataBuilder,
 )
@@ -35,6 +38,13 @@ def test_varlen_indexer_is_limited_to_active_dspark_capacity() -> None:
     assert _uses_varlen_dspark_capacity(config(dspark_confidence_threshold=0.5))
     assert _uses_varlen_dspark_capacity(config(dspark_budget_frac=0.5))
     assert _uses_varlen_dspark_capacity(config(dspark_sps_curve="auto"))
+
+
+def test_varlen_indexer_skips_uniform_full_width_batches() -> None:
+    assert not _needs_varlen_decode(True, True, 6, 6)
+    assert _needs_varlen_decode(True, False, 4, 4)
+    assert _needs_varlen_decode(True, False, 6, 6)
+    assert not _needs_varlen_decode(False, False, 6, 6)
 
 
 def test_dspark_swa_decode_threshold_matches_target_verification() -> None:

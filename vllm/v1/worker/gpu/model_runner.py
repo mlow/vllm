@@ -1292,6 +1292,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             online_sts is not None
             and num_sampled is not None
             and self.verification_capacity_manager is not None
+            and not self.verification_capacity_manager.capacity_bypassed
             and input_batch.num_draft_tokens_per_req is not None
         ):
             num_bonus = self.model_state.num_new_sampled_tokens_per_step
@@ -1383,11 +1384,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        apply_verification_capacity = True
+        if (
+            verification_capacity_manager is not None
+            and verification_capacity_manager.varlen_spec_decode
+            and not dummy_run
+        ):
+            apply_verification_capacity = (
+                verification_capacity_manager.should_apply_capacity(
+                    num_reqs,
+                    scheduler_output.has_structured_output_requests,
+                )
+            )
         use_varlen_capacity = (
             verification_capacity_manager is not None
             and verification_capacity_manager.varlen_spec_decode
             and bool(scheduler_output.scheduled_spec_decode_tokens)
             and not dummy_run
+            and apply_verification_capacity
         )
         if use_varlen_capacity:
             assert verification_capacity_manager is not None
@@ -1823,7 +1837,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # persistent fixed-width buffer untouched, but report an
                     # empty draft list to the scheduler for the next iteration.
                     draft_tokens_for_next_step = draft_tokens
-            if self.verification_capacity_manager is not None:
+            if (
+                self.verification_capacity_manager is not None
+                and not self.verification_capacity_manager.capacity_bypassed
+            ):
                 draft_token_capacity = self.speculator.compute_capacities(input_batch)
                 assert draft_token_capacity is not None
                 self.verification_capacity_manager.update_capacities(

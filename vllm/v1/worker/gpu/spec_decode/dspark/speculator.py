@@ -27,6 +27,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.triton_utils import triton
@@ -92,6 +93,14 @@ class DSparkSpeculator(DFlashSpeculator):
             dtype=torch.int32,
             device=device,
         )
+        self.capacity_activation_batch_size = (
+            envs.VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE
+        )
+        if self.capacity_activation_batch_size < 0:
+            raise ValueError(
+                "VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE must be >= 0, got "
+                f"{self.capacity_activation_batch_size}."
+            )
         self._runtime_num_reqs_for_capacity = torch.zeros(
             (1,),
             dtype=torch.int32,
@@ -191,6 +200,7 @@ class DSparkSpeculator(DFlashSpeculator):
         num_speculative_steps: int,
         num_query_per_req: int,
         is_profile: bool = False,
+        use_capacity: bool = True,
     ) -> None:
         # Sequential Markov sampling over the backbone's output hidden states.
         n_spec = num_speculative_steps
@@ -209,7 +219,7 @@ class DSparkSpeculator(DFlashSpeculator):
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
         confidence_logits = self.draft_token_confidence_logits[:num_reqs, :n_spec]
         min_survival_probability = self.min_survival_probability
-        use_confidence_capacity = self.use_draft_token_capacity
+        use_confidence_capacity = self.use_draft_token_capacity and use_capacity
 
         # Anchor (bonus) token per request = the input id at query offset 0,
         # laid out as one row per request in the draft query block.
@@ -404,4 +414,8 @@ class DSparkSpeculator(DFlashSpeculator):
             num_speculative_steps,
             num_query_per_req,
             is_profile=is_profile,
+            use_capacity=(
+                self.capacity_activation_batch_size <= 0
+                or num_reqs >= self.capacity_activation_batch_size
+            ),
         )

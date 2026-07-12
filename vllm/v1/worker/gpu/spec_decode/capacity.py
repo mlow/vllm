@@ -270,6 +270,17 @@ class CapacityBasedVerificationManager:
             if envs.VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH
             else None
         )
+        configured_activation_batch_size = (
+            envs.VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE
+        )
+        if configured_activation_batch_size < 0:
+            raise ValueError(
+                "VLLM_DSPARK_CAPACITY_ACTIVATION_BATCH_SIZE must be >= 0, got "
+                f"{configured_activation_batch_size}."
+            )
+        self.capacity_activation_batch_size = max(1, configured_activation_batch_size)
+        self._capacity_activation_is_configured = configured_activation_batch_size > 0
+        self.capacity_bypassed = False
 
     def add_request(self, req_idx: int) -> None:
         self.draft_token_capacity_np[req_idx] = self.req_states.num_speculative_steps
@@ -294,6 +305,8 @@ class CapacityBasedVerificationManager:
             self.copy_event_pending = True
 
     def update_capacities(self, draft_token_capacity: torch.Tensor) -> None:
+        if self.capacity_bypassed:
+            return
         self._flush_draft_token_capacity_copy()
         assert self.idx_mapping_np is not None
         self._stage_draft_token_capacity_copy(draft_token_capacity)
@@ -365,6 +378,61 @@ class CapacityBasedVerificationManager:
         controller = self.dynamic_draft_depth_controller
         if controller is not None:
             controller.set_draft_token_budget(draft_token_budget)
+            max_depth = self.req_states.num_speculative_steps
+            profiled_activation_batch_size = max(
+                1, (draft_token_budget + max_depth - 1) // max_depth
+            )
+            if not self._capacity_activation_is_configured:
+                self.capacity_activation_batch_size = profiled_activation_batch_size
+            if controller._should_log():
+                logger.info(
+                    "DSpark capacity readback activates at %d requests "
+                    "(profiled threshold %d, draft-token budget %d, K=%d)",
+                    self.capacity_activation_batch_size,
+                    profiled_activation_batch_size,
+                    draft_token_budget,
+                    max_depth,
+                )
+                if (
+                    self._capacity_activation_is_configured
+                    and self.capacity_activation_batch_size
+                    != profiled_activation_batch_size
+                ):
+                    logger.warning(
+                        "Configured DSpark capacity activation batch size %d "
+                        "does not match profiled threshold %d.",
+                        self.capacity_activation_batch_size,
+                        profiled_activation_batch_size,
+                    )
+
+    def should_apply_capacity(
+        self,
+        num_reqs: int,
+        has_structured_output_requests: bool = False,
+    ) -> bool:
+        apply_capacity = (
+            has_structured_output_requests
+            or num_reqs >= self.capacity_activation_batch_size
+        )
+        bypass = not apply_capacity
+        if bypass == self.capacity_bypassed:
+            return apply_capacity
+
+        if bypass:
+            # Drain a copy staged by the previous high-load step once. Low-load
+            # steps then stay entirely GPU/graph driven with no host readback.
+            self._flush_draft_token_capacity_copy()
+            self.draft_token_capacity_np.fill(self.req_states.num_speculative_steps)
+        self.capacity_bypassed = bypass
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info(
+                "DSpark capacity readback %s at %d active requests "
+                "(activation threshold %d)",
+                "enabled" if apply_capacity else "bypassed",
+                num_reqs,
+                self.capacity_activation_batch_size,
+            )
+        return apply_capacity
 
     def maybe_log_dispatch(self, num_tokens: int, batch_desc: object) -> None:
         """Log the effective capacity and graph shape for opt-in diagnostics."""
@@ -518,6 +586,8 @@ class VarlenCapacityBasedVerificationManager(CapacityBasedVerificationManager):
             _compact_token_inputs_kernel[(reqs_for_len,)](
                 input_ids,
                 positions,
+                input_ids,
+                positions,
                 query_start_loc,
                 query_start_loc,
                 BLOCK_SIZE=triton.next_power_of_2(query_len),
@@ -669,17 +739,26 @@ class VarlenCapacityBasedVerificationManager(CapacityBasedVerificationManager):
         self,
         input_batch: "InputBatch",
     ) -> "InputBatch":
-        self._flush_draft_token_capacity_copy()
         self._remember_batch(input_batch)
         self._set_token_views(
             input_batch,
             max(input_batch.num_tokens, input_batch.num_tokens_after_padding),
         )
         input_batch.is_padding[: input_batch.num_tokens].fill_(False)
+        if not self.capacity_bypassed:
+            self._flush_draft_token_capacity_copy()
         if (
             input_batch.num_draft_tokens == 0
             or input_batch.num_draft_tokens_per_req is None
         ):
+            return self._set_token_views(input_batch)
+
+        if self.capacity_bypassed:
+            attempted = input_batch.valid_num_draft_tokens_per_req
+            if attempted is None:
+                attempted = input_batch.num_draft_tokens_per_req
+            self._remember_capacity_log_snapshot(attempted)
+            self._observe_dynamic_draft_depth(input_batch, attempted)
             return self._set_token_views(input_batch)
 
         num_bonus_tokens = self._get_num_bonus_tokens(input_batch)
