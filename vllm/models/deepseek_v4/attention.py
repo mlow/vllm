@@ -51,6 +51,7 @@ from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import (
+    CUDAGraphCaptureEventPool,
     execute_in_parallel,
     maybe_execute_in_parallel,
 )
@@ -170,6 +171,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if not self.enable_post_gemm_aux_streams or self.aux_stream_list is None:
             return None
         return self.aux_stream_list[index]
+
+    def _post_gemm_events(self) -> list[torch.cuda.Event]:
+        pool = getattr(self, "attn_event_pool", None)
+        return self.attn_events if pool is None else pool.get()
 
     def __init__(
         self,
@@ -312,7 +317,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # join only enqueues waits on the default stream; re-recording those
         # events for cache/indexer overlap before the waits execute can race.
         self.ln_events = [torch.cuda.Event() for _ in range(4)]
-        self.attn_events = [torch.cuda.Event() for _ in range(3)]
+        self.attn_event_pool = CUDAGraphCaptureEventPool(3)
+        self.attn_events = self.attn_event_pool.default_events
 
         assert cache_config is not None, "DeepseekV4 attention requires cache_config"
         # ---- Attention / KV-cache setup ----
@@ -648,6 +654,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # overlap with default's GEMM + cache write.
         if self.indexer is not None:
             aux_streams = self.aux_stream_list
+            attn_events = self._post_gemm_events()
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -675,8 +682,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     ),
                     lambda: compressor(kv_score, positions, self.rotary_emb),
                 ],
-                self.attn_events[0],
-                [self.attn_events[1], self.attn_events[2]],
+                attn_events[0],
+                [attn_events[1], attn_events[2]],
                 [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
                 enable=(aux_streams is not None and self.enable_post_gemm_aux_streams),
                 enqueue_default_first=self.enqueue_default_before_indexer,
@@ -684,6 +691,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = self._post_gemm_aux_stream(0)
+            attn_events = self._post_gemm_events()
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
@@ -694,8 +702,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             q, _ = maybe_execute_in_parallel(
                 wq_b_kv_insert,
                 lambda: compressor(kv_score, positions, self.rotary_emb),
-                self.attn_events[0],
-                self.attn_events[1],
+                attn_events[0],
+                attn_events[1],
                 aux_stream,
             )
         else:
@@ -1077,10 +1085,8 @@ class DeepseekV4Indexer(nn.Module):
 
         # None on ROCm — maybe_execute_in_parallel falls back to sequential.
         self.aux_stream = aux_stream
-        self.ln_events: list[torch.cuda.Event] = [
-            torch.cuda.Event(),
-            torch.cuda.Event(),
-        ]
+        self.event_pool = CUDAGraphCaptureEventPool(2)
+        self.ln_events = self.event_pool.default_events
 
     def forward(
         self,
@@ -1109,11 +1115,12 @@ class DeepseekV4Indexer(nn.Module):
 
         # compressor returns None and writes K to the indexer KV cache; the
         # join orders that write before indexer_op (skip_k_cache_insert=True).
+        events = self.event_pool.get()
         (q_quant, weights), k = maybe_execute_in_parallel(
             wq_b_and_q_quant,
             lambda: compressor(compressed_kv_score, positions, rotary_emb),
-            self.ln_events[0],
-            self.ln_events[1],
+            events[0],
+            events[1],
             self.aux_stream,
         )
         return self.indexer_op(hidden_states, q_quant, k, weights)

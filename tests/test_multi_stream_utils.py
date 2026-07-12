@@ -6,7 +6,10 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from vllm.utils.multi_stream_utils import execute_in_parallel
+from vllm.utils.multi_stream_utils import (
+    CUDAGraphCaptureEventPool,
+    execute_in_parallel,
+)
 
 
 class _FakeEvent:
@@ -19,6 +22,30 @@ class _FakeEvent:
 
     def wait(self) -> None:
         self.calls.append(f"{self.name}.wait")
+
+
+def test_cudagraph_capture_event_pool_isolates_capture_generations(monkeypatch):
+    created = []
+
+    def fake_event():
+        event = object()
+        created.append(event)
+        return event
+
+    monkeypatch.setattr(torch.cuda, "Event", fake_event)
+    capturing = False
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+
+    pool = CUDAGraphCaptureEventPool(2)
+    assert pool.get() is pool.default_events
+
+    capturing = True
+    capture_a = pool.get()
+    capture_b = pool.get()
+    assert capture_a is not capture_b
+    assert set(map(id, capture_a)).isdisjoint(map(id, capture_b))
+    assert set(map(id, pool.default_events)).isdisjoint(map(id, capture_a))
+    assert len(created) == 6
 
 
 @pytest.mark.parametrize("enqueue_default_first", [False, True])

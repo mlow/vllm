@@ -17,6 +17,32 @@ class EventType(Enum):
     Attention = 1
 
 
+class CUDAGraphCaptureEventPool:
+    """Keep CUDA event generations private to each captured graph.
+
+    Reusing one event handle across independently captured graphs is unsafe
+    when those graphs can be replayed at different shapes. A replay may record
+    a new generation while another graph still has waits bound to the same
+    handle. Eager execution can reuse one stable event set, while every capture
+    gets a retained private set that is embedded only in that graph.
+    """
+
+    def __init__(self, num_events: int) -> None:
+        if num_events < 1:
+            raise ValueError("num_events must be at least one")
+        self.default_events = [torch.cuda.Event() for _ in range(num_events)]
+        self._captured_event_sets: list[list[torch.cuda.Event]] = []
+
+    def get(self) -> list[torch.cuda.Event]:
+        if not torch.cuda.is_current_stream_capturing():
+            return self.default_events
+        events = [torch.cuda.Event() for _ in self.default_events]
+        # CUDA graphs retain the event handles, and this list keeps the Python
+        # wrappers alive for the same lifetime as the owning module.
+        self._captured_event_sets.append(events)
+        return events
+
+
 def maybe_execute_in_parallel(
     fn0: Callable[[], Any],
     fn1: Callable[[], Any],

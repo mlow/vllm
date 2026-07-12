@@ -72,6 +72,7 @@ def test_gemm_and_attention_overlap_use_distinct_event_sets(monkeypatch) -> None
         fused_wqa_wkv=object(),
         ln_events=ln_events,
         attn_events=attn_events,
+        _post_gemm_events=lambda: attn_events,
         enqueue_default_before_indexer=True,
         enable_post_gemm_aux_streams=True,
         indexer_rotary_emb=object(),
@@ -98,3 +99,59 @@ def test_gemm_and_attention_overlap_use_distinct_event_sets(monkeypatch) -> None
         (attn_events[0], tuple(attn_events[1:3])),
     ]
     assert set(map(id, ln_events)).isdisjoint(map(id, attn_events))
+
+
+def test_attention_overlap_uses_capture_private_events(monkeypatch) -> None:
+    calls = []
+    captured_events = [object() for _ in range(3)]
+
+    def fake_execute_in_parallel(
+        default_fn,
+        aux_fns,
+        start_event,
+        done_events,
+        aux_streams,
+        enable,
+        **kwargs,
+    ):
+        del default_fn, aux_streams, enable, kwargs
+        calls.append((start_event, tuple(done_events)))
+        return torch.empty(1), [None] * len(aux_fns)
+
+    monkeypatch.setattr(
+        attention_module, "execute_in_parallel", fake_execute_in_parallel
+    )
+    monkeypatch.setattr(
+        attention_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=None),
+    )
+
+    layer = SimpleNamespace(
+        aux_stream_list=[object(), object(), object()],
+        compressor=object(),
+        indexer=object(),
+        attn_events=[object() for _ in range(3)],
+        attn_event_pool=SimpleNamespace(get=lambda: captured_events),
+        _post_gemm_events=lambda: captured_events,
+        enqueue_default_before_indexer=True,
+        enable_post_gemm_aux_streams=True,
+        indexer_rotary_emb=object(),
+        rotary_emb=object(),
+        forward_mqa=lambda *args: None,
+    )
+    tensor = torch.empty(1)
+
+    attention_module.DeepseekV4Attention.attention_impl(
+        layer,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+    )
+
+    assert calls == [(captured_events[0], tuple(captured_events[1:3]))]
