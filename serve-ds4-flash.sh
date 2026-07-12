@@ -352,8 +352,9 @@ if [[ -z "${gpu_memory_utilization}" ]]; then
     if [[ "${backend}" == "lucifer-default" ]]; then
       # The default DeepGEMM MoE path retains more model/runtime memory than
       # FlashInfer CUTLASS. At 0.9465 only 7.35 GiB remained for the 7.89 GiB
-      # DSpark KV requirement; 0.954 profiles 8.12 GiB (269741 tokens).
-      gpu_memory_utilization=0.954
+      # DSpark KV requirement. 0.953 profiles 8.03 GiB (266609 tokens) and
+      # leaves enough transient headroom for a sustained 128k prefill.
+      gpu_memory_utilization=0.953
     elif [[ "${backend}" == lucifer-* ]]; then
       gpu_memory_utilization=0.9465
     else
