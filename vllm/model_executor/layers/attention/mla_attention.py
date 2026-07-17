@@ -595,6 +595,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 v_head_dim=self.v_head_dim,
                 vllm_config=vllm_config,
             )
+        if self.prefill_backend is not None and not getattr(
+            self.impl, "supports_mha_prefill", True
+        ):
+            # Backends like B12X_MLA_SPARSE consume prefill inside their own
+            # MQA/extend kernels and never validated the dense-MHA cache read.
+            self.prefill_backend = None
 
         self.kv_cache = torch.tensor([])
 
