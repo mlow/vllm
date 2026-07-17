@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import sys
 import threading
 import time
 from collections import defaultdict
@@ -254,6 +255,15 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+def _maybe_save_b12x_moe_activation_amax() -> None:
+    b12x_moe = sys.modules.get("vllm.model_executor.layers.fused_moe.b12x_moe")
+    if b12x_moe is None:
+        return
+    maybe_save = getattr(b12x_moe, "maybe_save_b12x_moe_activation_amax", None)
+    if maybe_save is not None:
+        maybe_save()
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -4461,6 +4471,7 @@ class GPUModelRunner(
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
+                    _maybe_save_b12x_moe_activation_amax()
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -4769,6 +4780,8 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
             )
+
+        _maybe_save_b12x_moe_activation_amax()
 
         if not self.use_async_scheduling:
             if self.routed_experts_initialized:
