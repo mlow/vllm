@@ -31,6 +31,9 @@ from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup_if_needed,
 )
+from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+    minimax_m3_msa_warmup,
+)
 from vllm.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,
 )
@@ -153,10 +156,6 @@ def _uses_flashinfer_compute_kernels(worker: "Worker") -> bool:
 
 
 def kernel_warmup(worker: "Worker"):
-    from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
-        minimax_m3_msa_warmup,
-    )
-
     # Pooling models do not use the generation slot-mapping path.
     if not worker.use_v2_model_runner and not worker.model_runner.is_pooling_model:
         warm_v1_block_table_kernels(
@@ -165,15 +164,22 @@ def kernel_warmup(worker: "Worker"):
         )
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
+    compilation_config = worker.vllm_config.compilation_config
+    cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
+    mhc_warmup_token_sizes = list(cudagraph_capture_sizes)
+    max_num_scheduled_tokens = getattr(
+        worker.scheduler_config, "max_num_scheduled_tokens", None
+    )
+    if max_num_scheduled_tokens is not None:
+        mhc_warmup_token_sizes.append(max_num_scheduled_tokens)
+
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder
     # layer per token; warm them across token sizes first so the first real
     # request doesn't pay JIT cost. No-op for non-DSv4 models (gated inside).
     deepseek_v4_mhc_warmup(
         worker.get_model(),
         max_tokens=worker.scheduler_config.max_num_batched_tokens,
-        cudagraph_capture_sizes=(
-            worker.vllm_config.compilation_config.cudagraph_capture_sizes or []
-        ),
+        cudagraph_capture_sizes=mhc_warmup_token_sizes,
     )
 
     # Run next so input-prep kernels JIT against pristine runner state.
