@@ -21,7 +21,6 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
 from vllm.distributed.device_communicators.custom_all_reduce import (
-    CustomAllreduce,
     get_b12x_pcie_allreduce,
 )
 from vllm.distributed.parallel_state import (

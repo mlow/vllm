@@ -187,8 +187,8 @@ for chunk_idx in range(cdiv(C, MCC)):
 return curr_o @ W_O
 """
 
-import os
 import functools
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -854,6 +854,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         )
         num_mqa_tokens = attn_metadata.num_decode_tokens
         num_mha_tokens = q.size(0) - num_mqa_tokens
+        is_sparse_impl = self.impl.is_sparse
 
         if self.impl.is_sparse and num_mha_tokens > 0:
             prefill_max_seq_len = attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]

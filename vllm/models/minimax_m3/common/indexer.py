@@ -20,7 +20,6 @@ from typing import ClassVar
 import torch
 from torch import nn
 
-from vllm import envs
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.config.attention import IndexerKVDType
 from vllm.config.cache import CacheDType

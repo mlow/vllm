@@ -23,11 +23,11 @@ from vllm.model_executor.layers.quantization.online.fp8 import (
     Fp8PerTensorOnlineLinearMethod,
     Fp8PerTensorOnlineMoEMethod,
 )
-from vllm.model_executor.layers.quantization.online.nvfp4 import (
-    Nvfp4OnlineMoEMethod,
-)
 from vllm.model_executor.layers.quantization.online.mxfp8 import (
     is_shared_expert_projection,
+)
+from vllm.model_executor.layers.quantization.online.nvfp4 import (
+    Nvfp4OnlineMoEMethod,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 from vllm.platforms import current_platform

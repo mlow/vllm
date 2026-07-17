@@ -14,12 +14,12 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.kernels.linear.mxfp8.b12x import warmup_b12x_mxfp8_linear
 from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
 from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
     warmup_b12x_sparse_indexer,
 )
+from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.deepseek_v4_mhc_warmup import (
     deepseek_v4_mhc_warmup,
@@ -32,12 +32,12 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
+from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
+    minimax_m3_msa_warmup,
+)
 from vllm.model_executor.warmup.qwen_triton_warmup import qwen_triton_warmup
 from vllm.model_executor.warmup.sparse_mla_triton_warmup import (
     sparse_mla_triton_warmup_if_needed,
-)
-from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
-    minimax_m3_msa_warmup,
 )
 from vllm.model_executor.warmup.v1_block_table_warmup import (
     warm_v1_block_table_kernels,

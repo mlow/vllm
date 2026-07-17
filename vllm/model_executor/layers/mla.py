@@ -14,7 +14,6 @@ from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
-
 _NVFP4_MLA_SCALES_ENV = "VLLM_NVFP4_MLA_SCALES_FILE"
 _NVFP4_MLA_SCALES_FORMAT = "nvfp4_ds_mla_outer_scale_v1"
 _NVFP4_MLA_NUM_LAYERS = 78

@@ -28,13 +28,13 @@ from vllm.model_executor.layers.attention.mla_attention import (
     QueryLenSupport,
     _DecodeConcatQuantFP8,
 )
+from vllm.model_executor.layers.attention.sparse_mla_attention import (
+    SparseMLACommonImpl,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.model_executor.layers.attention.sparse_mla_attention import (
-    SparseMLACommonImpl,
-)
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 from vllm.v1.attention.backends.mla import flashmla as flashmla_module
@@ -586,6 +586,8 @@ def test_fp8_dcp_sparse_mla_uses_lse_gather_path(monkeypatch):
     impl = FakeSparseImpl()
     layer.impl = impl
     layer.dcp_a2a = False
+    layer.dcp_b12x = False
+    layer.attn_backend = SimpleNamespace(get_name=lambda: "FLASHMLA_SPARSE")
     layer.dcp_a2a_max_tokens = 0
     layer.dcp_a2a_large_backend = "ag_rs"
     layer.kv_cache_dtype = "fp8_ds_mla"

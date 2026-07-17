@@ -49,8 +49,8 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     AttentionType,
     CommonAttentionMetadata,
-    MultipleOf,
     MLAAttentionImpl,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_filter_and_convert_dcp_index,
