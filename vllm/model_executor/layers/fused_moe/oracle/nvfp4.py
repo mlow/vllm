@@ -304,6 +304,7 @@ def convert_to_nvfp4_moe_kernel_format(
     w2_scale_2: torch.Tensor,
     a2_scale: torch.Tensor | None,
     is_act_and_mul: bool,
+    use_a16: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -469,6 +470,9 @@ def make_nvfp4_moe_quant_config(
     a2_scale: torch.Tensor,
     swiglu_limit: float | None = None,
     layer: torch.nn.Module | None = None,
+    gemm1_alpha: float | None = None,
+    gemm1_beta: float | None = None,
+    use_a16: bool = False,
 ) -> FusedMoEQuantConfig:
     if backend == NvFp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -478,15 +482,17 @@ def make_nvfp4_moe_quant_config(
 
         assert isinstance(layer, RoutedExperts)
         return get_humming_moe_quant_config(layer)
-    elif backend == NvFp4MoeBackend.MARLIN:
+    if backend == NvFp4MoeBackend.MARLIN:
         return nvfp4_w4a16_moe_quant_config(
             g1_alphas=w13_scale_2,
             g2_alphas=w2_scale_2,
             w1_scale=w13_scale,
             w2_scale=w2_scale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=swiglu_limit,
         )
-    elif backend == NvFp4MoeBackend.EMULATION:
+    if backend == NvFp4MoeBackend.EMULATION:
         return nvfp4_moe_quant_config(
             g1_alphas=w13_scale_2,
             g2_alphas=w2_scale_2,
@@ -494,6 +500,8 @@ def make_nvfp4_moe_quant_config(
             a2_gscale=a2_scale,
             w1_scale=w13_scale,
             w2_scale=w2_scale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
             gemm1_clamp_limit=swiglu_limit,
         )
 
@@ -518,6 +526,8 @@ def make_nvfp4_moe_quant_config(
                 NvFp4MoeBackend.FLASHINFER_CUTEDSL,
             )
         ),
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=swiglu_limit,
     )
 
