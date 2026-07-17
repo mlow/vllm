@@ -51,6 +51,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.virtual_tp import get_virtual_tp_axis_original_size
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
@@ -167,6 +168,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                loaded_intermediate_size=get_virtual_tp_axis_original_size(
+                    "dense_intermediate_size",
+                    config.intermediate_size,
+                    config=config,
+                ),
             )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
