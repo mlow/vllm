@@ -130,6 +130,18 @@ class DSparkDeepseekV4Model(nn.Module):
         """
         return self.main_norm(self.main_proj(aux_hidden_states))
 
+    def finalize_mhc_weights(self) -> None:
+        for layer in self.layers:
+            layer.refresh_b12x_mhc_bf16_weights()
+
+        first_layer = self.layers[0]
+        if first_layer._use_b12x_mhc:
+            first_layer.hc_attn_fn_broadcast = (
+                first_layer.hc_attn_fn.detach()
+                .view(-1, first_layer.hc_mult, first_layer.hidden_size)
+                .sum(dim=1)
+            )
+
     @torch.inference_mode()
     def precompute_and_store_context_kv(
         self,
@@ -171,8 +183,10 @@ class DSparkDeepseekV4Model(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if getattr(self.layers[0], "_use_b12x_mhc", False):
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
@@ -454,6 +468,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_params.add(name)
 
         self._finalize_moe()
+        self.model.finalize_mhc_weights()
         logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
         return loaded_params
 
