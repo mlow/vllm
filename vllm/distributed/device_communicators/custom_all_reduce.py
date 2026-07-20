@@ -83,7 +83,9 @@ def _parse_byte_size(value: str) -> int:
 @lru_cache(maxsize=1)
 def _load_b12x_pcie_oneshot_pool() -> Any | None:
     try:
-        from b12x.distributed import PCIeOneshotAllReducePool
+        from sparkinfer.comm.pcie import (
+            OneshotAllReducePool as PCIeOneshotAllReducePool,
+        )
     except Exception:
         return None
     return PCIeOneshotAllReducePool
@@ -92,7 +94,7 @@ def _load_b12x_pcie_oneshot_pool() -> Any | None:
 @lru_cache(maxsize=1)
 def _load_b12x_pcie_dma() -> Any | None:
     try:
-        from b12x.distributed import PCIeDmaAllReduce
+        from sparkinfer.comm.pcie import DmaAllReduce as PCIeDmaAllReduce
     except Exception:
         return None
     return PCIeDmaAllReduce
@@ -419,7 +421,7 @@ class CustomAllreduce:
             if pool_cls is None:
                 logger.warning(
                     "PCIe custom allreduce was requested, but "
-                    "b12x.distributed.PCIeOneshotAllReducePool is unavailable."
+                    "sparkinfer.comm.pcie.OneshotAllReducePool is unavailable."
                 )
                 return
             # The largest allreduce the model can issue (prefill chunk x
@@ -498,7 +500,7 @@ class CustomAllreduce:
             if dma_cls is None:
                 logger.warning(
                     "b12x PCIe DMA allreduce unavailable "
-                    "(b12x.distributed.PCIeDmaAllReduce not importable); "
+                    "(sparkinfer.comm.pcie.DmaAllReduce not importable); "
                     "large allreduces stay on PyNCCL."
                 )
             else:
