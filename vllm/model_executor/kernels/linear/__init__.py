@@ -74,6 +74,9 @@ from vllm.model_executor.kernels.linear.mxfp4 import (
     MxFp4LinearKernel,
     MxFp4LinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.mxfp4.b12x import (
+    B12xMxFp4LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp4.flashinfer import (
     FlashInferMxFp4LinearKernel,
 )
@@ -113,6 +116,9 @@ from vllm.model_executor.kernels.linear.mxfp8.xpu import (
 from vllm.model_executor.kernels.linear.nvfp4 import (
     NvFp4LinearKernel,
     NvFp4LinearLayerConfig,
+)
+from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+    B12xNvFp4LinearKernel,
 )
 from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
     CutlassNvFp4LinearKernel,
@@ -215,12 +221,15 @@ def _get_linear_backend() -> str:
 
 # Mapping from linear_backend name to the set of kernel classes it covers.
 # When a user sets --linear-backend <name>, only kernels in the corresponding
-# set are considered candidates. If none can implement the layer config,
-# an error is raised to respect the user's explicit intent.
+# set are considered candidates. A backend with no kernel for the layer family
+# falls back to automatic selection. A matching backend kernel that cannot
+# implement the layer config remains an error.
 _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
     "b12x": {
         B12xFp8BlockScaledMMKernel,
+        B12xMxFp4LinearKernel,
         B12xMxfp8LinearKernel,
+        B12xNvFp4LinearKernel,
     },
     "cutlass": {
         CutlassInt8ScaledMMLinearKernel,
@@ -455,6 +464,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
 
 _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xNvFp4LinearKernel,
         FlashInferCuteDslNvFp4LinearKernel,
         # FlashInferB12xNvFp4LinearKernel excluded from auto-selection until
         # upstream CUTLASS SM121 MMA op guard is resolved; use
@@ -475,6 +485,7 @@ _POSSIBLE_NVFP4_KERNELS: dict[PlatformEnum, list[type[NvFp4LinearKernel]]] = {
 
 _POSSIBLE_MXFP4_KERNELS: dict[PlatformEnum, list[type[MxFp4LinearKernel]]] = {
     PlatformEnum.CUDA: [
+        B12xMxFp4LinearKernel,
         FlashInferMxFp4LinearKernel,
         MarlinMxFp4LinearKernel,
         HummingMxFp4LinearKernel,
@@ -565,8 +576,7 @@ def choose_scaled_mm_linear_kernel(
     # Apply --linear-backend filtering when set.
     linear_backend = _get_linear_backend()
     b12x_fp8_gemm_required = (
-        envs.VLLM_USE_B12X_FP8_GEMM
-        and B12xFp8BlockScaledMMKernel in platform_kernels
+        envs.VLLM_USE_B12X_FP8_GEMM and B12xFp8BlockScaledMMKernel in platform_kernels
     )
     if b12x_fp8_gemm_required:
         if force_kernel is not None and force_kernel is not B12xFp8BlockScaledMMKernel:
@@ -583,11 +593,14 @@ def choose_scaled_mm_linear_kernel(
     elif linear_backend != "auto":
         filtered = _filter_kernels_by_backend(linear_backend, platform_kernels)
         if not filtered:
-            raise ValueError(
-                f"--linear-backend={linear_backend} was requested but no "
-                f"'{linear_backend}' kernel exists for this layer type."
+            logger.info_once(
+                "No %s kernel exists for this layer type; falling back to "
+                "automatic linear kernel selection",
+                linear_backend,
+                scope="global",
             )
-        platform_kernels = filtered
+        else:
+            platform_kernels = filtered
 
     for kernel in platform_kernels:
         is_supported_and_can_implement, failure_reason = (
@@ -1111,6 +1124,8 @@ __all__ = [
     "Mxfp8LinearKernel",
     "Mxfp8LinearLayerConfig",
     "B12xMxfp8LinearKernel",
+    "B12xNvFp4LinearKernel",
+    "B12xMxFp4LinearKernel",
     "init_mxfp4_linear_kernel",
     "MxFp4LinearKernel",
     "MxFp4LinearLayerConfig",
